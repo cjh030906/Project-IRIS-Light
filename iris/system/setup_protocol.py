@@ -1425,6 +1425,9 @@ class SetupProtocol:
         """성공/재확인 NeedsUser면 Result, 다음 폴백이면 None."""
         self._emit_stream(f"공식 설치: irm {OLLAMA_INSTALL_PS1} | iex", None, replace=False)
         ps = (
+            # PowerShell 5.1의 irm은 ProgressPreference 기본값(Continue) 때문에
+            # 진행률 렌더링이 병목이 된다. 245KB 스크립트가 3분+ 걸리는 원인.
+            "$ProgressPreference='SilentlyContinue'; "
             "& ([scriptblock]::Create((irm '"
             + OLLAMA_INSTALL_PS1
             + "')))"
@@ -1631,6 +1634,9 @@ class SetupProtocol:
                 can_install=False,
             )
         ps = (
+            # PowerShell 5.1의 irm은 ProgressPreference 기본값(Continue) 때문에
+            # 진행률 렌더링이 병목이 된다. 245KB 스크립트가 3분+ 걸리는 원인.
+            "$ProgressPreference='SilentlyContinue'; "
             "& ([scriptblock]::Create((irm '"
             + HERMES_INSTALL_URL
             + "'))) -SkipSetup -NonInteractive"
