@@ -43,11 +43,16 @@ def is_hermes_gateway_running(
     base_url: str,
     *,
     api_key: str = "",
+    timeout_sec: float | None = None,
 ) -> bool:
-    return HermesClient(
+    client = HermesClient(
         base_url,
         api_key=resolve_hermes_api_key(api_key),
-    ).gateway_ready()
+    )
+    if timeout_sec is not None:
+        # 설정창 등 빠른 핑 — /models까지는 보지 않는다.
+        return client.health_ok(timeout_sec=timeout_sec)
+    return client.gateway_ready()
 
 
 def _hermes_agent_dir() -> Path:

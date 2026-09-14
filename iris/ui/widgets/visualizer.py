@@ -19,6 +19,8 @@ _SNAPSHOT_TOLERANCE_PX = 1
 _ORB_CENTER_Y_RATIO = 0.36
 # Companion: 앵커(상단 슬롯) 우선, 폴백 비율은 더 위
 _ORB_CENTER_Y_RATIO_COMPANION = 0.09
+# IDE 히어로 — 큰 구체 상단 잘림 방지 (기본 0.36보다 살짝 아래)
+_ORB_CENTER_Y_RATIO_HERO = 0.42
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,16 @@ class Visualizer(QWidget):
         )
         self._particle.set_companion_mode(companion)
         self.request_sync_orb_anchor("companion_orb_placement")
+
+    def set_hero_orb_placement(self, hero: bool) -> None:
+        """IDE 히어로 — 창 비율 중심을 살짝 내려 상단 잘림 방지."""
+        if hero:
+            self._use_anchor_center = False
+            self._center_y_ratio = _ORB_CENTER_Y_RATIO_HERO
+            self._particle.set_companion_mode(False)
+        else:
+            self._center_y_ratio = _ORB_CENTER_Y_RATIO
+        self.request_sync_orb_anchor("hero_orb_placement")
 
     def set_orb_anchor(self, widget: QWidget | None) -> None:
         """구체 표시 여부·동기화 트리거용 앵커 (위치는 창 콘텐츠 중앙 고정)."""

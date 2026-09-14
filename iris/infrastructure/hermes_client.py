@@ -160,11 +160,11 @@ class HermesClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _health_ping_ok(self) -> bool:
+    def _health_ping_ok(self, *, timeout_sec: float = 5.0) -> bool:
         for path in (f"{self.api_root}/health", f"{self.base_url}/health"):
             try:
                 req = Request(path, method="GET", headers=self._headers())
-                with urlopen(req, timeout=5.0) as resp:
+                with urlopen(req, timeout=timeout_sec) as resp:
                     if resp.status != 200:
                         continue
                     body = json.loads(resp.read().decode("utf-8"))
@@ -174,9 +174,9 @@ class HermesClient:
                 continue
         return False
 
-    def health_ok(self) -> bool:
+    def health_ok(self, *, timeout_sec: float = 5.0) -> bool:
         """/health — 프로세스 생존만 (Bearer 불필요)."""
-        return self._health_ping_ok()
+        return self._health_ping_ok(timeout_sec=timeout_sec)
 
     def gateway_ready(self) -> bool:
         """/health + /v1/models — 채팅과 동일한 Bearer 인증까지 확인."""
@@ -465,21 +465,23 @@ class HermesClient:
                         if isinstance(delta, dict):
                             chunk = delta.get("content")
                             if isinstance(chunk, str) and chunk:
-                                yield {
-                                    "content": chunk,
-                                    "tool_progress": None,
-                                    "done": False,
-                                }
+                                if _should_emit_assistant_content(chunk, choice):
+                                    yield {
+                                        "content": chunk,
+                                        "tool_progress": None,
+                                        "done": False,
+                                    }
                         # 일부 응답은 delta 대신 message.content만 옴
                         message = choice.get("message") or {}
                         if isinstance(message, dict):
                             full = message.get("content")
                             if isinstance(full, str) and full:
-                                yield {
-                                    "content": full,
-                                    "tool_progress": None,
-                                    "done": False,
-                                }
+                                if _should_emit_assistant_content(full, choice):
+                                    yield {
+                                        "content": full,
+                                        "tool_progress": None,
+                                        "done": False,
+                                    }
                     if obj.get("type") == "hermes.tool.progress":
                         msg = _format_tool_progress(obj)
                         if msg:
@@ -522,6 +524,56 @@ def _format_tool_progress(obj: dict[str, Any]) -> str:
     return "tool running"
 
 
+def _looks_like_tool_args_json(text: str) -> bool:
+    """Hermes가 tool 인자 dict를 assistant content로 흘리는 경우 채팅에서 숨긴다."""
+    s = (text or "").strip()
+    if not s.startswith("{") or not s.endswith("}"):
+        return False
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(obj, dict) or not obj:
+        return False
+    toolish = {
+        "file_glob",
+        "pattern",
+        "path",
+        "target",
+        "command",
+        "query",
+        "glob",
+        "cwd",
+        "limit",
+        "tool",
+        "tool_name",
+    }
+    return bool(toolish & {str(k) for k in obj.keys()})
+
+
+def _delta_has_tool_calls(delta: dict[str, Any]) -> bool:
+    tc = delta.get("tool_calls")
+    return isinstance(tc, list) and bool(tc)
+
+
+def _choice_has_tool_calls(choice: dict[str, Any]) -> bool:
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and _delta_has_tool_calls(delta):
+        return True
+    message = choice.get("message")
+    if isinstance(message, dict) and _delta_has_tool_calls(message):
+        return True
+    return False
+
+
+def _should_emit_assistant_content(chunk: str, choice: dict[str, Any]) -> bool:
+    if _choice_has_tool_calls(choice):
+        return False
+    if _looks_like_tool_args_json(chunk):
+        return False
+    return bool((chunk or "").strip())
+
+
 if __name__ == "__main__":
     assert infer_hermes_provider("gemma4:31b-cloud") == "ollama"
     assert infer_hermes_provider("gemma4:26b") == "ollama"
@@ -539,6 +591,14 @@ if __name__ == "__main__":
         }
     )
     assert _sse_error_message({"choices": [{"delta": {"content": "hi"}}]}) == ""
+    assert _looks_like_tool_args_json(
+        '{"file_glob":"**/node_modules/typescript","path":"C:/Users/kwakm","target":"files"}'
+    )
+    assert not _looks_like_tool_args_json('{"answer":"yes"}')
+    assert not _should_emit_assistant_content(
+        '{"file_glob":"x"}',
+        {"delta": {"content": '{"file_glob":"x"}'}},
+    )
     resolved = resolve_hermes_api_key("")
     client = HermesClient("http://127.0.0.1:8642/v1", api_key="")
     assert client.api_key == resolved

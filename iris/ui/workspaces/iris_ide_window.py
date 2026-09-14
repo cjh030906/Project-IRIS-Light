@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+from urllib.parse import quote
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from PyQt6.QtWidgets import QLabel, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
 
 if TYPE_CHECKING:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from iris.assets.branding import load_app_icon
+from iris.ui.ide.iris_ide_welcome_layer import IrisIdeWelcomeLayer
 from iris.ui.shared.theme_tokens import TOKENS
 from iris.ui.window.frameless_chrome import suppress_native_window_border
 
@@ -23,16 +26,11 @@ def _iris_ide_window_stylesheet() -> str:
     t = TOKENS
     return f"""
     QMainWindow {{
-        background: {t.background_primary};
+        background: {t.void_black};
         border: none;
     }}
     QWidget#IrisIdeLoading {{
-        background: qlineargradient(
-            x1:0, y1:0, x2:0, y2:1,
-            stop:0 {t.space_navy},
-            stop:0.45 {t.background_primary},
-            stop:1 {t.void_black}
-        );
+        background: {t.void_black};
         border: none;
         border-radius: 0;
     }}
@@ -52,9 +50,11 @@ def _iris_ide_window_stylesheet() -> str:
 
 
 class IrisIdeWindow(QMainWindow):
-    """Separate top-level window — Theia in QWebEngineView."""
+    """Separate top-level window — welcome / Theia in QWebEngineView."""
 
     theia_load_finished = pyqtSignal(bool)
+    files_dropped = pyqtSignal(list)
+    folder_opened = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -65,6 +65,7 @@ class IrisIdeWindow(QMainWindow):
         self.setMinimumSize(640, 480)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setStyleSheet(_iris_ide_window_stylesheet())
+        self.setAcceptDrops(True)
         self._frameless_chrome_applied = False
         self._stack = QStackedWidget(self)
         self.setCentralWidget(self._stack)
@@ -84,13 +85,38 @@ class IrisIdeWindow(QMainWindow):
         load_lay.addWidget(self._loading_label)
         self._stack.addWidget(self._loading)
 
+        self._welcome = IrisIdeWelcomeLayer()
+        self._welcome.folder_opened.connect(self.folder_opened.emit)
+        self._stack.addWidget(self._welcome)
+
         self._view: QWebEngineView | None = None
         self._loaded_url = ""
+        self._loaded_workspace = ""
         self._defer_show = False
         self._load_hooked = False
+        self._embedded = False
+
+    def set_embedded(self, embedded: bool) -> None:
+        """단일 창 Companion — top-level Window ↔ 내부 위젯."""
+        embedded = bool(embedded)
+        if self._embedded == embedded:
+            return
+        self._embedded = embedded
+        if embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setMinimumSize(0, 0)
+        else:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+            self.setMinimumSize(640, 480)
+            self._frameless_chrome_applied = False
+
+    def is_embedded(self) -> bool:
+        return self._embedded
 
     def apply_frameless_chrome(self) -> None:
         """Companion/타일 — Win11 DWM 1px 테두리 숨김 (FramelessWindowHint는 __init__)."""
+        if self._embedded:
+            return
         suppress_native_window_border(self)
         self._frameless_chrome_applied = True
 
@@ -99,6 +125,32 @@ class IrisIdeWindow(QMainWindow):
         if not self._frameless_chrome_applied:
             self.apply_frameless_chrome()
 
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        from iris.ui.window.file_drop import mime_has_attachable
+
+        if mime_has_attachable(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        from iris.ui.window.file_drop import mime_has_attachable
+
+        if mime_has_attachable(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        from iris.ui.window.file_drop import paths_from_mime
+
+        paths = paths_from_mime(event.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
     def _ensure_view(self) -> QWebEngineView | None:
         if self._view is not None:
             return self._view
@@ -106,8 +158,11 @@ class IrisIdeWindow(QMainWindow):
             from PyQt6.QtWebEngineWidgets import QWebEngineView as _QWebEngineView
         except ImportError:  # pragma: no cover
             return None
+
+        # ponytail: WebEngine AcceptDrops=True면 Chromium이 OS 파일 드롭을 가로챔
         self._view = _QWebEngineView()
-        self._view.setStyleSheet(f"background: {TOKENS.background_primary};")
+        self._view.setAcceptDrops(False)
+        self._view.setStyleSheet(f"background: {TOKENS.void_black};")
         if not self._load_hooked:
             self._view.loadFinished.connect(self._on_theia_load_finished)
             self._load_hooked = True
@@ -121,10 +176,22 @@ class IrisIdeWindow(QMainWindow):
             self.show()
             self.raise_()
 
+    def show_welcome(self, *, show_window: bool = True) -> None:
+        """Companion 진입 기본화면 — 저장된 폴더를 자동으로 열지 않음."""
+        self._welcome.refresh_recent_folders()
+        self._stack.setCurrentWidget(self._welcome)
+        if show_window and not self._embedded:
+            self.show()
+            self.raise_()
+        elif self._embedded:
+            self.show()
+
     def show_loading(self, message: str = "IRIS IDE 시작 중…", *, show_window: bool = True) -> None:
         self._loading_label.setText(message)
         self._stack.setCurrentWidget(self._loading)
-        if show_window:
+        if show_window and not self._embedded:
+            self.show()
+        elif self._embedded:
             self.show()
 
     def load_theia(
@@ -133,6 +200,10 @@ class IrisIdeWindow(QMainWindow):
         *,
         bridge_port: int = 0,
         bridge_token: str = "",
+        control_port: int = 0,
+        control_token: str = "",
+        workspace: str = "",
+        force_reload: bool = False,
         defer_show: bool = False,
         on_ready: Callable[[bool], None] | None = None,
     ) -> None:
@@ -147,10 +218,24 @@ class IrisIdeWindow(QMainWindow):
                 f"{url}{sep}iris_bridge_port={int(bridge_port)}"
                 f"&iris_bridge_token={bridge_token}"
             )
+        if control_port and control_token:
+            sep = "&" if "?" in url else "?"
+            url = (
+                f"{url}{sep}iris_control_port={int(control_port)}"
+                f"&iris_control_token={quote(control_token, safe='')}"
+            )
+        ws = (workspace or "").strip()
+        if ws:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}iris_ws={quote(ws, safe='')}"
+        if force_reload or (ws and ws != self._loaded_workspace):
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}iris_reload={int(time.time() * 1000)}"
         if on_ready is not None:
             self.theia_load_finished.connect(on_ready, type=Qt.ConnectionType.SingleShotConnection)
         self._defer_show = defer_show
-        if url == self._loaded_url and self._stack.currentWidget() is view:
+        same_url = url == self._loaded_url and not force_reload
+        if same_url and self._stack.currentWidget() is view:
             if defer_show:
                 self.theia_load_finished.emit(True)
             else:
@@ -158,12 +243,14 @@ class IrisIdeWindow(QMainWindow):
                 self.raise_()
             return
         self._loaded_url = url
+        self._loaded_workspace = ws
         view.load(QUrl(url))
         self._stack.setCurrentWidget(view)
         if defer_show:
             return
         self.show()
-        self.raise_()
+        if not self._embedded:
+            self.raise_()
 
     def hide_window(self) -> None:
         self.hide()
@@ -171,9 +258,15 @@ class IrisIdeWindow(QMainWindow):
     def close_window(self) -> None:
         """Companion/앱 종료 시 IDE 창을 완전히 닫는다 (hide만 하면 유령 창이 남음)."""
         self._loaded_url = ""
+        self._loaded_workspace = ""
         self._defer_show = False
+        if self._embedded:
+            self.set_embedded(False)
         self.hide()
         self.close()
+
+    def is_welcome_visible(self) -> bool:
+        return self._stack.currentWidget() is self._welcome
 
     def is_theia_loaded(self) -> bool:
         return bool(self._loaded_url) and self._view is not None and self._stack.currentWidget() is self._view
@@ -193,11 +286,12 @@ def _self_check() -> None:
     app = QApplication(sys.argv)
     w = IrisIdeWindow()
     assert w.windowFlags() & Qt.WindowType.FramelessWindowHint
-    w.show_loading()
+    w.show_welcome()
+    assert w.is_welcome_visible()
     assert w.windowTitle() == IRIS_IDE_TITLE
     icon_path = Path(__file__).resolve().parents[2] / "assets" / "iris_icon.png"
     assert icon_path.is_file()
-    assert TOKENS.background_primary in w.styleSheet()
+    assert TOKENS.void_black in w.styleSheet()
     print("iris_ide_window ok")
 
 

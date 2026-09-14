@@ -217,11 +217,11 @@ export class IrisIdeBridgeServer {
                 return { items: [] };
             case 'createTerminal':
             case 'runTerminalCommand': {
-                const { execSync } = require('child_process') as typeof import('child_process');
                 const command = String(args.command || args.cmd || 'echo IRIS_IDE_TEST');
                 const cwd = args.cwd ? this.resolvePath(String(args.cwd)) : this.workspaceRoot;
-                const out = execSync(command, { cwd, encoding: 'utf-8', timeout: 30000 });
-                return { command, output: out, cwd };
+                throw new Error(
+                    'runTerminalCommand must go through standalone-bridge frontend queue (Theia integrated terminal)',
+                );
             }
             case 'getTerminalState':
                 return { active: false };

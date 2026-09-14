@@ -1,4 +1,4 @@
-"""IRIS IDE companion 80:20 tile geometry (PyQt, no live Theia required)."""
+"""IRIS IDE companion 80:20 — 듀얼 타일 + 단일 창 셸."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from iris.system.ide_tiler import (
     tile_iris_ide_and_iris,
     work_area_for,
 )
+from iris.ui.workspaces.ide_companion_page import IdeCompanionPage, IdeUnifiedShell
 from iris.ui.workspaces.iris_ide_window import IrisIdeWindow
 
 
@@ -48,9 +49,23 @@ def main() -> int:
     assert tiles_are_flush(ide_geo, iris_geo), (ide_geo, iris_geo)
     assert not tiles_have_overlap(ide_geo, iris_geo), (ide_geo, iris_geo)
     assert ide_geo.width() + iris_geo.width() == total
+
+    # 단일 창 내부 8:2
+    shell = IdeUnifiedShell()
+    companion = IdeCompanionPage()
+    ide2 = IrisIdeWindow()
+    ide2.set_embedded(True)
+    shell.resize(1000, 600)
+    shell.show()
+    shell.mount(ide2, companion, total_w=1000)
+    app.processEvents()
+    sizes = shell._split.sizes()
+    assert sizes[0] == 800 and sizes[1] == 200, sizes
+    assert ide2.is_embedded()
+
     iris.close()
     app.processEvents()
-    print("iris_ide_companion_tile check ok", tiles.ide, tiles.iris)
+    print("iris_ide_companion_tile check ok", tiles.ide, tiles.iris, "unified", sizes)
     return 0
 
 

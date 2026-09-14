@@ -304,6 +304,33 @@ def is_core_ready() -> bool:
     return bool(load_setup_state().get("core_ready"))
 
 
+def needs_setup_wizard(*, hermes_command: str = "hermes") -> bool:
+    """시작 프로토콜 위저드가 필요한지 — 미설치 또는 한 번도 Core 완료 안 함."""
+    if not ollama_executable() or not hermes_executable(hermes_command):
+        return True
+    return not is_core_ready()
+
+
+def _warm_core_services(
+    *,
+    ollama_base_url: str,
+    hermes_base_url: str,
+    hermes_command: str,
+    wait_sec: float = 25.0,
+) -> None:
+    """재부팅 직후 꺼져 있을 수 있는 Ollama/Hermes를 조용히 기동 시도."""
+    half = max(8.0, wait_sec / 2)
+    if ollama_executable():
+        ensure_ollama_running(ollama_base_url, wait_sec=half)
+    if hermes_executable(hermes_command):
+        ensure_hermes_gateway_running(
+            hermes_base_url,
+            api_key=resolve_hermes_api_key(),
+            command=hermes_command,
+            wait_sec=half,
+        )
+
+
 def mark_core_ready_if_healthy(
     *,
     ollama_base_url: str = "http://127.0.0.1:11434/v1",
@@ -311,15 +338,16 @@ def mark_core_ready_if_healthy(
     hermes_command: str = "hermes",
     min_model: str = "",
 ) -> bool:
-    """위저드 생략 여부 — 실행 파일 존재가 아니라 실제 헬스체크로 판단한다.
+    """부팅 게이트 — True면 시작 프로토콜 없이 runtime boot.
 
-    - core_ready였더라도 매번 빠른 헬스체크(Ollama 응답·모델·Hermes gateway)를
-      수행한다. 실패하면 core_ready를 해제하고 False를 반환해 위저드/복구로 보낸다.
-      (MCP stdio 핸드셰이크는 느려서 여기선 생략 — core_smoke 단계에서 검증)
-    - 아직 core_ready가 아니면, 실행 파일이 있을 때만 같은 헬스체크를 시도하고
-      통과해야 core_ready로 기록한다.
-    - 헬스체크 자체가 실패(연결 거부 등)하면 항상 False.
+    - Ollama/Hermes 실행 파일이 없으면 False (위저드).
+    - core_ready가 이미 True면 헬스 실패로 플래그를 지우지 않고, 서비스 기동만
+      시도한 뒤 True (재부팅 직후 일시 미응답은 일반 부팅에서 복구).
+    - core_ready가 아니면 기동 시도 후 verify_core_quick 통과 시에만 core_ready 기록.
     """
+    if not ollama_executable() or not hermes_executable(hermes_command):
+        return False
+
     proto = SetupProtocol(
         ollama_base_url=ollama_base_url,
         hermes_base_url=hermes_base_url,
@@ -329,13 +357,18 @@ def mark_core_ready_if_healthy(
         dry_run=False,
     )
     if is_core_ready():
-        ok, _detail = proto.verify_core_quick()
-        if ok:
-            return True
-        reset_core_ready()
-        return False
-    if not (ollama_executable() and hermes_executable(hermes_command)):
-        return False
+        _warm_core_services(
+            ollama_base_url=ollama_base_url,
+            hermes_base_url=hermes_base_url,
+            hermes_command=hermes_command,
+        )
+        return True
+
+    _warm_core_services(
+        ollama_base_url=ollama_base_url,
+        hermes_base_url=hermes_base_url,
+        hermes_command=hermes_command,
+    )
     ok, _detail = proto.verify_core_quick()
     if not ok:
         return False
@@ -646,6 +679,44 @@ class SetupProtocol:
             "min_model": self.min_model,
             "api_key_set": bool(resolve_hermes_api_key()),
         }
+
+    def detect_local(self) -> dict[str, Any]:
+        """로컬 파일·설정만 — 네트워크 헬스는 enrich_detect_network."""
+        exe_o = ollama_executable()
+        exe_h = hermes_executable(self.hermes_command)
+        repo = project_root()
+        venv_py = repo / ".venv" / "Scripts" / "python.exe"
+        if not venv_py.is_file():
+            venv_py = repo / ".venv" / "bin" / "python"
+        return {
+            "core_ready": bool(self._state.get("core_ready")),
+            "state_dir": str(iris_state_dir()),
+            "ollama_exe": exe_o,
+            "ollama_running": None,
+            "hermes_exe": exe_h,
+            "hermes_running": None,
+            "venv_ok": venv_py.is_file(),
+            "min_model": self.min_model,
+            "api_key_set": bool(resolve_hermes_api_key()),
+        }
+
+    def enrich_detect_network(
+        self,
+        snap: dict[str, Any],
+        *,
+        timeout_sec: float = 1.0,
+    ) -> dict[str, Any]:
+        """detect_local 결과에 Ollama/Hermes 실행 여부를 짧은 타임아웃으로 채운다."""
+        out = dict(snap)
+        out["ollama_running"] = is_ollama_running(
+            self.ollama_base_url,
+            timeout_sec=timeout_sec,
+        )
+        out["hermes_running"] = is_hermes_gateway_running(
+            self.hermes_base_url,
+            timeout_sec=timeout_sec,
+        )
+        return out
 
     def _record_step(self, step_id: str, status: str, message: str = "") -> SetupStepResult:
         message = redact_secrets(message)
@@ -1425,6 +1496,9 @@ class SetupProtocol:
         """성공/재확인 NeedsUser면 Result, 다음 폴백이면 None."""
         self._emit_stream(f"공식 설치: irm {OLLAMA_INSTALL_PS1} | iex", None, replace=False)
         ps = (
+            # PowerShell 5.1의 irm은 ProgressPreference 기본값(Continue) 때문에
+            # 진행률 렌더링이 병목이 된다. 245KB 스크립트가 3분+ 걸리는 원인.
+            "$ProgressPreference='SilentlyContinue'; "
             "& ([scriptblock]::Create((irm '"
             + OLLAMA_INSTALL_PS1
             + "')))"
@@ -1631,6 +1705,9 @@ class SetupProtocol:
                 can_install=False,
             )
         ps = (
+            # PowerShell 5.1의 irm은 ProgressPreference 기본값(Continue) 때문에
+            # 진행률 렌더링이 병목이 된다. 245KB 스크립트가 3분+ 걸리는 원인.
+            "$ProgressPreference='SilentlyContinue'; "
             "& ([scriptblock]::Create((irm '"
             + HERMES_INSTALL_URL
             + "'))) -SkipSetup -NonInteractive"
@@ -2383,8 +2460,7 @@ def _self_check() -> None:
     assert real_before == real_after2, "dry_run 저장이 실제 setup_state.json을 건드림"
     dryrun_path.unlink(missing_ok=True)
 
-    # --- 3/9) mark_core_ready_if_healthy·verify_core_quick은 실행 파일 존재가 아니라
-    #          실제 네트워크 헬스체크로 판단한다 (죽은 포트면 core_ready였어도 False) ---
+    # --- 3/9) verify_core_quick은 실제 네트워크 헬스체크 (죽은 포트면 False) ---
     dead_proto = SetupProtocol(
         ollama_base_url="http://127.0.0.1:1/v1",
         hermes_base_url="http://127.0.0.1:2/v1",
@@ -2393,6 +2469,35 @@ def _self_check() -> None:
     )
     ok_quick, detail_quick = dead_proto.verify_core_quick()
     assert ok_quick is False and detail_quick, detail_quick
+
+    # --- 3b) core_ready 완료 후에는 헬스 실패해도 reset·위저드로 보내지 않음 ---
+    saved_gate = load_setup_state()
+    try:
+        st = dict(saved_gate)
+        st["core_ready"] = True
+        save_setup_state(st)
+        warm_calls = {"n": 0}
+
+        def _noop_warm(**_kwargs) -> None:
+            warm_calls["n"] += 1
+
+        orig_warm = globals()["_warm_core_services"]
+        globals()["_warm_core_services"] = _noop_warm
+        try:
+            boot_ok = mark_core_ready_if_healthy(
+                ollama_base_url="http://127.0.0.1:1/v1",
+                hermes_base_url="http://127.0.0.1:2/v1",
+                hermes_command="hermes",
+            )
+        finally:
+            globals()["_warm_core_services"] = orig_warm
+        assert boot_ok is True
+        assert load_setup_state().get("core_ready") is True
+        assert warm_calls["n"] == 1
+        if ollama_executable() and hermes_executable("hermes"):
+            assert needs_setup_wizard(hermes_command="hermes") is False
+    finally:
+        save_setup_state(saved_gate)
 
     # --- 5/6) 모델 존재 확인은 startswith 접두 오탐이 아니라 정확히 일치해야 한다 ---
     assert _model_present(["gemma4:e2b", "llama3:8b"], "gemma4:e2b") is True

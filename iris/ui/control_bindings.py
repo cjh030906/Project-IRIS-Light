@@ -454,6 +454,44 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
         _log(window, "ide.toggle_companion", True)
         return ok_result("ide.toggle_companion", {"ui_mode": window._ui_mode})
 
+    def ide_pick_open_folder(_a: dict[str, Any]) -> dict[str, Any]:
+        from PyQt6.QtWidgets import QFileDialog
+
+        start = ""
+        try:
+            start = str(load_user_profile(window._db).project_root or "")
+        except Exception:
+            start = ""
+        path = QFileDialog.getExistingDirectory(window, "Open Folder", start)
+        if not path:
+            return ok_result("ide.pick_open_folder", {"cancelled": True})
+        return ide_open_folder({"path": path, "new_window": False})
+
+    def ide_pick_open_file(_a: dict[str, Any]) -> dict[str, Any]:
+        from PyQt6.QtWidgets import QFileDialog
+
+        start = ""
+        try:
+            start = str(load_user_profile(window._db).project_root or "")
+        except Exception:
+            start = ""
+        paths, _ok = QFileDialog.getOpenFileNames(window, "Open File", start)
+        if not paths:
+            return ok_result("ide.pick_open_file", {"cancelled": True, "opened": []})
+        opened: list[str] = []
+        errors: list[str] = []
+        for p in paths:
+            r = ide_open_file({"path": p})
+            if r.get("ok"):
+                opened.append(p)
+            else:
+                errors.append(str(r.get("error") or p))
+        ok = bool(opened) and not errors
+        body = {"opened": opened, "errors": errors}
+        if not ok:
+            return err_result("ide.pick_open_file", errors[0] if errors else "open failed", body)
+        return ok_result("ide.pick_open_file", body)
+
     def ide_open_folder(args: dict[str, Any]) -> dict[str, Any]:
         path = str(args.get("path") or args.get("folder") or args.get("project_root") or "").strip()
         if not path:
@@ -932,12 +970,27 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
 
         ide_terminal = "failed"
         result: dict[str, Any]
+        t0 = time.monotonic()
         if session.ide_id == "iris_ide":
             try:
                 client = window._iris_ide_bridge_client()
                 term = client.run_terminal_command(shell_cmd, cwd=root_s)
                 elapsed = time.monotonic() - t0
                 output = str(term.get("output") or "")
+                via = str(term.get("via") or "iris_ide_bridge")
+                queued = bool(term.get("queued"))
+                if via == "bridge_fallback":
+                    return err_result(
+                        "project.run",
+                        "IDE integrated terminal unavailable (bridge ran command outside Theia — blocked)",
+                        {"via": via, "command": shell_cmd},
+                    )
+                if not queued and via != "theia_terminal":
+                    return err_result(
+                        "project.run",
+                        "IDE integrated terminal did not accept command",
+                        {"via": via, "command": shell_cmd},
+                    )
                 payload = {
                     "ok": True,
                     "exit_code": 0,
@@ -947,8 +1000,8 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
                     "argv": argv,
                     "cwd": root_s,
                     "timed_out": False,
-                    "via": "iris_ide_bridge",
-                    "ide_terminal": "iris_ide_bridge",
+                    "via": via,
+                    "ide_terminal": "ok" if queued or via == "theia_terminal" else "iris_ide_bridge",
                 }
                 payload["summary"] = summarize_run(payload).get("summary") or output[:120]
                 _log(window, "project.run", True)
@@ -957,7 +1010,6 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
                 return err_result("project.run", str(exc))
         hwnd = int(session.hwnd) if session and session.hwnd else None
         pid = session.pid if session else None
-        t0 = time.monotonic()
 
         if not reveal:
             return err_result("project.run", "project.run requires IDE integrated terminal")
@@ -1088,6 +1140,18 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
         "ide.open_file",
         ide_open_file,
         summary="Open a file in the currently bound IDE session editor",
+        risk="medium",
+    )
+    reg.register(
+        "ide.pick_open_folder",
+        ide_pick_open_folder,
+        summary="Native OS folder picker then open that folder in IRIS IDE",
+        risk="medium",
+    )
+    reg.register(
+        "ide.pick_open_file",
+        ide_pick_open_file,
+        summary="Native OS file picker then open selected files in the bound IDE",
         risk="medium",
     )
     reg.register(

@@ -14,6 +14,9 @@ const wantPort = parseInt(process.env.IRIS_IDE_BRIDGE_PORT || '0', 10);
 const stateFile = (process.env.IRIS_IDE_STATE_FILE || '').trim();
 
 let editorState = null;
+let pendingCommands = [];
+let commandResults = {};
+let nextCommandId = 1;
 
 function writeState(port) {
     if (!stateFile) return;
@@ -36,7 +39,13 @@ function writeState(port) {
 
 function resolvePath(rel) {
     const root = workspaceRoot;
-    const target = path.resolve(root, rel || '.');
+    const raw = String(rel || '').trim();
+    if (path.isAbsolute(raw)) {
+        const abs = path.resolve(raw);
+        if (!abs.startsWith(root)) throw new Error('path escapes workspace');
+        return abs;
+    }
+    const target = path.resolve(root, raw || '.');
     if (!target.startsWith(root)) throw new Error('path escapes workspace');
     return target;
 }
@@ -64,6 +73,33 @@ function authOk(req) {
     return url.searchParams.get('token') === token;
 }
 
+function waitForFrontendCommand(id, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+        const deadline = Date.now() + timeoutMs;
+        const tick = () => {
+            const slot = commandResults[id];
+            if (slot) {
+                delete commandResults[id];
+                if (slot.error) reject(new Error(slot.error));
+                else resolve(slot.result || {});
+                return;
+            }
+            if (Date.now() > deadline) {
+                reject(new Error('frontend command timeout'));
+                return;
+            }
+            setTimeout(tick, 80);
+        };
+        setTimeout(tick, 80);
+    });
+}
+
+function enqueueFrontend(cmd, args, timeoutMs = 30000) {
+    const id = nextCommandId++;
+    pendingCommands.push({ id, cmd, args: args || {} });
+    return waitForFrontendCommand(id, timeoutMs);
+}
+
 async function dispatch(cmd, args) {
     switch (cmd) {
         case 'health':
@@ -73,6 +109,20 @@ async function dispatch(cmd, args) {
         case 'setEditorState':
             editorState = args && typeof args === 'object' ? args : null;
             return { saved: true };
+        case 'pollPendingCommands': {
+            const limit = Math.min(parseInt(String(args.limit || 8), 10) || 8, 20);
+            const batch = pendingCommands.splice(0, limit);
+            return { commands: batch };
+        }
+        case 'completeCommand': {
+            const id = parseInt(String(args.id || 0), 10);
+            if (!id) throw new Error('completeCommand: id required');
+            commandResults[id] = {
+                result: args.result && typeof args.result === 'object' ? args.result : { value: args.result },
+                error: args.error ? String(args.error) : '',
+            };
+            return { ok: true };
+        }
         case 'getActiveEditor':
             return { editor: editorState };
         case 'getOpenEditors':
@@ -88,8 +138,12 @@ async function dispatch(cmd, args) {
             const rel = String(args.path || '');
             const abs = resolvePath(rel);
             if (!fs.existsSync(abs)) throw new Error(`file not found: ${rel}`);
-            editorState = { uri: abs, path: rel, line: args.line || 1, column: args.column || 1 };
-            return { path: abs, opened: true };
+            try {
+                return await enqueueFrontend(cmd, { path: rel, abs, line: args.line || 1, column: args.column || 1 }, 3500);
+            } catch {
+                editorState = { uri: abs, path: rel, line: args.line || 1, column: args.column || 1 };
+                return { path: abs, opened: true, via: 'bridge_fallback' };
+            }
         }
         case 'saveFile':
         case 'saveAll':
@@ -138,14 +192,22 @@ async function dispatch(cmd, args) {
         case 'findReferences':
             return { items: [] };
         case 'createTerminal':
+            try {
+                return await enqueueFrontend('createTerminal', { name: String(args.name || 'IRIS') }, 3500);
+            } catch {
+                return { name: String(args.name || 'IRIS'), created: false, via: 'bridge_fallback' };
+            }
         case 'runTerminalCommand': {
-            const command = String(args.command || args.cmd || 'echo IRIS_IDE_TEST');
-            const cwd = args.cwd ? resolvePath(String(args.cwd)) : workspaceRoot;
-            const out = execSync(command, { cwd, encoding: 'utf8', timeout: 30000 });
-            return { command, output: out, cwd };
+            const command = String(args.command || args.cmd || '').trim();
+            if (!command) {
+                throw new Error('runTerminalCommand: empty command');
+            }
+            const cwd = args.cwd ? String(args.cwd) : workspaceRoot;
+            // ponytail: execSync 폴백 금지 — Hermes/브릿지 셸이 아니라 Theia 통합 터미널만.
+            return await enqueueFrontend('runTerminalCommand', { command, cwd }, 15000);
         }
         case 'getTerminalState':
-            return { active: false };
+            return { active: pendingCommands.some(c => c.cmd === 'runTerminalCommand') };
         case 'runTask':
             return { started: false };
         case 'getTaskState':
@@ -163,8 +225,8 @@ async function dispatch(cmd, args) {
         case 'getGitDiff':
             try {
                 const rel = String(args.path || '');
-                const cmd = rel ? `git diff -- ${rel}` : 'git diff';
-                return { diff: execSync(cmd, { cwd: workspaceRoot, encoding: 'utf8' }) };
+                const gitCmd = rel ? `git diff -- ${rel}` : 'git diff';
+                return { diff: execSync(gitCmd, { cwd: workspaceRoot, encoding: 'utf8' }) };
             } catch {
                 return { diff: '' };
             }
