@@ -867,7 +867,7 @@ class SetupProtocol:
         if not info.get("usable"):
             return False, report or "사용 가능한 Ollama 모델이 없습니다"
         key = resolve_hermes_api_key()
-        if not is_hermes_gateway_running(self.hermes_base_url, api_key=key):
+        if not is_hermes_gateway_running(self.hermes_base_url, api_key=key, timeout_sec=3.0):
             return False, "Hermes gateway /health 실패"
         return True, "Ollama·Hermes 정상"
 

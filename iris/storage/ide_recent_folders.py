@@ -69,3 +69,30 @@ def truncate_path_middle(path: str, max_len: int = 52) -> str:
     head = max_len // 2 - 2
     tail = max_len - head - 3
     return f"{path[:head]}...{path[-tail:]}"
+
+
+def next_iris_project_dir(parent: Path, *, base: str = "Iris Project") -> Path:
+    """Create folder용 — 이름 입력 없이 쓸 고유 경로 (아직 만들지 않음)."""
+    root = Path(parent).expanduser()
+    candidate = root / base
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        candidate = root / f"{base} {n}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td)
+        a = next_iris_project_dir(p)
+        assert a.name == "Iris Project"
+        a.mkdir()
+        b = next_iris_project_dir(p)
+        assert b.name == "Iris Project 2"
+    print("ide_recent_folders ok")

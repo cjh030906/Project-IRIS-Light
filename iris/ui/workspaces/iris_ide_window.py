@@ -94,29 +94,36 @@ class IrisIdeWindow(QMainWindow):
         self._loaded_workspace = ""
         self._defer_show = False
         self._load_hooked = False
+        # ponytail: "embedded" = Companion에 도킹된 자식 HWND (QWidget 임베드 아님)
         self._embedded = False
 
-    def set_embedded(self, embedded: bool) -> None:
-        """단일 창 Companion — top-level Window ↔ 내부 위젯."""
+    def set_embedded(self, embedded: bool, *, host: QWidget | None = None) -> None:
+        """Companion 도킹 — 항상 top-level HWND 유지 (Qt.Widget 임베드 금지).
+
+        WA_Translucent 조상 트리 아래 QMainWindow→Widget 재부모는
+        QWebEngine(터미널·단축키·포커스) 입력을 깨뜨린다. 시각적 단일 창은
+        호스트 rect에 geometry만 맞춘 자식 Window로 구현한다.
+        """
         embedded = bool(embedded)
-        if self._embedded == embedded:
-            return
-        self._embedded = embedded
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
         if embedded:
-            self.setWindowFlags(Qt.WindowType.Widget)
+            self._embedded = True
             self.setMinimumSize(0, 0)
+            # setParent(host, flags) — 플래그+부모 원자적 (setWindowFlags만 쓰면 부모 유실)
+            self.setParent(host, flags)
         else:
-            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+            was = self._embedded
+            self._embedded = False
+            self.setParent(None, flags)
             self.setMinimumSize(640, 480)
-            self._frameless_chrome_applied = False
+            if was:
+                self._frameless_chrome_applied = False
 
     def is_embedded(self) -> bool:
         return self._embedded
 
     def apply_frameless_chrome(self) -> None:
         """Companion/타일 — Win11 DWM 1px 테두리 숨김 (FramelessWindowHint는 __init__)."""
-        if self._embedded:
-            return
         suppress_native_window_border(self)
         self._frameless_chrome_applied = True
 
@@ -180,19 +187,16 @@ class IrisIdeWindow(QMainWindow):
         """Companion 진입 기본화면 — 저장된 폴더를 자동으로 열지 않음."""
         self._welcome.refresh_recent_folders()
         self._stack.setCurrentWidget(self._welcome)
-        if show_window and not self._embedded:
+        if show_window:
             self.show()
             self.raise_()
-        elif self._embedded:
-            self.show()
 
     def show_loading(self, message: str = "IRIS IDE 시작 중…", *, show_window: bool = True) -> None:
         self._loading_label.setText(message)
         self._stack.setCurrentWidget(self._loading)
-        if show_window and not self._embedded:
+        if show_window:
             self.show()
-        elif self._embedded:
-            self.show()
+            self.raise_()
 
     def load_theia(
         self,
@@ -249,8 +253,8 @@ class IrisIdeWindow(QMainWindow):
         if defer_show:
             return
         self.show()
-        if not self._embedded:
-            self.raise_()
+        self.raise_()
+        self.focus_theia_view()
 
     def hide_window(self) -> None:
         self.hide()
@@ -264,6 +268,16 @@ class IrisIdeWindow(QMainWindow):
             self.set_embedded(False)
         self.hide()
         self.close()
+
+    def focus_theia_view(self) -> None:
+        """터미널/단축키용 — WebEngine에 포커스 한 번."""
+        if self._view is None:
+            return
+        if self._stack.currentWidget() is not self._view:
+            return
+        self.raise_()
+        self.activateWindow()
+        self._view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def is_welcome_visible(self) -> bool:
         return self._stack.currentWidget() is self._welcome

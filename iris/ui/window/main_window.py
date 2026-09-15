@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 import time
 
-from PyQt6.QtCore import QEvent, QRect, Qt, QThread, QTimer
+from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QThread, QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
@@ -181,6 +181,10 @@ class IdeSession:
 
 MIN_COMPANION_IRIS_WIDTH = 260  # companion sync가 Iris 폭을 0으로 밀지 않도록 하는 하한선
 _HERO_ORB_SCALE = 2.55
+# Assistant 우측 모니터 — 히어로 hide 후 splitter가 0~수 px로 붕괴한 값을 저장하지 않음
+_ASSISTANT_RIGHT_DEFAULT = 340
+_ASSISTANT_RIGHT_MIN = 220
+_ASSISTANT_CENTER_MIN = 340
 
 
 class MainWindow(QMainWindow):
@@ -193,6 +197,8 @@ class MainWindow(QMainWindow):
         icon = load_app_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
+        # ponytail: ctor 중 winId()/HWND 브랜딩은 Windows에서 abort(0xC0000409).
+        # showEvent에서만 apply_hwnd_branding.
         self.setMinimumSize(960, 640)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAcceptDrops(True)
@@ -238,6 +244,7 @@ class MainWindow(QMainWindow):
         self._boot_checks_worker: BootChecksWorker | None = None
         self._boot_checks_done = False
         self._startup_health_worker: QThread | None = None
+        self._core_warm_worker: QThread | None = None
         self._emu_launch_worker: EmulatorLaunchWorker | None = None
         self._iris_ide_launch_worker: IrisIdeLaunchWorker | None = None
         self._pending_iris_ide_source = "icon"
@@ -295,6 +302,8 @@ class MainWindow(QMainWindow):
         self._companion_saved_geometry = None
         self._companion_saved_min_size = None
         self._hero_saved_geometry = None
+        # 히어로가 right_column을 숨기기 전 모니터 폭 — companion 복귀 시 사용
+        self._home_assistant_sizes: list[int] | None = None
         self._orb_spacer_min_h = 160
         self._normal_root_margins = (
             TOKENS.spacing_lg,
@@ -451,8 +460,12 @@ class MainWindow(QMainWindow):
 
         self._companion_page = IdeCompanionPage()
         self._unified_shell = IdeUnifiedShell()
+        self._unified_shell.set_split_changed_callback(self._sync_docked_iris_ide_geometry)
         self._body_stack = QStackedWidget()
         self._body_stack.setObjectName("MainBodyStack")
+        # Companion 우측·히어로에서 사이버/구체가 비치도록
+        self._body_stack.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._body_stack.setStyleSheet("QStackedWidget#MainBodyStack { background: transparent; }")
         self._body_stack.addWidget(splitter)
         self._body_stack.addWidget(self._companion_page)
         self._body_stack.addWidget(self._unified_shell)
@@ -718,6 +731,32 @@ class MainWindow(QMainWindow):
         if self._runtime_boot_started:
             return
         self._runtime_boot_started = True
+        self._schedule_core_warm()
+        # ponytail: IDE 히어로/Companion 중이면 인트로를 가로채지 않는다 —
+        # prepare_hidden이 복귀 연출을 죽이고, 사용자는 '시작 안 됨'으로 본다.
+        if (
+            self._ui_mode != "normal"
+            or self._hero_enter_pending
+            or self._hero_exit_pending
+        ):
+            if self._intro is None:
+                self._intro = StartupIntroAnimator(self)
+                self._intro.bind(
+                    left=self._left_sidebar,
+                    right=self._assistant_page.right_column,
+                    orb=self._viz.particle_core(),
+                    live=self._live_activity,
+                    chat=self._chat,
+                    waveform=self._chat.waveform,
+                    chrome=[self._drag],
+                )
+            try:
+                self._intro.finished.disconnect(self._on_intro_finished)
+            except TypeError:
+                pass
+            self._intro.finished.connect(self._on_intro_finished)
+            QTimer.singleShot(900, self._schedule_tts_runtime_bootstrap)
+            return
         # ponytail: control/Hermes는 intro 끝난 뒤(_on_intro_finished) — MCP→/v1/state가
         # UI 스레드를 붙잡아 Windows「응답하지 않음」이 나던 경로를 피한다.
         self._intro = StartupIntroAnimator(self)
@@ -734,9 +773,28 @@ class MainWindow(QMainWindow):
         self._viz.particle_core().set_boot_reveal(0.0)
         self._viz.particle_core().set_boot_glitch(1.0)
         self._chat.waveform.set_reveal_progress(0.0)
-        self._intro.prepare_hidden()
+        # ponytail: prepare_hidden은 show/layout 이후(_begin_boot_sequence) —
+        # 게이트가 빨라지면 폭 0 상태에서 arm 되어 인트로가 안 보이는 회귀가 난다.
         QTimer.singleShot(40, self._begin_boot_sequence)
         QTimer.singleShot(900, self._schedule_tts_runtime_bootstrap)
+
+    def _schedule_core_warm(self) -> None:
+        """Ollama/Hermes 기동은 인트로와 병렬 — 게이트에서 기다리지 않음."""
+        if self._test_mode:
+            return
+        if getattr(self, "_core_warm_worker", None) is not None:
+            return
+        from iris.ui.workers.startup_health_worker import CoreWarmWorker
+
+        worker = CoreWarmWorker(
+            ollama_base_url=self._settings.ollama_base_url,
+            hermes_base_url=self._settings.hermes_base_url,
+            hermes_command=self._settings.hermes_command,
+            parent=self,
+        )
+        self._core_warm_worker = worker
+        worker.finished.connect(lambda: setattr(self, "_core_warm_worker", None))
+        worker.start()
 
     def _begin_boot_sequence(self) -> None:
         """빈 창에서 UI 등장 연출 + 모델·에뮬 점검을 동시에 시작.
@@ -745,6 +803,7 @@ class MainWindow(QMainWindow):
         에뮬레이터 준비 알림이 떠야 한다.
         """
         if self._intro is not None:
+            self._intro.prepare_hidden()
             self._intro.start()
         QTimer.singleShot(1500, self._start_boot_checks)
         self._refresh_models()
@@ -4599,8 +4658,9 @@ class MainWindow(QMainWindow):
 
     def _companion_iris_ide_window(self) -> IrisIdeWindow | None:
         """Companion 중 IRIS IDE(PyQt) 창 — Win32 sync와 분리 (ide-companion-tile-8020)."""
+        # HWND 도킹 모드도 별도 top-level — sync는 _sync_docked_iris_ide_geometry
         if self._iris_ide_unified:
-            return None  # 단일 창 임베드 — 별도 top-level 타일 없음
+            return None
         win = self._iris_ide_window
         if win is None:
             return None
@@ -4801,14 +4861,15 @@ class MainWindow(QMainWindow):
             self._live_activity.append_instant_line(f"폴더 열기 실패: {err}")
 
     def _sync_ide_hero_geometry(self) -> None:
+        """히어로는 UiOverlay 전체 — body만 덮으면 DragTab 아래 심(겹침)이 생김."""
         hero = getattr(self, "_ide_hero", None)
         overlay = getattr(self, "_ui_overlay", None)
-        body = getattr(self, "_body_stack", None)
-        if hero is None or overlay is None or body is None:
+        if hero is None or overlay is None:
             return
-        top_left = body.mapTo(overlay, body.rect().topLeft())
-        hero.setGeometry(top_left.x(), top_left.y(), body.width(), body.height())
+        hero.setGeometry(overlay.rect())
         hero.raise_()
+        # 크롬 클릭 유지 — 히어로 위에 DragTab
+        self._drag.raise_()
 
     def _enter_iris_ide_hero(self, *, source: str = "icon") -> None:
         """IRIS IDE 단일 창 히어로 — 주변 UI 퇴장 → 구체 → 타이틀 글리치."""
@@ -4880,11 +4941,21 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         self._hero_enter_pending = False
+        self._sync_ide_hero_geometry()  # DragTab을 히어로 위에 유지
         self._live_activity.append_instant_line("IDE: hero (single window)")
 
     def _apply_iris_ide_hero_layout(self) -> None:
         """히어로 레이아웃만 적용 — 인트로가 구체/오버레이를 켠다."""
-        self._root_lay.setContentsMargins(0, TOKENS.spacing_sm, 0, TOKENS.spacing_sm)
+        # 폴더 전: 상단 분리 없음 (Companion 80:20은 폴더 연 뒤에만)
+        self._root_lay.setContentsMargins(0, 0, 0, 0)
+        # 히어로는 전역 orb_layer (Companion 슬롯 모드면 cyberspace로 복귀)
+        if self._viz.is_layout_orb_mode() or self._viz.parent() is not self._cyberspace_bg:
+            self._restore_viz_to_cyberspace()
+        self._cyberspace_bg.set_orb_host(None)
+        self._cyberspace_bg.set_orb_above_ui(False)
+
+        # hide 전에 모니터 폭 스냅샷 — hide 후 sizes()는 우측이 붕괴됨
+        self._home_assistant_sizes = self._snapshot_assistant_sizes()
 
         self._left_sidebar.hide()
         self._assistant_page.right_column.hide()
@@ -4905,12 +4976,12 @@ class MainWindow(QMainWindow):
         core.set_size_scale(_HERO_ORB_SCALE)
         core.set_boot_reveal(0.0)
         core.set_boot_glitch(1.0)
-        self._cyberspace_bg.set_orb_above_ui(False)
 
         self._ui_mode = "ide_hero"
         self._drag.set_ide_companion_active(True)
         self._set_workspace_icon_active("ide")
         self._sync_ide_hero_geometry()
+        self._ide_hero.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._ide_hero.hide()  # reveal 연출이 show
         self._ide_hero.refresh_recent()
         self._viz.request_sync_orb_anchor("ide_hero_enter")
@@ -4982,7 +5053,7 @@ class MainWindow(QMainWindow):
         self._viz.set_hero_orb_placement(False)
 
         self._left_sidebar.show()
-        self._assistant_page.right_column.show()
+        self._restore_assistant_sizes(self._home_assistant_sizes)
         self._live_activity.show()
         self._chat.show()
         self._orb_spacer.setMinimumHeight(self._orb_spacer_min_h)
@@ -5022,41 +5093,96 @@ class MainWindow(QMainWindow):
         return IrisIdeClient(base_url=mgr.bridge_base_url(), token=mgr.bridge_token())
 
     def _activate_iris_ide_companion_tile(self, *, label: str = "") -> str:
-        """IRIS IDE — 단일 창 내부 8:2 (별도 top-level IDE 창 타일 없음)."""
+        """IRIS IDE — Iris 본체 8:2 + IDE는 자식 HWND로 좌측 호스트에 도킹.
+
+        Qt.Widget 임베드는 WebEngine 입력(터미널/실행)을 깨므로 쓰지 않는다.
+        """
         from PyQt6.QtWidgets import QApplication
 
         win = self._ensure_iris_ide_window()
-        win.set_embedded(True)
-        try:
-            wid = int(self.winId())
-        except Exception:
-            wid = 0
-        self._ide_hwnd = wid or None
         self._apply_iris_ide_unified_layout(True)
         QApplication.processEvents()
         work = work_area_for(self)
         place_qt_window(self, work)
         QApplication.processEvents()
-        self._unified_shell.apply_ratio(work.width())
+        self._unified_shell.apply_ratio(max(1, self._unified_shell.width() or work.width()))
         suppress_native_window_border(self)
-        self._fit_companion_orb_to_width()
-        self._viz.request_sync_orb_anchor("ide_companion_tiled")
+
+        # 자식 top-level HWND — 반투명 조상 트리 밖
+        win.set_embedded(True, host=self)
+        win.apply_frameless_chrome()
+        self._sync_docked_iris_ide_geometry()
+        win.show()
+        win.raise_()
+        QApplication.processEvents()
+        try:
+            self._ide_hwnd = int(win.winId()) or None
+        except Exception:
+            self._ide_hwnd = None
+        self._embed_viz_in_companion_slot()
+        QApplication.processEvents()
+        self._viz.request_sync_orb_anchor("ide_companion_tiled_stable")
         self._iris_ide_unified = True
-        # 단일 창 — 두 창 sync 타이머 불필요
         if self._companion_sync_timer.isActive():
             self._companion_sync_timer.stop()
         if label:
             self._live_activity.append_instant_line(
-                f"IDE Companion: {label} unified 80:20 (single window)"
+                f"IDE Companion: {label} docked 80:20 (HWND over host)"
             )
         return ""
 
+    def _sync_docked_iris_ide_geometry(self) -> None:
+        """좌측 ide_host에 IRIS IDE를 맞추되, 우측 iris_host와 경계 flush (겹침·틈 금지)."""
+        win = self._iris_ide_window
+        if win is None or not self._iris_ide_unified:
+            return
+        host = self._unified_shell.ide_host()
+        iris = self._unified_shell.iris_host()
+        if host is None or not host.isVisible():
+            return
+        if host.height() <= 0:
+            return
+        top_left = host.mapToGlobal(QPoint(0, 0))
+        # IDE 오른쪽 = Iris Companion 왼쪽 — host.width()만 쓰면 DWM/DPI로 1~수 px 침범 가능
+        if iris is not None and iris.isVisible():
+            iris_left = iris.mapToGlobal(QPoint(0, 0)).x()
+            width = max(1, iris_left - top_left.x())
+        else:
+            width = max(1, host.width())
+        win.setGeometry(QRect(top_left.x(), top_left.y(), width, host.height()))
+        suppress_native_window_border(win)
+
+    @staticmethod
+    def _normalize_assistant_sizes(sizes: list[int] | None) -> list[int]:
+        """우측 모니터 폭이 붕괴(0~min 미만)면 기본값으로 복구."""
+        if not sizes or len(sizes) < 2:
+            return [800, _ASSISTANT_RIGHT_DEFAULT]
+        left = max(0, int(sizes[0]))
+        right = max(0, int(sizes[1]))
+        if right < _ASSISTANT_RIGHT_MIN:
+            right = _ASSISTANT_RIGHT_DEFAULT
+        total = left + right
+        if total <= 0:
+            return [800, _ASSISTANT_RIGHT_DEFAULT]
+        left = max(_ASSISTANT_CENTER_MIN, total - right)
+        return [left, right]
+
+    def _snapshot_assistant_sizes(self) -> list[int]:
+        return self._normalize_assistant_sizes(self._assistant_page.splitter.sizes())
+
+    def _restore_assistant_sizes(self, sizes: list[int] | None) -> None:
+        normalized = self._normalize_assistant_sizes(sizes)
+        self._assistant_page.right_column.show()
+        self._assistant_page.splitter.setSizes(normalized)
+
     def _apply_iris_ide_unified_layout(self, active: bool) -> None:
-        """메인 창 전체를 work area로 두고 내부 스플리터 8:2."""
+        """메인 창 전체를 work area로 두고 내부 스플리터 8:2 (좌측은 HWND 도킹 자리)."""
         if active:
             if self._ui_mode == "ide_companion" and self._iris_ide_unified:
                 self._drag.set_ide_companion_active(True)
                 self._set_workspace_icon_active("ide")
+                self._embed_viz_in_companion_slot()
+                self._sync_docked_iris_ide_geometry()
                 return
             if self._companion_saved_geometry is None or not self._companion_saved_geometry.isValid():
                 self._companion_saved_geometry = QRect(self.normalGeometry())
@@ -5064,14 +5190,17 @@ class MainWindow(QMainWindow):
                     self._companion_saved_geometry = QRect(self.geometry())
             self._hero_saved_geometry = None
             self._companion_saved_sizes = self._main_splitter.sizes()
-            self._companion_saved_assistant_sizes = self._assistant_page.splitter.sizes()
+            # 히어로 hide로 붕괴된 sizes 대신, hide 전 스냅샷 우선
+            if self._home_assistant_sizes is not None:
+                self._companion_saved_assistant_sizes = list(self._home_assistant_sizes)
+            else:
+                self._companion_saved_assistant_sizes = self._snapshot_assistant_sizes()
             self._companion_saved_min_size = self.minimumSize()
             self._show_assistant_workspace()
 
             work = work_area_for(self)
             self.setMinimumSize(960, 640)
             self._root_lay.setContentsMargins(0, 0, 0, 0)
-            self._frameless_shell.set_left_grips_visible(True)
 
             # companion 본문(구체·로그·채팅)을 먼저 mount한 뒤 셸에 합침
             act_h = max(72, min(110, int(work.height() * 0.11)))
@@ -5083,14 +5212,10 @@ class MainWindow(QMainWindow):
                 orb_height=EMAIL_ORB_HEIGHT,
                 activity_height=act_h,
             )
-            win = self._ensure_iris_ide_window()
-            win.set_embedded(True)
-            self._unified_shell.mount(win, self._companion_page, total_w=work.width())
+            # IDE는 Qt 레이아웃에 넣지 않음 — HWND 도킹
+            self._unified_shell.mount(None, self._companion_page, total_w=work.width())
             self._body_stack.setCurrentWidget(self._unified_shell)
-            self._viz.particle_core().set_size_scale(EMAIL_ORB_SCALE)
-            self._viz.set_orb_anchor(self._orb_spacer)
-            self._viz.set_companion_orb_placement(True)
-            self._cyberspace_bg.set_orb_above_ui(True)
+            self._embed_viz_in_companion_slot()
 
             self._ui_mode = "ide_companion"
             self._iris_ide_unified = True
@@ -5114,15 +5239,16 @@ class MainWindow(QMainWindow):
             win.hide()
             win.set_embedded(False)
         self._root_lay.setContentsMargins(*self._normal_root_margins)
-        self._frameless_shell.set_left_grips_visible(True)
+        self._frameless_shell.set_companion_grip_mode(False)
         if self._companion_saved_min_size is not None:
             self.setMinimumSize(self._companion_saved_min_size)
         else:
             self.setMinimumSize(960, 640)
         if self._companion_saved_sizes:
             self._main_splitter.setSizes(self._companion_saved_sizes)
-        if self._companion_saved_assistant_sizes:
-            self._assistant_page.splitter.setSizes(self._companion_saved_assistant_sizes)
+        self._restore_assistant_sizes(
+            self._companion_saved_assistant_sizes or self._home_assistant_sizes
+        )
         if self._companion_saved_geometry is not None and self._companion_saved_geometry.isValid():
             if self.isMaximized():
                 self.showNormal()
@@ -5179,6 +5305,7 @@ class MainWindow(QMainWindow):
             return
         win = self._ensure_iris_ide_window()
         win.apply_frameless_chrome()
+        win.focus_theia_view()
         mgr = shared_iris_ide_runtime()
         self._bind_ide_session(
             ide_id="iris_ide",
@@ -5225,7 +5352,7 @@ class MainWindow(QMainWindow):
             core.set_boot_reveal(1.0)
             core.set_boot_glitch(0.0)
             self._viz.set_hero_orb_placement(False)
-            self._left_sidebar.show()
+            self._left_sidebar.hide()
             self._assistant_page.right_column.show()
             # mount가 다시 show — 일단 보이게 두고 인트로가 숨김→등장
             self._live_activity.show()
@@ -5858,6 +5985,42 @@ class MainWindow(QMainWindow):
         self._orb_spacer.setMaximumHeight(EMAIL_ORB_HEIGHT)
         self._viz.particle_core().set_size_scale(EMAIL_ORB_SCALE)
 
+    def _embed_viz_in_companion_slot(self) -> None:
+        """Companion A: Visualizer를 orb_spacer 자식으로 — IDE/채팅 위 전역 오버레이 금지."""
+        # 히어로 잔여 오버레이가 Companion을 덮지 않게
+        hero = getattr(self, "_ide_hero", None)
+        if hero is not None:
+            hero.hide()
+            hero.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._cyberspace_bg.set_orb_host(None)
+        self._cyberspace_bg.set_orb_above_ui(False)
+        self._cyberspace_bg.release_orb_layer()
+        self._fit_companion_orb_to_width()
+        self._companion_page.embed_orb(self._viz, self._orb_spacer)
+        self._viz.set_layout_orb_mode(True)
+        self._viz.set_companion_orb_placement(True)
+        self._viz.set_orb_anchor(None)
+        self._frameless_shell.set_companion_grip_mode(True)
+        self._unified_shell.set_ide_insets(0, 0, 0, 0)
+        self._drag.raise_()
+        self._viz.request_sync_orb_anchor("companion_layout_orb")
+        self._sync_docked_iris_ide_geometry()
+
+    def _restore_viz_to_cyberspace(self) -> None:
+        """Companion 종료 — Visualizer를 다시 cyberspace orb_layer로."""
+        self._companion_page.release_embedded_orb()
+        self._viz.set_layout_orb_mode(False)
+        self._viz.set_companion_orb_placement(False)
+        self._cyberspace_bg.set_orb_host(None)
+        self._cyberspace_bg.set_orb_above_ui(False)
+        self._cyberspace_bg.set_orb_layer(self._viz)
+        self._frameless_shell.set_companion_grip_mode(False)
+        self._unified_shell.set_ide_insets(8, 0, 0, 8)
+        self._viz.set_orb_anchor(self._orb_spacer)
+        hero = getattr(self, "_ide_hero", None)
+        if hero is not None:
+            hero.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
     def _mount_companion_body(self, iris_w: int, iris_h: int) -> None:
         act_h = max(72, min(110, int(iris_h * 0.11)))
         self._clear_workspace_live_slots()
@@ -5870,14 +6033,10 @@ class MainWindow(QMainWindow):
             activity_height=act_h,
         )
         self._body_stack.setCurrentWidget(self._companion_page)
-        self._viz.particle_core().set_size_scale(EMAIL_ORB_SCALE)
-        self._viz.set_orb_anchor(self._orb_spacer)
-        self._viz.set_companion_orb_placement(True)
-        self._cyberspace_bg.set_orb_above_ui(True)
+        self._embed_viz_in_companion_slot()
 
     def _unmount_companion_body(self) -> None:
-        self._cyberspace_bg.set_orb_above_ui(False)
-        self._viz.set_companion_orb_placement(False)
+        self._restore_viz_to_cyberspace()
         self._orb_spacer.setMinimumHeight(self._orb_spacer_min_h)
         self._orb_spacer.setMaximumHeight(16777215)
         self._orb_spacer.setSizePolicy(
@@ -5928,14 +6087,16 @@ class MainWindow(QMainWindow):
                     self._companion_saved_geometry = QRect(self.geometry())
             self._hero_saved_geometry = None
             self._companion_saved_sizes = self._main_splitter.sizes()
-            self._companion_saved_assistant_sizes = self._assistant_page.splitter.sizes()
+            if self._home_assistant_sizes is not None:
+                self._companion_saved_assistant_sizes = list(self._home_assistant_sizes)
+            else:
+                self._companion_saved_assistant_sizes = self._snapshot_assistant_sizes()
             self._companion_saved_min_size = self.minimumSize()
             self._show_assistant_workspace()
 
             iris = self._companion_iris_rect()
             self.setMinimumSize(min(MIN_COMPANION_IRIS_WIDTH, iris.width()), min(480, iris.height()))
             self._root_lay.setContentsMargins(0, 0, 0, 0)
-            self._frameless_shell.set_left_grips_visible(False)
             self._mount_companion_body(iris.width(), iris.height())
 
             self._ui_mode = "ide_companion"
@@ -5958,7 +6119,7 @@ class MainWindow(QMainWindow):
         self._last_synced_iris_rect = None
         self._unmount_companion_body()
         self._root_lay.setContentsMargins(*self._normal_root_margins)
-        self._frameless_shell.set_left_grips_visible(True)
+        self._frameless_shell.set_companion_grip_mode(False)
         if self._companion_saved_min_size is not None:
             self.setMinimumSize(self._companion_saved_min_size)
         else:
@@ -5967,8 +6128,9 @@ class MainWindow(QMainWindow):
         # backend_row()는 레거시 빈 위젯 — show()하면 parent 없는 top-level 흰 창이 됨.
         if self._companion_saved_sizes:
             self._main_splitter.setSizes(self._companion_saved_sizes)
-        if self._companion_saved_assistant_sizes:
-            self._assistant_page.splitter.setSizes(self._companion_saved_assistant_sizes)
+        self._restore_assistant_sizes(
+            self._companion_saved_assistant_sizes or self._home_assistant_sizes
+        )
         saved = self._companion_saved_geometry
         if saved is not None and saved.isValid():
             if self.isMaximized():
@@ -6122,6 +6284,13 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         suppress_native_window_border(self)
         self._arm_file_drops(self)
+        if sys.platform == "win32" and not self._test_mode:
+            try:
+                from iris.assets.windows_taskbar import apply_hwnd_branding
+
+                apply_hwnd_branding(int(self.winId()))
+            except Exception:
+                pass
 
     def changeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().changeEvent(event)
@@ -6136,6 +6305,12 @@ class MainWindow(QMainWindow):
             self._sync_ide_hero_geometry()
         if self._iris_ide_unified and self._ui_mode == "ide_companion":
             self._unified_shell.apply_ratio(max(1, self.width()))
+            self._sync_docked_iris_ide_geometry()
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        super().moveEvent(event)
+        if self._iris_ide_unified and self._ui_mode == "ide_companion":
+            self._sync_docked_iris_ide_geometry()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         wiz = getattr(self, "_setup_wizard", None)
@@ -6195,6 +6370,10 @@ class MainWindow(QMainWindow):
                 if not self._startup_health_worker.wait(3000):
                     self._startup_health_worker.terminate()
                     self._startup_health_worker.wait(1500)
+            if self._core_warm_worker is not None and self._core_warm_worker.isRunning():
+                if not self._core_warm_worker.wait(2000):
+                    self._core_warm_worker.terminate()
+                    self._core_warm_worker.wait(1000)
             if self._hermes_health_worker is not None and self._hermes_health_worker.isRunning():
                 # ponytail: gateway 재기동 체크는 최대 60s 걸릴 수 있어 종료를 막음 — 강제 종료
                 if not self._hermes_health_worker.wait(3000):

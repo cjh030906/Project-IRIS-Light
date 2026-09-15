@@ -8,7 +8,6 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QPushButton,
     QSizePolicy,
@@ -18,6 +17,7 @@ from PyQt6.QtWidgets import (
 
 from iris.storage.ide_recent_folders import (
     list_recent_folders,
+    next_iris_project_dir,
     record_opened_folder,
     truncate_path_middle,
 )
@@ -215,11 +215,8 @@ class IrisIdeWelcomeLayer(QWidget):
         parent = QFileDialog.getExistingDirectory(self, "Create folder — 상위 디렉터리 선택")
         if not parent:
             return
-        name, ok = QInputDialog.getText(self, "Create folder", "Folder name:")
-        if not ok or not name.strip():
-            return
-        new_dir = Path(parent) / name.strip()
-        new_dir.mkdir(parents=True, exist_ok=True)
+        new_dir = next_iris_project_dir(Path(parent))
+        new_dir.mkdir(parents=True, exist_ok=False)
         resolved = str(new_dir.resolve())
         record_opened_folder(new_dir)
         self.refresh_recent_folders()
