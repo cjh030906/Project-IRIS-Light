@@ -578,6 +578,8 @@ body.at-hero .grain,body.at-hero .scanl{opacity:0}
 .spec{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--text-3);margin:clamp(14px,2.6vh,22px) 0 0;display:flex;flex-wrap:wrap;gap:6px 18px;max-width:none}
 .spec b{color:var(--text-2);font-weight:500;margin-right:6px}
 .fine{font-family:var(--mono);font-size:10.5px;color:var(--text-3);margin:8px 0 0;letter-spacing:.02em;max-width:none;line-height:1.6}
+.fine a{color:var(--text-2);text-decoration:none;border-bottom:1px solid var(--line-bright)}
+.fine a:hover{color:var(--cyan);border-color:var(--cyan)}
 
 /* ============================================================
    08 · 확장성 — 구체를 도는 궤도
@@ -930,20 +932,21 @@ footer .fr a:hover{color:var(--cyan)}
   <div class="rail inst">
     <div>
       <p class="lbl rv"><b>07</b>설치와 첫 실행</p>
-      <h2>bat 파일 두 개로<br>설치합니다</h2>
-      <p class="sub rv d1">터미널에 명령어를 칠 필요는 없습니다. 중간에 실패하면 이유와 해결 방법을 화면에 보여 줍니다.</p>
+      <h2>설치 파일 하나로<br>시작합니다</h2>
+      <p class="sub rv d1">설치 프로그램이 파이썬 확인부터 패키지 설치까지 알아서 준비합니다. 중간에 실패하면 이유와 해결 방법을 화면에 보여 줍니다.</p>
       <div class="dbl rv d2">
-        <div class="bs"><div class="n">1</div><div><div class="t">저장소 내려받기</div><div class="d">GitHub에서 <code>Code → Download ZIP</code>, 압축 풀기</div></div></div>
-        <div class="bs"><div class="n">2</div><div><div class="t"><code>setup.bat</code> 더블클릭</div><div class="d">파이썬 확인 · 가상환경 · 패키지 설치 · import 검증까지 자동</div></div></div>
-        <div class="bs"><div class="n">3</div><div><div class="t"><code>run.bat</code> 더블클릭</div><div class="d">시작 위저드가 Ollama · Hermes 설치를 이어서 안내</div></div></div>
+        <div class="bs"><div class="n">1</div><div><div class="t"><code>IRIS-Setup.exe</code> 내려받기</div><div class="d">Windows 10/11 · 약 23MB</div></div></div>
+        <div class="bs"><div class="n">2</div><div><div class="t">실행하고 기다리기</div><div class="d">서명 인증서가 없어 Windows가 한 번 막습니다 — <b>추가 정보 → 실행</b>. 패키지를 받는 데 몇 분 걸립니다</div></div></div>
+        <div class="bs"><div class="n">3</div><div><div class="t">바탕화면 <code>IRIS</code> 실행</div><div class="d">시작 위저드가 Ollama · Hermes 설치를 이어서 안내</div></div></div>
       </div>
       <div class="btns rv d3">
-        <a class="btn btn-p" href="https://github.com/kwakminoo/Project-IRIS-Light/archive/refs/heads/main.zip">
+        <a class="btn btn-p" href="https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4.5-4.5M12 15l4.5-4.5M4 20h16"/></svg>
-          ZIP 내려받기
+          설치 프로그램 내려받기
         </a>
-        <a class="btn" href="https://github.com/kwakminoo/Project-IRIS-Light">저장소 열기 ↗</a>
+        <a class="btn" href="https://github.com/kwakminoo/Project-IRIS-Light/releases">릴리스 전체 보기 ↗</a>
       </div>
+      <p class="fine rv d3">* 소스에서 직접 설치하려면 <a href="https://github.com/kwakminoo/Project-IRIS-Light/archive/refs/heads/main.zip">ZIP</a> 을 받아 <code>setup.bat</code> 을 실행합니다. 설치가 중간에 끊겼을 때도 같은 파일로 이어서 복구합니다.</p>
     </div>
 
     <div class="proto rv d1" id="proto">
@@ -963,7 +966,7 @@ footer .fr a:hover{color:var(--cyan)}
     </div>
   </div>
   <div class="meta l"><b>07</b> / Install</div>
-  <div class="meta r">setup.bat → run.bat</div>
+  <div class="meta r">IRIS-Setup.exe → IRIS</div>
 </section>
 
 <!-- ============ 08 · 확장성 ============ -->
