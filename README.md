@@ -11,6 +11,10 @@ IRIS는 [Ollama](https://ollama.com/)(로컬/클라우드 모델)와 [Hermes Age
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg)](#필요-사양)
 
+🌐 **소개 사이트 — [cjh030906.github.io/iris-light-site](https://cjh030906.github.io/iris-light-site/)**
+시연 영상, 실제 화면, 동작 구조를 한 페이지에서 볼 수 있습니다.
+([저장소](https://github.com/cjh030906/iris-light-site))
+
 ---
 
 ## 🎬 설치·동작 데모 영상
