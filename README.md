@@ -37,9 +37,9 @@ IRIS는 [Ollama](https://ollama.com/)(로컬/클라우드 모델)와 [Hermes Age
 **파이썬을 처음 써 보는 분도 명령어 입력 없이 설치할 수 있습니다.**
 
 <table>
-<tr><td align="center"><b>1</b></td><td>저장소를 <code>Code → Download ZIP</code> 으로 받아 압축을 풉니다.</td></tr>
-<tr><td align="center"><b>2</b></td><td>폴더 안의 <b><code>setup.bat</code> 을 더블클릭</b>합니다. — 파이썬 확인 · 가상환경 · 패키지 설치 · 검증까지 <b>전부 자동</b></td></tr>
-<tr><td align="center"><b>3</b></td><td><b><code>run.bat</code> 을 더블클릭</b>합니다. 시작 위저드가 Ollama · Hermes 설치를 이어서 안내합니다.</td></tr>
+<tr><td align="center"><b>1</b></td><td><a href="https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe"><b>IRIS-Setup.exe 내려받기</b></a> — Windows 10/11 · 약 23MB</td></tr>
+<tr><td align="center"><b>2</b></td><td><b>실행</b>합니다. 서명 인증서가 없어 Windows가 한 번 막습니다 — <b>추가 정보 → 실행</b>. 파이썬 확인 · 가상환경 · 패키지 설치 · 검증까지 <b>전부 자동</b>이라 몇 분 걸립니다.</td></tr>
+<tr><td align="center"><b>3</b></td><td>바탕화면의 <b><code>IRIS</code></b> 를 실행합니다. 시작 위저드가 Ollama · Hermes 설치를 이어서 안내합니다.</td></tr>
 </table>
 
 끝입니다. 자세한 설치 옵션과 문제 해결은 [설치](#설치) 절을 보세요.
@@ -131,7 +131,18 @@ IRIS는 기본적으로 **클라우드 모델**로 추론하고, 로컬에는 UI
 
 ## 설치
 
-### 방법 A — 자동 설치 (권장)
+### 방법 A — 설치 프로그램 (권장)
+
+[**IRIS-Setup.exe**](https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe)
+를 받아 실행합니다. `%LOCALAPPDATA%\Programs\IRIS` 에 설치한 뒤, 아래 방법 B와 똑같은
+`setup.ps1` 을 돌려 가상환경과 패키지를 준비합니다.
+
+- 서명 인증서가 없어 Windows SmartScreen이 한 번 경고합니다 — **추가 정보 → 실행**
+- 패키지를 받는 데 몇 분 걸립니다. 진행 기록은 설치 폴더의 `setup-log.txt` ·
+  `setup-log-pip.txt` 에 남습니다
+- 설치가 중간에 끊겼다면 설치 폴더의 `setup.bat` 을 다시 실행하면 이어서 복구합니다
+
+### 방법 B — 소스에서 자동 설치
 
 저장소 폴더에서 **`setup.bat` 을 더블클릭**하면 끝입니다.
 터미널을 열 필요도, 명령어를 외울 필요도 없습니다.
@@ -166,7 +177,7 @@ chmod +x setup.sh
 > 실행 정책(`ExecutionPolicy`) 때문에 `.ps1` 이 막히는 환경에서도 `setup.bat` 은
 > 정상 동작합니다. 내부에서 `-ExecutionPolicy Bypass` 로 우회합니다.
 
-### 방법 B — 수동 설치
+### 방법 C — 수동 설치
 
 ```powershell
 git clone https://github.com/kwakminoo/Project-IRIS-Light.git
@@ -187,6 +198,7 @@ copy .env.example .env
 | 가상환경 생성 실패 | Microsoft Store 버전 Python은 문제가 잦습니다. [python.org](https://www.python.org/downloads/) 배포판 권장. Debian 계열은 `sudo apt install python3-venv` |
 | 패키지 설치 중 네트워크 오류 | 사내망/프록시. `pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org` |
 | PyQt6 import 실패 | Windows: `winget install -e --id Microsoft.VCRedist.2015+.x64` · Linux: `sudo apt install libgl1 libegl1 libxkbcommon-x11-0 libxcb-cursor0` |
+| 설치는 끝났는데 앱이 안 뜸 | 의존성 설치가 중간에 끊긴 경우입니다. 실행하면 이유를 창으로 알려 주고 `%LOCALAPPDATA%\iris-light\launcher.log` 에 남깁니다. 설치 폴더의 `setup.bat` 을 다시 실행하세요 |
 | 그래도 안 될 때 | `.\setup.ps1 -Recreate` 로 가상환경을 통째로 다시 만들기 |
 
 ---
