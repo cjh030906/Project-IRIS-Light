@@ -1,15 +1,26 @@
 # 설치 프로그램 빌드 · 배포 절차
 
-랜딩 페이지의 「설치 프로그램 내려받기」 버튼은 아래 주소를 고정으로 가리킵니다.
-
-```
-https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe
-```
+랜딩 페이지의 「설치 프로그램 내려받기」 버튼은 `releases/latest/download/IRIS-Setup.exe`
+주소를 고정으로 가리킵니다.
 
 **에셋 이름은 반드시 `IRIS-Setup.exe`** 여야 합니다. 버전을 파일명에 넣으면
 (`IRIS-Setup-0.1.1.exe`) 이 주소가 404가 되고 사이트 버튼이 죽습니다. 버전은 릴리스
 태그로 구분합니다. 빌드 스크립트가 이미 `dist\IRIS-Setup.exe` 로 내보내므로
 **이름을 바꾸지 말고 그대로 올리면 됩니다.**
+
+## 지금 어디에 올라가 있나 (2026-09-16)
+
+이 저장소에는 아직 `IRIS-Setup.exe` 릴리스가 없어서 버튼이 404 였습니다. 링크를 살리려고
+0.1.1 을 포크에 올려 두었고, 사이트는 **임시로** 그쪽을 가리킵니다.
+
+```
+https://github.com/cjh030906/Project-IRIS-Light/releases/tag/v0.1.1
+```
+
+**이 저장소에 `v0.1.1` 릴리스를 올리면** 사이트 저장소
+(`cjh030906/iris-light-site`)의 `index.html` 에서 `cjh030906/Project-IRIS-Light/releases`
+두 줄을 `kwakminoo/...` 로 되돌리면 됩니다. 그 두 줄 말고는 바꾼 게 없습니다.
+이 저장소 `README.md` 의 내려받기 링크도 그때 같이 살아납니다.
 
 ## 빌드
 
