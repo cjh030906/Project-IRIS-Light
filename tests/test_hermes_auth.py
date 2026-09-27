@@ -311,6 +311,58 @@ class HermesClientAuthTests(TestCase):
             self.assertEqual(ready.http_status, 401)
             self.assertIn("401", ready.detail)
 
+    def test_normalize_hermes_openai_base_url(self) -> None:
+        from iris.infrastructure.hermes_client import normalize_hermes_openai_base_url
+
+        self.assertEqual(
+            normalize_hermes_openai_base_url("http://127.0.0.1:8642"),
+            "http://127.0.0.1:8642/v1",
+        )
+        self.assertEqual(
+            normalize_hermes_openai_base_url("http://127.0.0.1:8642/v1/"),
+            "http://127.0.0.1:8642/v1",
+        )
+        self.assertEqual(
+            normalize_hermes_openai_base_url("http://127.0.0.1:8642/v1/v1"),
+            "http://127.0.0.1:8642/v1",
+        )
+        client = HermesClient("http://127.0.0.1:8642", api_key="x" * 40)
+        self.assertEqual(client.base_url, "http://127.0.0.1:8642/v1")
+
+    def test_probe_gateway_ready_models_404(self) -> None:
+        from io import BytesIO
+        from urllib.error import HTTPError
+
+        from iris.infrastructure.hermes_client import HealthProbeResult
+
+        with patch(
+            "iris.infrastructure.hermes_credentials.load_hermes_dotenv",
+            return_value={"API_SERVER_KEY": "x" * 40},
+        ):
+            client = HermesClient("http://127.0.0.1:8642/v1", api_key="")
+            healthy = HealthProbeResult(
+                ok=True, code="ok", url="http://127.0.0.1:8642/health"
+            )
+            err = HTTPError(
+                "http://127.0.0.1:8642/v1/models",
+                404,
+                "Not Found",
+                None,
+                BytesIO(b"404: Not Found"),
+            )
+            with (
+                patch.object(client, "probe_health", return_value=healthy),
+                patch(
+                    "iris.infrastructure.hermes_client.urlopen", side_effect=err
+                ),
+            ):
+                ready = client.probe_gateway_ready()
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, "models_404")
+            self.assertEqual(ready.http_status, 404)
+            self.assertIn("404", ready.detail)
+            self.assertIn("라우트", ready.detail)
+
 
 class HermesGatewayStepReadyTests(TestCase):
     def test_health_ok_models_fail_triggers_restart(self) -> None:
@@ -340,6 +392,7 @@ class HermesGatewayStepReadyTests(TestCase):
                         "key_weak": False,
                         "key_len": 40,
                         "models_ok": False,
+                        "http_status": 401,
                     },
                 )(),
             ),
@@ -403,6 +456,7 @@ class HermesGatewayStepReadyTests(TestCase):
                         "detail": "401",
                         "key_weak": False,
                         "key_len": 40,
+                        "http_status": 401,
                     },
                 )(),
             ),
@@ -410,10 +464,63 @@ class HermesGatewayStepReadyTests(TestCase):
             result = proto._step_core_smoke()
         self.assertEqual(result.status, "done", result)
         self.assertEqual(calls["gw"], [True])
+        # models_http + 401 → 키 rotate
+        self.assertEqual(calls["env"], [True])
+        from iris.system.setup_protocol import SetupProtocol
+
+        proto = SetupProtocol(dry_run=False, simulate=False)
+        calls: dict[str, list] = {"env": [], "gw": []}
+        verifies = [
+            (
+                False,
+                "[READY] /health OK 이지만 /v1/models 404 (models_404, key_len=43).\n"
+                "/v1/models HTTP 404: 404: Not Found\n"
+                "로컬 모델 있음 — 클라우드 불필요",
+            ),
+            (True, "Ollama·Hermes·MCP 정상"),
+        ]
+
+        def _env(*, force_rotate: bool = False):
+            calls["env"].append(force_rotate)
+            return proto._record_step("hermes_env", "done", "ok")
+
+        def _gw(*, force_restart: bool = False):
+            calls["gw"].append(force_restart)
+            return proto._record_step("hermes_gateway", "done", "restarted")
+
+        with (
+            patch.object(proto, "verify_core", side_effect=verifies),
+            patch.object(proto, "_step_hermes_env", side_effect=_env),
+            patch.object(proto, "_step_hermes_gateway", side_effect=_gw),
+            patch(
+                "iris.system.hermes_gateway.probe_gateway_ready",
+                return_value=type(
+                    "R",
+                    (),
+                    {
+                        "ok": False,
+                        "code": "models_404",
+                        "detail": "404",
+                        "key_weak": False,
+                        "key_len": 43,
+                        "http_status": 404,
+                    },
+                )(),
+            ),
+            patch(
+                "iris.system.setup_protocol._upsert_dotenv",
+            ),
+            patch(
+                "iris.system.setup_protocol._iris_env_path",
+                return_value=type("P", (), {"__str__": lambda s: "x"})(),
+            ),
+        ):
+            result = proto._step_core_smoke()
+        self.assertEqual(result.status, "done", result)
+        self.assertEqual(calls["gw"], [True])
+        # 404 경로: env 보강은 하되 rotate=False
         self.assertEqual(calls["env"], [False])
-
-
-class HermesChatAuthProbeTests(TestCase):
+        self.assertFalse(any(calls["env"]))
     def test_probe_unauthorized_without_key(self) -> None:
         with patch(
             "iris.infrastructure.hermes_credentials.load_hermes_dotenv",

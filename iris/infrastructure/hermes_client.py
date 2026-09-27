@@ -20,9 +20,22 @@ from iris.infrastructure.hermes_credentials import (
 def api_root_from_base(base_url: str) -> str:
     """http://127.0.0.1:8642/v1 → http://127.0.0.1:8642"""
     raw = (base_url or "").strip().rstrip("/")
-    if raw.endswith("/v1"):
-        raw = raw[:-3]
+    while raw.endswith("/v1"):
+        raw = raw[:-3].rstrip("/")
     return raw or "http://127.0.0.1:8642"
+
+
+def normalize_hermes_openai_base_url(base_url: str) -> str:
+    """OpenAI 호환 root — 항상 `…/v1` (꼬리 슬래시·이중 /v1 제거).
+
+    Hermes api_server는 `/v1/models` 만 등록한다. `/models`·`/v1/v1/models`·
+    `/v1/models/` 는 aiohttp 기본 `404: Not Found` — 키 문제와 혼동하기 쉽다.
+    """
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        return "http://127.0.0.1:8642/v1"
+    root = api_root_from_base(raw)
+    return f"{root}/v1"
 
 
 # Hermes /health 정상 본문: {"status":"ok","platform":"hermes-agent",...}
@@ -47,13 +60,14 @@ class GatewayReadyResult:
     """/health + /v1/models 채팅 준비 진단 (시크릿 값 없음)."""
 
     ok: bool
-    code: str  # ok | no_key | models_http | models_error | health_fail
+    code: str  # ok | no_key | models_http | models_404 | models_error | health_fail
     health_ok: bool = False
     models_ok: bool = False
     http_status: int | None = None
     detail: str = ""
     key_len: int = 0
     key_weak: bool = False
+    models_url: str = ""
 
 
 def _summarize_health_body(raw: str, *, limit: int = 120) -> str:
@@ -210,7 +224,7 @@ class HermesClient:
         command: str = "hermes",
         timeout_sec: float = 300.0,
     ) -> None:
-        self.base_url = (base_url or "http://127.0.0.1:8642/v1").strip().rstrip("/")
+        self.base_url = normalize_hermes_openai_base_url(base_url)
         self.api_root = api_root_from_base(self.base_url)
         self.api_key = resolve_hermes_api_key(api_key)
         self.command = (command or "hermes").strip() or "hermes"
@@ -316,6 +330,7 @@ class HermesClient:
         key = (self.api_key or "").strip()
         key_len = len(key)
         key_weak = is_weak_hermes_api_key(key) if key else True
+        models_url = f"{self.base_url}/models"
         if not health.ok:
             return GatewayReadyResult(
                 ok=False,
@@ -324,6 +339,7 @@ class HermesClient:
                 detail=f"/health {health.code}",
                 key_len=key_len,
                 key_weak=key_weak,
+                models_url=models_url,
             )
         if not key:
             return GatewayReadyResult(
@@ -333,45 +349,81 @@ class HermesClient:
                 detail="API_SERVER_KEY 없음",
                 key_len=0,
                 key_weak=True,
+                models_url=models_url,
             )
-        try:
-            self._get_json(f"{self.base_url}/models")
-            return GatewayReadyResult(
-                ok=True,
-                code="ok",
-                health_ok=True,
-                models_ok=True,
-                http_status=200,
-                detail="/v1/models OK",
-                key_len=key_len,
-                key_weak=key_weak,
-            )
-        except HTTPError as e:
-            body = ""
+        # 잘못된 base(/models·/v1/v1/models)도 같은 404 — 후보를 순서대로 시도
+        candidates = [models_url]
+        alt = f"{self.api_root}/v1/models"
+        if alt not in candidates:
+            candidates.append(alt)
+        last_status: int | None = None
+        last_body = ""
+        last_url = models_url
+        for url in candidates:
+            last_url = url
             try:
-                body = e.read().decode("utf-8", errors="replace")[:120]
-            except Exception:
-                body = str(e.reason or "")[:80]
+                self._get_json(url)
+                return GatewayReadyResult(
+                    ok=True,
+                    code="ok",
+                    health_ok=True,
+                    models_ok=True,
+                    http_status=200,
+                    detail="/v1/models OK",
+                    key_len=key_len,
+                    key_weak=key_weak,
+                    models_url=url,
+                )
+            except HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")[:120]
+                except Exception:
+                    body = str(e.reason or "")[:80]
+                last_status = int(e.code) if e.code else None
+                last_body = body
+                # 401/403은 경로가 맞다는 뜻 — 다른 후보로 도망가지 않음
+                if last_status in (401, 403):
+                    break
+                if last_status != 404:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                return GatewayReadyResult(
+                    ok=False,
+                    code="models_error",
+                    health_ok=True,
+                    models_ok=False,
+                    detail=f"/v1/models 오류: {exc}"[:200],
+                    key_len=key_len,
+                    key_weak=key_weak,
+                    models_url=last_url,
+                )
+        if last_status == 404:
             return GatewayReadyResult(
                 ok=False,
-                code="models_http",
+                code="models_404",
                 health_ok=True,
                 models_ok=False,
-                http_status=int(e.code) if e.code else None,
-                detail=f"/v1/models HTTP {e.code}: {body}".strip(),
+                http_status=404,
+                detail=(
+                    f"/v1/models HTTP 404 (url={last_url}): {last_body}".strip()
+                    + " — api_server OpenAI 라우트 미마운트 또는 base_url 경로 오류"
+                ),
                 key_len=key_len,
                 key_weak=key_weak,
+                models_url=last_url,
             )
-        except Exception as exc:  # noqa: BLE001
-            return GatewayReadyResult(
-                ok=False,
-                code="models_error",
-                health_ok=True,
-                models_ok=False,
-                detail=f"/v1/models 오류: {exc}"[:200],
-                key_len=key_len,
-                key_weak=key_weak,
-            )
+        return GatewayReadyResult(
+            ok=False,
+            code="models_http",
+            health_ok=True,
+            models_ok=False,
+            http_status=last_status,
+            detail=f"/v1/models HTTP {last_status}: {last_body}".strip(),
+            key_len=key_len,
+            key_weak=key_weak,
+            models_url=last_url,
+        )
 
     def gateway_ready(self) -> bool:
         """/health + /v1/models — 프로세스·키 존재. 채팅 401은 probe_chat_auth()."""

@@ -160,6 +160,9 @@ integrations/
   hermes-plugins/ · hermes-mcp/ · showui-aloha/
 ```
 
+패턴·증상별 수정 위치·UI 커스텀: [`guides/extending-iris.md`](guides/extending-iris.md).  
+패키지 경계(pydoc): 각 `iris/**/__init__.py` 의 `Agent-readable`.
+
 ---
 
 ## 6. 비기능

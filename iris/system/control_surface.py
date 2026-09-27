@@ -183,6 +183,11 @@ class UiThreadTimeout(TimeoutError):
 
 
 class ActionRegistry:
+    """Control Surface 액션 인터페이스. 이름 → 핸들러.
+
+    기여자는 ``register``로 액션을 올린다. HTTP 서버 구현은 이 클래스 밖이다.
+    """
+
     def __init__(self) -> None:
         self._specs: dict[str, ActionSpec] = {}
         self._handlers: dict[str, HandlerFn] = {}
@@ -196,6 +201,7 @@ class ActionRegistry:
         risk: str = "low",
         confirm_required: bool = False,
     ) -> None:
+        """액션 이름 하나를 등록한다. 같은 이름이면 ``ValueError``."""
         if name in self._specs:
             raise ValueError(f"duplicate control action: {name}")
         self._specs[name] = ActionSpec(

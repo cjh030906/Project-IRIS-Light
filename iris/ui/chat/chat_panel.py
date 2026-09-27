@@ -464,6 +464,7 @@ class ChatComposerInput(QPlainTextEdit):
 class ChatLogTextEdit(QTextEdit):
     speaker_clicked = pyqtSignal(str)
     update_action_clicked = pyqtSignal(str)  # apply | later
+    ollama_login_clicked = pyqtSignal()
     files_attached = pyqtSignal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -504,7 +505,7 @@ class ChatLogTextEdit(QTextEdit):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         # 앵커(도구 접기·재생·링크·파일 chip·citation·복사·이미지)가 항상 우선
-        anchor = self.anchorAt(event.pos())
+        anchor = self.anchorAt(event.pos()) or ""
         if anchor.startswith("iris-collapse://"):
             if handle_tool_collapse_click(self, self._tool_blocks, anchor):
                 event.accept()
@@ -519,6 +520,15 @@ class ChatLogTextEdit(QTextEdit):
                 self.update_action_clicked.emit(action)
             event.accept()
             return
+        if "iris-ollama-login" in anchor:
+            # press에서 이미 처리했으면 스킵
+            if getattr(self, "_ollama_login_pressed", False):
+                self._ollama_login_pressed = False
+                event.accept()
+                return
+            self.ollama_login_clicked.emit()
+            event.accept()
+            return
         if anchor.startswith("iris-stt://"):
             event.accept()
             return
@@ -527,6 +537,17 @@ class ChatLogTextEdit(QTextEdit):
             return
 
         super().mouseReleaseEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        # 로그인 링크는 press에서 처리 — selection 드래그로 release 앵커가 비는 경우 대비
+        anchor = self.anchorAt(event.pos()) or ""
+        if "iris-ollama-login" in anchor:
+            self._ollama_login_pressed = True
+            self.ollama_login_clicked.emit()
+            event.accept()
+            return
+        self._ollama_login_pressed = False
+        super().mousePressEvent(event)
 
 
 _HANDLE_H = 10
@@ -1039,6 +1060,7 @@ class ChatPanel(QWidget):
     mic_clicked = pyqtSignal()
     speaker_clicked = pyqtSignal(str)
     update_action_clicked = pyqtSignal(str)
+    ollama_login_clicked = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1054,6 +1076,7 @@ class ChatPanel(QWidget):
         self._log.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
         # 스크롤바는 숨기고 마우스 휠로만 스크롤
         self._log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1138,6 +1161,7 @@ class ChatPanel(QWidget):
         self._input_area.attachment_strip.changed.connect(self._on_input_changed)
         self._log.speaker_clicked.connect(self.speaker_clicked.emit)
         self._log.update_action_clicked.connect(self.update_action_clicked.emit)
+        self._log.ollama_login_clicked.connect(self.ollama_login_clicked.emit)
         self._log.files_attached.connect(self._on_composer_drop_paths)
 
         self._height_handle = _ChatHeightHandle()
@@ -1534,6 +1558,42 @@ class ChatPanel(QWidget):
         self._log.setTextCursor(cursor)
         self._append_trailing_blank_line()
         self._scroll_log_to_bottom()
+
+    def append_ollama_cloud_login_prompt(self, text: str) -> None:
+        """클라우드 미로그인 안내 + [로그인] 링크 (푸른색)."""
+        self.finish_typing()
+        self._typing_anchor_y = None
+        body = (text or "").strip() or (
+            "Ollama 클라우드 미로그인입니다. Ollama 앱에서 로그인하거나 로컬 모델로 바꾸세요."
+        )
+        # [재생]과 동일 패턴 — QTextEdit이 복잡한 button style을 깨뜨리는 경우 대비
+        button = (
+            ' <a href="iris-ollama-login://open" '
+            'style="color:#38bdf8;text-decoration:none;">[로그인]</a>'
+        )
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(f"<b>Iris</b>: {html.escape(body)}{button}")
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
+    def select_model_silent(self, runtime: str) -> bool:
+        """시그널 없이 콤보 선택 변경. 해당 runtime이 없으면 False."""
+        rt = (runtime or "").strip()
+        if not rt:
+            return False
+        for i in range(self._model_combo.count()):
+            if self._model_combo.itemData(i) == rt:
+                self._model_guard_silent = True
+                self._model_combo.blockSignals(True)
+                self._model_combo.setCurrentIndex(i)
+                self._model_combo.blockSignals(False)
+                self._model_guard_silent = False
+                self._model_guard_prev_index = i
+                self._update_model_tooltip()
+                self._input_area.input_bar.fit_model_picker()
+                return True
+        return False
 
     def dismiss_update_prompt(self, note: str = "") -> None:
         """Update/Late 클릭 후 버튼 제거."""

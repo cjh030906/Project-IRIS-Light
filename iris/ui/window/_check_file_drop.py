@@ -88,6 +88,7 @@ def main() -> None:
     check_finish_keeps_pending_outside()
     check_win_shell_drop_arm()
     check_explorer_overlay_drop()
+    check_occluded_click_stays_on_front_window()
     check_no_win32_drop_hooks()
     # ponytail: 소스가 OK여도 구식 bundle.js면 실행에 안 뜸 — 번들 마커 필수
     for label, bundle in (
@@ -186,6 +187,17 @@ def check_finish_keeps_pending_outside() -> None:
         assert bound_finish() == [r"C:\proj\tab.py"]
     assert inst._pending_ide_drag == []
     inst._attach_os_drop_paths.assert_called_with([r"C:\proj\tab.py"])
+
+
+def check_occluded_click_stays_on_front_window() -> None:
+    """Iris가 뒤에 있을 때 사각형이 겹쳐도 앞 페이지 클릭을 가로채지 않는다."""
+    from iris.ui.window.explorer_drop_overlay import cursor_targets_iris_window
+
+    assert cursor_targets_iris_window(50, host_hwnd=1, overlay_hwnd=2) is False
+    assert cursor_targets_iris_window(1, host_hwnd=1, overlay_hwnd=2) is True
+    assert cursor_targets_iris_window(2, host_hwnd=1, overlay_hwnd=2) is True
+    assert cursor_targets_iris_window(9, host_hwnd=1, ide_hwnd=9) is False
+    assert cursor_targets_iris_window(0, host_hwnd=1) is True
 
 
 def check_no_win32_drop_hooks() -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QPainter, QPen, QTextCursor
 from PyQt6.QtWidgets import (
@@ -121,6 +123,7 @@ class _NeedsUserCard(QFrame):
         self.setObjectName("NeedsUserCard")
         self._url = ""
         self._open_app = ""
+        self._log_path = ""
         lay = QVBoxLayout(self)
         lay.setSpacing(TOKENS.spacing_sm)
         self._why = QLabel("")
@@ -149,6 +152,10 @@ class _NeedsUserCard(QFrame):
         self._open_btn.clicked.connect(self._open_url)
         self._open_btn.hide()
         row.addWidget(self._open_btn)
+        self._log_btn = QPushButton("로그 열기")
+        self._log_btn.clicked.connect(self._open_log)
+        self._log_btn.hide()
+        row.addWidget(self._log_btn)
         self._install_btn = QPushButton("설치")
         self._install_btn.clicked.connect(self.install_clicked.emit)
         self._install_btn.hide()
@@ -239,9 +246,11 @@ class _NeedsUserCard(QFrame):
         self._hint.setVisible(bool(result.action_hint))
         self._url = (result.action_url or "").strip()
         self._open_app = (result.open_local_app or "").strip().lower()
+        self._log_path = (result.log_path or "").strip()
         self._open_btn.setText(result.login_label if result.can_login else "열기")
         # 앱 열기 또는 URL 중 하나라도 있으면 버튼 표시
         self._open_btn.setVisible(bool(self._open_app) or bool(self._url) or result.can_login)
+        self._log_btn.setVisible(bool(self._log_path))
         self._install_btn.setText(result.install_label or "설치")
         self._install_btn.setVisible(bool(result.can_install))
         # 키 붙여넣기는 external_api 등 hint에 '붙여넣'이 있을 때만
@@ -264,6 +273,7 @@ class _NeedsUserCard(QFrame):
         self._console_hint.setVisible(self._step_id in VISIBLE_CONSOLE_STEPS)
         self._paste.hide()
         self._open_btn.hide()
+        self._log_btn.hide()
         self._install_btn.hide()
         self._later_btn.hide()
         self._done_btn.hide()
@@ -360,6 +370,28 @@ class _NeedsUserCard(QFrame):
                 return
         if self._url:
             QDesktopServices.openUrl(QUrl(self._url))
+
+    def _open_log(self) -> None:
+        path = (self._log_path or "").strip()
+        if not path:
+            return
+        from pathlib import Path
+
+        p = Path(path)
+        if not p.is_file():
+            self._hint.setText(f"로그 파일이 없습니다: {path}")
+            self._hint.show()
+            return
+        # notepad / 기본 연결 — GUI라 CREATE_NO_WINDOW 쓰지 않음
+        if sys.platform == "win32":
+            import os
+
+            try:
+                os.startfile(str(p))  # noqa: S606
+                return
+            except OSError:
+                pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
 
 class SetupWizard(QDialog):
@@ -475,7 +507,39 @@ class SetupWizard(QDialog):
         if self._worker is None and not self._finished:
             self._start_worker()
 
+    def _ensure_admin_for_protocol(self) -> bool:
+        """실행 프로토콜은 관리자 권한 필요. 재실행 시작 시 False(워커 보류)."""
+        if is_setup_preview() or sys.platform != "win32":
+            return True
+        try:
+            from iris.learning.elevation import elevate_for_setup_protocol, is_elevated
+
+            if is_elevated():
+                return True
+            self._append_log(
+                "실행 프로토콜은 관리자 권한이 필요합니다. UAC 확인 후 다시 시작합니다…"
+            )
+            if elevate_for_setup_protocol(mode=self._mode):
+                self._force_close = True
+                from PyQt6.QtWidgets import QApplication
+
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
+                return False
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"관리자 권한 재실행 실패: {exc}")
+        self._current.setText("관리자 권한이 필요합니다")
+        self._append_log(
+            "UAC에서 허용하지 않았거나 재실행에 실패했습니다. "
+            "IRIS를 ‘관리자 권한으로 실행’한 뒤 다시 시도하세요."
+        )
+        self._retry_btn.show()
+        return False
+
     def _start_worker(self) -> None:
+        if not self._ensure_admin_for_protocol():
+            return
         # 재시도/재검사: 이전 워커를 끊고 진단 잔상·목록을 비운 뒤 새로 시작한다.
         if self._worker is not None:
             if self._worker.isRunning() or self._worker.is_install_running():
@@ -648,6 +712,7 @@ class SetupWizard(QDialog):
                 install_label=result.install_label,
                 login_label=result.login_label,
                 open_local_app=result.open_local_app,
+                log_path=result.log_path,
             )
             self._card.bind(warned, allow_skip=True)
         else:

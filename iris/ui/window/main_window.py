@@ -319,6 +319,16 @@ class MainWindow(QMainWindow):
         self._runtime_boot_started = False
         self._control_surface = None
         self._saved_model = load_selected_model(self._db) or self._settings.ollama_model.strip()
+        # 미로그인 클라우드를 초기 선택으로 두지 않음 — 목록 로드 후 로컬로 확정
+        try:
+            from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
+
+            if cloud_model_blocked_without_login(self._saved_model):
+                self._saved_model = ""
+                self._settings.ollama_model = ""
+                self._settings.model_name = ""
+        except Exception:
+            pass
         if self._saved_model:
             self._settings.ollama_model = self._saved_model
             self._settings.model_name = self._saved_model
@@ -539,6 +549,7 @@ class MainWindow(QMainWindow):
         self._chat.mic_clicked.connect(self._on_chat_mic_clicked)
         self._chat.speaker_clicked.connect(self._on_chat_speaker_clicked)
         self._chat.update_action_clicked.connect(self._on_chat_update_action)
+        self._chat.ollama_login_clicked.connect(self._on_ollama_cloud_login_clicked)
         left_lay.addWidget(self._chat, 3)
 
         history_panel = self._left_sidebar.chat_history
@@ -691,6 +702,18 @@ class MainWindow(QMainWindow):
             tick.timeout.connect(self._on_startup_gate_tick)
             self._startup_gate_tick = tick
         tick.start(5000)
+        # 관리자 재실행 직후 — 설정/위저드에서 요청한 실행 프로토콜을 이어서 연다.
+        try:
+            from iris.learning.elevation import consume_pending_setup_wizard
+
+            pending = consume_pending_setup_wizard()
+        except Exception:
+            pending = None
+        if pending:
+            tick.stop()
+            self._pending_setup_mode = pending
+            QTimer.singleShot(40, self._show_pending_setup_wizard)
+            return
         if is_setup_preview():
             tick.stop()
             QTimer.singleShot(40, self._show_first_run_setup)
@@ -707,6 +730,40 @@ class MainWindow(QMainWindow):
         self._startup_health_worker = worker
         worker.finished_ok.connect(self._on_startup_health_ready)
         worker.start()
+
+    def _show_pending_setup_wizard(self) -> None:
+        mode = getattr(self, "_pending_setup_mode", None) or "repair"
+        self._pending_setup_mode = None
+        if mode == "first_run":
+            self._show_first_run_setup()
+            return
+        from iris.config.settings import load_settings
+        from iris.system.setup_protocol import is_core_ready, is_setup_preview
+        from iris.ui.window.setup_wizard import SetupWizard
+
+        cy = getattr(self, "_cyberspace_bg", None)
+        if cy is not None:
+            cy.hide()
+        dlg = SetupWizard(self._settings, mode="repair", parent=None)
+        self._setup_wizard = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._setup_wizard = None
+            if cy is not None:
+                cy.show()
+        if is_core_ready() or is_setup_preview():
+            self._settings = load_settings(self._env_path)
+            self._start_runtime_boot()
+        else:
+            self._notes.try_add_alert(
+                target_id=0,
+                category="ERROR_DETECTED",
+                title="시작 프로토콜",
+                message="Core가 준비되지 않았습니다. 설정에서 「환경 다시 설정」을 실행하세요.",
+                focus_hint="",
+                event_id=0,
+            )
 
     def _on_startup_gate_tick(self) -> None:
         worker = self._startup_health_worker
@@ -946,6 +1003,30 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_app_update_apply_failed)
         worker.start()
 
+    def _on_ollama_cloud_login_clicked(self) -> None:
+        """채팅 [로그인] — Ollama 데스크톱 앱 UI에서 로그인하도록 앱만 연다."""
+        from iris.system.ollama_server import ensure_ollama_running, open_ollama_app
+
+        ok, detail = open_ollama_app()
+        ensure_ollama_running(self._settings.ollama_base_url, wait_sec=2.0)
+        if ok:
+            self._live_activity.append_instant_line(f"Ollama 앱 열기 ({detail[:80]})")
+            self._chat.append_message_instant(
+                "Iris",
+                "Ollama 앱을 열었습니다. "
+                "작업 표시줄/트레이의 Ollama 아이콘을 클릭해 창을 연 뒤, "
+                "앱 안에서 ollama.com 계정으로 로그인하세요. "
+                "(웹사이트만 로그인하면 Iris에는 반영되지 않습니다.)",
+            )
+            self._maybe_refresh_ollama_quota(force=True)
+            return
+        self._live_activity.append_instant_line(f"Ollama 앱 실행 실패: {detail[:120]}")
+        self._chat.append_message_instant(
+            "Iris",
+            f"Ollama 앱을 열지 못했습니다: {detail[:160]}. "
+            "시작 메뉴에서 Ollama를 직접 연 뒤 앱에서 로그인하세요.",
+        )
+
     def _on_app_update_applied(self, message: str) -> None:
         self._app_update_apply_worker = None
         self._pending_update_remote_sha = ""
@@ -1019,6 +1100,20 @@ class MainWindow(QMainWindow):
         model = (model or "").strip()
         if not model:
             return
+        from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
+
+        if cloud_model_blocked_without_login(model):
+            local = self._first_local_picker_model()
+            self._live_activity.append_instant_line(
+                f"Hermes model sync skip (클라우드 미로그인): {model}"
+            )
+            if local and local != model and self._chat.select_model_silent(local):
+                self._settings.ollama_model = local
+                self._settings.model_name = local
+                self._saved_model = local
+                model = local
+            else:
+                return
         if self._hermes_model_worker is not None and self._hermes_model_worker.isRunning():
             return
         try:
@@ -1119,10 +1214,20 @@ class MainWindow(QMainWindow):
         )
         if preferred in ("(unset)",):
             preferred = ""
-        self._chat.set_models(items, selected=preferred)
+        from iris.infrastructure.hermes_errors import resolve_initial_model
+
+        names = [str(m.name).strip() for m in items if str(getattr(m, "name", "") or "").strip()]
+        resolved = resolve_initial_model(preferred, names)
+        if resolved and resolved != preferred:
+            self._live_activity.append_instant_line(
+                f"클라우드 미로그인 — 초기 모델을 로컬 '{resolved}'로 선택"
+            )
+        self._chat.set_models(items, selected=resolved or preferred)
         if items:
             chosen = self._chat.current_model()
-            self._apply_selected_model(chosen, persist=False)
+            # 클라우드→로컬 폴백이면 DB에도 남겨 다음 기동에 클라우드가 다시 안 뜨게
+            persist = bool(resolved and resolved != preferred)
+            self._apply_selected_model(chosen, persist=persist)
             n_api = sum(1 for m in items if is_api_runtime_model(m.name))
             n_cloud = sum(
                 1
@@ -1218,10 +1323,53 @@ class MainWindow(QMainWindow):
     def _on_model_changed(self, model: str) -> None:
         self._apply_selected_model(model, persist=True)
 
+    def _first_local_picker_model(self) -> str:
+        """피커에 있는 로컬 채팅 모델 하나 (임베딩·클라우드 제외)."""
+        from iris.system.setup_protocol import prefer_chat_model
+
+        names: list[str] = []
+        for m in getattr(self._chat, "_picker_models", None) or []:
+            n = str(getattr(m, "runtime", None) or getattr(m, "name", "") or "").strip()
+            if n:
+                names.append(n)
+        if not names:
+            combo = getattr(self._chat, "_model_combo", None)
+            if combo is not None:
+                for i in range(combo.count()):
+                    n = str(combo.itemData(i) or "").strip()
+                    if n:
+                        names.append(n)
+        return prefer_chat_model(names) or ""
+
+    def _guard_cloud_model_selection(self, model: str) -> str:
+        """미로그인 클라우드면 로컬로 폴백하고 안내. 반환=실제 쓸 모델명."""
+        from iris.infrastructure.hermes_errors import (
+            CLOUD_AUTH_USER_MSG,
+            cloud_model_blocked_without_login,
+        )
+
+        if not cloud_model_blocked_without_login(model):
+            return model
+        local = self._first_local_picker_model()
+        self._live_activity.append_instant_line(
+            f"클라우드 미로그인 — '{model}' 사용 불가"
+            + (f", 로컬 '{local}'로 전환" if local else "")
+        )
+        self._chat.append_ollama_cloud_login_prompt(CLOUD_AUTH_USER_MSG)
+        if local and self._chat.select_model_silent(local):
+            try:
+                if self._db is not None:
+                    save_selected_model(self._db, local)
+            except Exception:
+                pass
+            return local
+        return model
+
     def _apply_selected_model(self, model: str, *, persist: bool) -> None:
         model = (model or "").strip()
         if not model:
             return
+        model = self._guard_cloud_model_selection(model)
         self._settings.ollama_model = model
         self._settings.model_name = model
         self._saved_model = model
@@ -1404,7 +1552,7 @@ class MainWindow(QMainWindow):
         if err:
             self._live_activity.append_instant_line(f"chat 저장 실패: {err}")
             return
-        if role == "user":
+        if role in ("user", "assistant"):
             self._refresh_chat_history_panel()
 
     def _drop_last_user_history(self) -> None:
@@ -2059,6 +2207,20 @@ class MainWindow(QMainWindow):
             self._refresh_models()
             self._finish_current_turn(turn.id, open_followup=False)
             return
+        from iris.infrastructure.hermes_errors import (
+            CLOUD_AUTH_USER_MSG,
+            cloud_model_blocked_without_login,
+        )
+
+        if cloud_model_blocked_without_login(model):
+            local = self._first_local_picker_model()
+            if local and self._chat.select_model_silent(local):
+                self._apply_selected_model(local, persist=True)
+                model = local
+            else:
+                self._chat.append_ollama_cloud_login_prompt(CLOUD_AUTH_USER_MSG)
+                self._finish_current_turn(turn.id, open_followup=False)
+                return
         if self._use_hermes_backend() and not self._hermes_online:
             self._live_activity.append_instant_line(
                 "Hermes gateway Offline — 기동 후 연결을 시도합니다…"
@@ -3953,10 +4115,13 @@ class MainWindow(QMainWindow):
         self._drop_last_user_history()
         self._refresh_context_gauge()
         self._live_activity.append_instant_line(f"Error: {err}")
-        self._chat.append_message_instant(
-            "Iris",
-            f"{self._backend_label()} 오류: {err}",
-        )
+        from iris.infrastructure.hermes_errors import is_cloud_auth_user_message
+
+        label = self._backend_label()
+        if is_cloud_auth_user_message(err):
+            self._chat.append_ollama_cloud_login_prompt(f"{label} 오류: {err}")
+        else:
+            self._chat.append_message_instant("Iris", f"{label} 오류: {err}")
         self._chat_worker = None
         self._maybe_refresh_ollama_quota()
         self._finish_current_turn(open_followup=False)
@@ -4033,6 +4198,9 @@ class MainWindow(QMainWindow):
         else:
             self._email_page.set_mails([])
             self._left_sidebar.email_folder.set_status("설정에서 이메일 계정을 추가하세요.")
+            from iris.ui.settings.email_connect_guide import run_email_connect_guide
+
+            QTimer.singleShot(0, lambda: run_email_connect_guide(self))
 
     def _on_calendar_icon(self) -> None:
         self._workspace_mode = "calendar"
@@ -6653,6 +6821,7 @@ class MainWindow(QMainWindow):
             sel = dlg.selection()
             if sel is None:
                 return
+            self._refresh_chat_history_panel()
             self._settings.ollama_base_url = sel.ollama_base_url
             self._settings.ollama_model = sel.ollama_model
             self._settings.hermes_command = sel.hermes_command
@@ -6707,6 +6876,8 @@ class MainWindow(QMainWindow):
                 self._request_stt_warmup()
                 if getattr(self._voice_prefs, "mic_listen_preferred", False):
                     QTimer.singleShot(300, self._maybe_restore_mic_listen)
+            self._pcm_player.set_volume(self._voice_prefs.tts_volume)
+            self._media_audio_out.setVolume(self._voice_prefs.tts_volume)
             self._pcm_player.set_voice_pitch(self._voice_prefs.tts_pitch_semitones)
             self._apply_alert_voice_prefs()
             self._pcm_player.set_voice_effect(

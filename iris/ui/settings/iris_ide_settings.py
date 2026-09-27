@@ -126,8 +126,10 @@ class IrisIdeInstallDialog(QDialog):
 
     def _on_fail(self, err: str) -> None:
         self._worker = None
-        self._card.finish_install(message=f"설치 실패 — {err[:240]}")
+        # finish 전에 로그 먼저 — finish가 bar를 숨기면 set_install_chunk가
+        # begin_install을 다시 켜 「설치 중…」에 고착된다.
         self._card.set_install_chunk(err, None, False)
+        self._card.finish_install(message=f"설치 실패 — {err[:240]}")
         self._close_btn.show()
 
     def _install_running(self) -> bool:

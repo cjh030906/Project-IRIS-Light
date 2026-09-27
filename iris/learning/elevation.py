@@ -120,6 +120,67 @@ def relaunch_as_admin(*, working_directory: str | None = None) -> bool:
     return int(rc) > 32
 
 
+def needs_admin_for_setup() -> bool:
+    """실행 프로토콜(첫 설치·미완료 Core)은 관리자 권한이 필요하다."""
+    if sys.platform != "win32":
+        return False
+    if is_elevated():
+        return False
+    try:
+        from iris.system.setup_protocol import is_setup_preview, needs_setup_wizard
+
+        if is_setup_preview():
+            return False
+        return bool(needs_setup_wizard())
+    except Exception:
+        return False
+
+
+def _pending_setup_wizard_path() -> Path:
+    from iris.system.hermes_iris_control_sync import iris_state_dir
+
+    return iris_state_dir() / "pending_setup_wizard"
+
+
+def mark_pending_setup_wizard(mode: str = "repair") -> None:
+    """관리자 재실행 후 위저드를 다시 열도록 표시."""
+    try:
+        path = _pending_setup_wizard_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((mode or "repair").strip() or "repair", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def consume_pending_setup_wizard() -> str | None:
+    """재실행 후 1회만 읽는다. 없으면 None."""
+    path = _pending_setup_wizard_path()
+    try:
+        if not path.is_file():
+            return None
+        mode = path.read_text(encoding="utf-8").strip() or "repair"
+        path.unlink(missing_ok=True)
+        return mode if mode in {"first_run", "repair"} else "repair"
+    except OSError:
+        return None
+
+
+def elevate_for_setup_protocol(*, mode: str | None = None) -> bool:
+    """실행 프로토콜 직전에 관리자로 재실행. True면 현재 프로세스는 종료할 것."""
+    if sys.platform != "win32" or is_elevated():
+        return False
+    try:
+        from iris.system.setup_protocol import is_setup_preview
+
+        if is_setup_preview():
+            return False
+    except Exception:
+        pass
+    if mode:
+        mark_pending_setup_wizard(mode)
+    return relaunch_as_admin()
+
+
 if __name__ == "__main__":
     exe, params = iris_launch_command()
     name = Path(exe).name.lower()
@@ -133,4 +194,13 @@ if __name__ == "__main__":
         assert params == ""
     else:
         assert "-m iris" in params
+    # ponytail: 미리보기면 상승 요구 금지 — 데모/CI가 UAC에 막히지 않게.
+    import os
+
+    os.environ["IRIS_SETUP_DEMO"] = "1"
+    assert needs_admin_for_setup() is False
+    assert elevate_for_setup_protocol() is False
+    mark_pending_setup_wizard("repair")
+    assert consume_pending_setup_wizard() == "repair"
+    assert consume_pending_setup_wizard() is None
     print("elevation self-check ok", exe, repr(params), "elevated=", is_elevated())

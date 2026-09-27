@@ -183,7 +183,10 @@ def load_voice_preferences(db: Database) -> VoicePreferences:
     prefs.tts_reference_audio = str(data.get("tts_reference_audio", prefs.tts_reference_audio) or "")
     prefs.tts_reference_text = str(data.get("tts_reference_text", prefs.tts_reference_text) or "")
     prefs.tts_voice_prompt_hash = str(data.get("tts_voice_prompt_hash", prefs.tts_voice_prompt_hash) or "")
-    prefs.tts_volume = _to_float(data.get("tts_volume"), prefs.tts_volume)
+    vol = _to_float(data.get("tts_volume"), prefs.tts_volume)
+    if not math.isfinite(vol):
+        vol = prefs.tts_volume
+    prefs.tts_volume = max(0.0, min(1.0, vol))
     prefs.tts_use_voice_profile = _to_bool(
         data.get("tts_use_voice_profile"), prefs.tts_use_voice_profile
     )

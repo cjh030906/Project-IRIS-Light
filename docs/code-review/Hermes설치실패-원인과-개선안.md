@@ -150,9 +150,12 @@ message=f"우회 설치도 실패: {detail[:200]}"     # ← 다시 앞 200자
 | 항목 | 상태 |
 |------|------|
 | 원인 범위 조사 | 완료 (본 문서) |
-| H1 코드 수정 | **미착수** — 다음 작업 |
-| 우회 uv sync / UI 버튼 | 미착수 |
-| 타 사용자 재현 로그 | UI 스크린샷만 (전체 pip 로그 없음 — H9) |
+| H1 코드 수정 | **완료** — `format_pip_failure` 꼬리+로그파일, `_install_hermes_bypass` head 절단 제거 |
+| 우회 uv sync / UI 버튼 | **완료** — uv sync→pip, NeedsUser「로그 열기」·「우회로 다시 설치」, 공식 실패시 우회 1회 |
+| 잔여 R1–R5 | **완료** — R1=(a)+(c): prefer_bypass/last_error bypass·448 → 공식 생략 + 스트림 448 조기 abort. R2 staging 정리. R3 `format_runtime_failure`+log_path+`bypass_runtime`. R4 clip ≤800. R5 §7-1·2 unittest |
+| 총괄표 연번 | **22** (긴급 · **완료**) — `조치-소요-사항-총괄표.md` §3 자 |
+| §7 실기 | unittest로 1·2 대체 통과. cold/`_check_setup_hermes_live`는 **네트워크·기존 hermes 없으면 스킵** (사유: 에이전트 환경에 cold wipe 비권장) |
+| 타 사용자 재현 로그 | UI 스크린샷만 (전체 pip 로그 없음 — H9) → 이후 설치부터 `%LOCALAPPDATA%\hermes\logs\iris-bypass-pip-*.log` |
 
 ---
 
@@ -161,3 +164,6 @@ message=f"우회 설치도 실패: {detail[:200]}"     # ← 다시 앞 200자
 | 날짜 | 내용 |
 |------|------|
 | 2026-09-24 | Core 4 Hermes 우회 실패 UI 기준으로 원인 표·개선안 작성. H1(로그 head 절단) 확정, 동일 트리 pip 재실행 성공 관측 |
+| 2026-09-24 | 연번 1–11 구현: 꼬리 로그·staging clone·py 3.11 우선·uv sync·NeedsUser 우회 버튼·idle 완화 |
+| 2026-09-24 | 총괄표 연번 22 등록(부분 조치). 잔여 R1–R5 후속 프롬프트 분리 |
+| 2026-09-24 | 잔여 R1–R5 구현·unittest 12건·총괄표 22 **완료**. R1 조합 (a)+(c) |

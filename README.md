@@ -252,6 +252,7 @@ copy .env.example .env
 ### 소프트웨어
 
 - **Windows 10/11** 권장 (시작 프로토콜·winget/Hermes 설치 스크립트 기준)
+- `%LOCALAPPDATA%`가 OneDrive 하면 Hermes 공식 uv가 WinError 448에 걸릴 수 있음 — Iris 우회 설치(시스템 Python)를 사용합니다
 - Python **3.11+** 권장
 - **안정적인 인터넷** 필수 (클라우드 모델·도구 호출)
 
@@ -356,7 +357,7 @@ chmod +x run.sh
 | [docs/domain.md](docs/domain.md) | 바운디드 컨텍스트 · Runtime Gateway 설계 |
 | [docs/ia/IA.md](docs/ia/IA.md) | 정보 구조 · 요청 경로 · 아키텍처 다이어그램 |
 | [docs/api/](docs/api/) | API 관련 문서 |
-| [docs/guides/extending-iris.md](docs/guides/extending-iris.md) | 코어 불변 · 스킬/MCP 확장 |
+| [docs/guides/extending-iris.md](docs/guides/extending-iris.md) | 코어 불변 · 패턴 · 어디를 고칠지 · 스킬/MCP/UI |
 | [docs/guides/ui-toolkit-migration.md](docs/guides/ui-toolkit-migration.md) | PyQt6→PySide6 UI 전환 가이드 (문서만) |
 | [docs/guides/agent-readable-docs.md](docs/guides/agent-readable-docs.md) | AI·인간 공용 모듈 헤더 계약 |
 | [docs/검증/기능테스트-시나리오서.md](docs/검증/기능테스트-시나리오서.md) | 검증관용 클릭 단위 시나리오 |

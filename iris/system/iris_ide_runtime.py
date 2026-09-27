@@ -73,6 +73,20 @@ class IrisIdeStatus:
 ProgressFn = Callable[[str], None]
 
 
+def _yarn_needs_native_bypass(msg: str) -> bool:
+    """True when yarn failed on Windows native compile (VS C++ / node-gyp / ffmpeg)."""
+    t = (msg or "").lower()
+    needles = (
+        "could not find any visual studio",
+        "desktop development with c++",
+        "gyp err! find vs",
+        "@theia/ffmpeg",
+        "node-gyp rebuild",
+        "msvs_version not set",
+    )
+    return any(n in t for n in needles)
+
+
 class IrisIdeRuntimeManager:
     """Theia browser backend + IRIS bridge lifecycle."""
 
@@ -163,6 +177,24 @@ class IrisIdeRuntimeManager:
         yarn_ok, yarn_msg = self._run_yarn(dest, ["install", "--frozen-lockfile"], progress, run_streamed)
         if not yarn_ok:
             yarn_ok, yarn_msg = self._run_yarn(dest, ["install"], progress, run_streamed)
+        # VS C++ 없는 PC: @theia/ffmpeg node-gyp 실패 → ignore-scripts 후 스텁·재링크
+        if not yarn_ok and _yarn_needs_native_bypass(yarn_msg):
+            self._emit(progress, "native build bypass (no VS C++)…")
+            yarn_ok, yarn_msg = self._run_yarn(
+                dest, ["install", "--ignore-scripts"], progress, run_streamed
+            )
+            if yarn_ok:
+                stub = dest / "scripts" / "stub-windows-ca-certs.js"
+                if stub.is_file():
+                    self._run_cmd(
+                        [node_executable(), str(stub)],
+                        cwd=str(dest),
+                        progress=progress,
+                        run_streamed=run_streamed,
+                        timeout=60.0,
+                    )
+                # prebuild 있는 네이티브만 재설치 (ffmpeg binding.gyp는 스텁이 제거)
+                yarn_ok, yarn_msg = self._run_yarn(dest, ["install"], progress, run_streamed)
         if not yarn_ok:
             return False, yarn_msg
         self._emit(progress, "TypeScript compile…")

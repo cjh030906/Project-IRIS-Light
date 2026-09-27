@@ -25,9 +25,10 @@ from iris.ui.sidebar.left_sidebar_panel import LeftSidebarPanel
 def _check_history_panel(app: QApplication, db: Database) -> None:
     first = create_conversation(db)
     append_message(db, first.id, "user", "IRIS 구조 알려줘")
-    append_message(db, first.id, "assistant", "ui/system/infrastructure로 나뉩니다.")
+    append_message(db, first.id, "assistant", "ui와 system으로 나뉩니다.")
     second = create_conversation(db)
     append_message(db, second.id, "user", "새 채팅 기능 붙여줘")
+    append_message(db, second.id, "assistant", "채팅 목록을 왼쪽 패널에 붙였습니다.")
 
     panel = ChatHistoryPanel()
     panel.set_conversations(list_conversations(db), active_id=second.id)
@@ -49,15 +50,15 @@ def _check_history_panel(app: QApplication, db: Database) -> None:
 
     buttons = panel.findChildren(QPushButton)
     titles = {b.toolTip() for b in buttons}
-    assert "IRIS 구조 알려줘" in titles, titles
-    assert "새 채팅 기능 붙여줘" in titles, titles
+    assert "ui와 system으로 나뉩니다." in titles, titles
+    assert "채팅 목록을 왼쪽 패널에 붙였습니다." in titles, titles
     assert "새 채팅" in titles, "새 채팅(+) 버튼이 없다"
     assert "제목 수정" in titles, "제목 수정 버튼이 없다"
 
     for b in buttons:
-        if b.toolTip() == "IRIS 구조 알려줘":
+        if b.toolTip() == "ui와 system으로 나뉩니다.":
             b.click()
-        elif b.toolTip() == "대화 삭제: 새 채팅 기능 붙여줘":
+        elif b.toolTip() == "대화 삭제: 채팅 목록을 왼쪽 패널에 붙였습니다.":
             b.click()
         elif b.toolTip() == "새 채팅":
             b.click()

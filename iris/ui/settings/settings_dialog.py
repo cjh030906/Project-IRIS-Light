@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPalette
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -41,6 +42,17 @@ from iris.audio.voice_runtime_client import VoiceRuntimeClient, VoiceRuntimeErro
 from iris.audio.voice_runtime_manager import VoiceRuntimeProcessManager
 from iris.audio.workers import TTSRuntimeBootstrapWorker, TTSStreamWorker, VoiceAnalyzeWorker
 from iris.config.settings import Settings
+from iris.infrastructure.external_api_keys import (
+    CALENDAR_API_FIELD,
+    SEARCH_PRESETS,
+    SearchPreset,
+    apply_hermes_search_backend,
+    load_calendar_api_key,
+    load_search_api_keys,
+    load_search_preset_id,
+    save_calendar_api_key,
+    save_search_api_keys,
+)
 from iris.knowledge.iris_wiki import IrisWiki
 from iris.storage.database import Database
 from iris.storage.email_accounts import (
@@ -79,13 +91,16 @@ from iris.ui.widgets.ide_icons import ide_icon_for, show_ide_not_installed_dialo
 from iris.ui.widgets.mic_input_meter import MicThresholdBar
 from iris.ui.settings import settings_service
 from iris.ui.settings.hud_dialog import (
+    build_chat_title_box,
     configure_form,
     configure_hud_dialog,
+    make_collapsible,
     make_form_label,
     make_hint,
     make_scroll_body,
     make_title,
 )
+from iris.ui.settings.voice_runtime_status import VoiceRuntimeStatusWidget
 from iris.ui.shared.theme_tokens import TOKENS
 
 
@@ -285,7 +300,7 @@ class SettingsDialog(QDialog):
         root.addWidget(make_title("SETTINGS"))
         root.addWidget(
             make_hint(
-                "Ollama · Hermes · API · 음성 · 이메일 · IDE Companion을 설정합니다. "
+                "Ollama · Hermes · API(검색·캘린더·LLM) · 음성 · 이메일 · IDE Companion을 설정합니다. "
                 "창을 늘리거나 스크롤하면 모든 항목을 가리지 않고 볼 수 있습니다."
             )
         )
@@ -329,18 +344,21 @@ class SettingsDialog(QDialog):
         form.addRow(make_form_label("Hermes API Key"), self._hermes_key)
         form.addRow(make_form_label("Hermes 명령"), self._hermes_cmd)
         conn_lay.addLayout(form)
-        content_lay.addWidget(conn_box)
+        content_lay.addWidget(make_collapsible(conn_box))
+        content_lay.addWidget(make_collapsible(self._build_api_box()))
 
         if db is not None:
-            content_lay.addWidget(self._build_api_providers_box())
-            content_lay.addWidget(self._build_voice_box())
-            content_lay.addWidget(self._build_permission_box())
-            content_lay.addWidget(self._build_learning_runtime_box())
-            content_lay.addWidget(self._build_email_box())
-            content_lay.addWidget(self._build_ide_box())
-            content_lay.addWidget(self._build_project_parents_box())
-            content_lay.addWidget(self._build_hermes_control_box())
-            content_lay.addWidget(self._build_setup_protocol_box())
+            chat_box = build_chat_title_box(db)
+            self._chat_title_basis = chat_box.title_basis
+            content_lay.addWidget(make_collapsible(chat_box))
+            content_lay.addWidget(make_collapsible(self._build_voice_box()))
+            content_lay.addWidget(make_collapsible(self._build_permission_box()))
+            content_lay.addWidget(make_collapsible(self._build_learning_runtime_box()))
+            content_lay.addWidget(make_collapsible(self._build_email_box()))
+            content_lay.addWidget(make_collapsible(self._build_ide_box()))
+            content_lay.addWidget(make_collapsible(self._build_project_parents_box()))
+            content_lay.addWidget(make_collapsible(self._build_hermes_control_box()))
+            content_lay.addWidget(make_collapsible(self._build_setup_protocol_box()))
 
         content_lay.addStretch(1)
         root.addWidget(scroll, 1)
@@ -356,8 +374,155 @@ class SettingsDialog(QDialog):
             self._sync_ide_selection_ui_quick()
             self._reload_account_list()
 
+    @staticmethod
+    def _open_signup_url(url: str) -> None:
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _build_api_box(self) -> QGroupBox:
+        box = QGroupBox("API")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(TOKENS.spacing_sm)
+        lay.addWidget(
+            make_hint(
+                "검색·캘린더·LLM을 한곳에서 넣습니다. 검색 프리셋을 고르면 옆 「발급」이 "
+                "그 서비스의 키 발급 페이지를 엽니다. 키는 그 아래 칸에 넣고 저장하세요."
+            )
+        )
+        form = QFormLayout()
+        configure_form(form)
+        self._search_form = form
+        self._install_search_preset_rows(form)
+        self._install_calendar_key_row(form)
+        lay.addLayout(form)
+        if self._db is not None:
+            lay.addWidget(self._build_api_providers_box())
+        return box
+
+    def _install_search_preset_rows(self, form: QFormLayout) -> None:
+        self._search_draft = load_search_api_keys()
+        self._search_preset_obj: SearchPreset | None = None
+        self._search_preset = QComboBox()
+        for preset in SEARCH_PRESETS:
+            label = preset.label + (" ★" if preset.recommended else "")
+            self._search_preset.addItem(label, preset.id)
+        self._style_combo_light_text(self._search_preset)
+        self._search_preset.setMinimumHeight(32)
+        self._search_preset.currentIndexChanged.connect(self._on_search_preset_changed)
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(8)
+        preset_row.addWidget(self._search_preset, 1)
+        self._search_issue_btn = QPushButton("발급")
+        self._search_issue_btn.setFixedWidth(56)
+        self._search_issue_btn.clicked.connect(self._on_search_issue)
+        preset_row.addWidget(self._search_issue_btn, 0)
+        self._search_api_key = QLineEdit()
+        self._search_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._search_api_key.setMinimumHeight(32)
+        self._search_extra_key = QLineEdit()
+        self._search_extra_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._search_extra_key.setMinimumHeight(32)
+        self._search_extra_label = make_form_label("추가 키")
+        form.addRow(make_form_label("검색 프리셋"), preset_row)
+        form.addRow(make_form_label("API Key"), self._search_api_key)
+        form.addRow(self._search_extra_label, self._search_extra_key)
+        self._search_extra_row = form.rowCount() - 1
+        initial = self._search_preset.findData(load_search_preset_id())
+        self._search_preset.blockSignals(True)
+        self._search_preset.setCurrentIndex(initial if initial >= 0 else 0)
+        self._search_preset.blockSignals(False)
+        self._apply_search_preset(self._search_preset.currentIndex())
+
+    def _install_calendar_key_row(self, form: QFormLayout) -> None:
+        field = CALENDAR_API_FIELD
+        initial = load_calendar_api_key() or self._settings.data_go_kr_service_key
+        self._calendar_api_key = QLineEdit(initial)
+        self._calendar_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._calendar_api_key.setMinimumHeight(32)
+        self._calendar_api_key.setPlaceholderText(field.hint)
+        self._calendar_api_key.setToolTip(field.hint)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(self._calendar_api_key, 1)
+        btn = QPushButton("발급")
+        btn.setFixedWidth(56)
+        btn.setToolTip("공공데이터포털 특일정보 API 발급 페이지 열기")
+        btn.clicked.connect(lambda: self._open_signup_url(field.signup_url))
+        row.addWidget(btn, 0)
+        form.addRow(make_form_label("캘린더 API Key"), row)
+
+    def _on_search_preset_changed(self, index: int) -> None:
+        self._stash_search_preset_fields()
+        self._apply_search_preset(index)
+
+    def _stash_search_preset_fields(self) -> None:
+        preset = self._search_preset_obj
+        if preset is None:
+            return
+        if preset.env_key:
+            self._search_draft[preset.env_key] = self._search_api_key.text().strip()
+        if preset.extra_env:
+            self._search_draft[preset.extra_env] = self._search_extra_key.text().strip()
+
+    def _apply_search_preset(self, index: int) -> None:
+        preset_id = str(self._search_preset.itemData(index) or "none")
+        preset = next((p for p in SEARCH_PRESETS if p.id == preset_id), SEARCH_PRESETS[0])
+        self._search_preset_obj = preset
+        self._search_preset.setToolTip(preset.hint)
+        has_signup = bool(preset.signup_url)
+        self._search_issue_btn.setEnabled(has_signup)
+        self._search_issue_btn.setToolTip(
+            "키 발급 페이지 열기" if has_signup else "이 프리셋은 발급 페이지가 없습니다"
+        )
+        needs_key = bool(preset.env_key)
+        self._search_api_key.setEnabled(needs_key)
+        self._search_api_key.setEchoMode(
+            QLineEdit.EchoMode.Normal
+            if preset.id == "searxng"
+            else QLineEdit.EchoMode.Password
+        )
+        if preset.id == "searxng":
+            placeholder = "인스턴스 URL — 예: http://127.0.0.1:8080"
+        elif preset.key_optional and not needs_key:
+            placeholder = "키 없이 사용할 수 있습니다"
+        elif preset.hint:
+            placeholder = preset.hint
+        else:
+            placeholder = "API Key"
+        self._search_api_key.setPlaceholderText(placeholder)
+        self._search_api_key.setToolTip(preset.hint)
+        self._search_api_key.setText(self._search_draft.get(preset.env_key, "") if needs_key else "")
+        show_extra = bool(preset.extra_env)
+        self._search_extra_label.setText(preset.extra_label or "추가 키")
+        self._search_extra_key.setPlaceholderText(preset.extra_label or "")
+        self._search_extra_key.setText(
+            self._search_draft.get(preset.extra_env, "") if show_extra else ""
+        )
+        self._search_form.setRowVisible(self._search_extra_row, show_extra)
+
+    def _on_search_issue(self) -> None:
+        preset = self._search_preset_obj
+        if preset is not None and preset.signup_url:
+            self._open_signup_url(preset.signup_url)
+
+    def _persist_search_calendar_api_keys(self) -> None:
+        if hasattr(self, "_search_draft"):
+            self._stash_search_preset_fields()
+            preset = self._search_preset_obj
+            save_search_api_keys(
+                self._search_draft,
+                preset_id=preset.id if preset is not None else "none",
+            )
+            if preset is not None and preset.hermes_backend:
+                apply_hermes_search_backend(preset.hermes_backend)
+        if hasattr(self, "_calendar_api_key"):
+            key = self._calendar_api_key.text().strip()
+            save_calendar_api_key(key)
+            self._settings.data_go_kr_service_key = key
+
     def _build_api_providers_box(self) -> QGroupBox:
-        box = QGroupBox("API (OpenAI 호환)")
+        box = QGroupBox("LLM (OpenAI 호환)")
         lay = QVBoxLayout(box)
         lay.setSpacing(TOKENS.spacing_sm)
         lay.addWidget(
@@ -375,6 +540,7 @@ class SettingsDialog(QDialog):
         self._api_preset = QComboBox()
         for label, url in BASE_URL_PRESETS:
             self._api_preset.addItem(label, url)
+        self._style_combo_light_text(self._api_preset)
         self._api_preset.currentIndexChanged.connect(self._on_api_preset_changed)
         self._api_base = QLineEdit()
         self._api_base.setPlaceholderText("예: https://generativelanguage.googleapis.com/v1beta/openai")
@@ -482,6 +648,32 @@ class SettingsDialog(QDialog):
             self._api_base.setText(url)
         if not self._api_name.text().strip() and index > 0:
             self._api_name.setText(self._api_preset.itemText(index))
+
+    @staticmethod
+    def _style_combo_light_text(combo: QComboBox) -> None:
+        """Windows 네이티브 팔레트가 드롭다운 글자를 검게 덮는 경우 대비."""
+        light = QColor(TOKENS.text_primary)
+        pal = combo.palette()
+        pal.setColor(QPalette.ColorRole.Text, light)
+        pal.setColor(QPalette.ColorRole.ButtonText, light)
+        pal.setColor(QPalette.ColorRole.WindowText, light)
+        pal.setColor(QPalette.ColorRole.HighlightedText, light)
+        combo.setPalette(pal)
+        view = combo.view()
+        if view is not None:
+            vpal = view.palette()
+            vpal.setColor(QPalette.ColorRole.Text, light)
+            vpal.setColor(QPalette.ColorRole.WindowText, light)
+            vpal.setColor(QPalette.ColorRole.HighlightedText, light)
+            vpal.setColor(QPalette.ColorRole.Base, QColor(TOKENS.space_navy))
+            vpal.setColor(QPalette.ColorRole.Highlight, QColor(37, 99, 235, 115))
+            view.setPalette(vpal)
+
+    def _on_tts_volume_changed(self, value: int) -> None:
+        self._voice_tts_volume_label.setText(f"{int(value)}%")
+        vol = max(0.0, min(1.0, value / 100.0))
+        self._preview_player.set_volume(vol)
+        self._ref_preview_player.setVolume(vol)
 
     def _flush_api_form_to_providers(self, *, silent: bool = False) -> ApiProvider | None:
         """이름+URL이 채워져 있으면 목록에 추가(저장 버튼만 누른 경우 대비)."""
@@ -1009,6 +1201,24 @@ class SettingsDialog(QDialog):
         self._voice_runtime_mock.setToolTip(
             "켜면 모델 없이 UI만 검증합니다. 실제 팀 녹음 목소리를 들으려면 끄세요."
         )
+        self._voice_runtime_status = VoiceRuntimeStatusWidget(
+            runtime=self._voice_runtime,
+            url_provider=lambda: self._voice_runtime_url.text().strip()
+            or "http://127.0.0.1:18765",
+            mock_provider=lambda: self._voice_runtime_mock.isChecked(),
+            model_provider=lambda: (
+                self._voice_tts_model.currentText().strip()
+                if hasattr(self, "_voice_tts_model")
+                else self._voice_prefs.tts_model
+            )
+            or "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            parent=self,
+        )
+        self._voice_runtime_status.connected_changed.connect(self._on_voice_runtime_connected)
+        self._voice_runtime_url.editingFinished.connect(self._voice_runtime_status.probe_now)
+        self._voice_runtime_mock.stateChanged.connect(
+            lambda _checked: self._voice_runtime_status.probe_now()
+        )
 
         self._voice_tts_on = QCheckBox("TTS 사용")
         self._voice_tts_on.setChecked(self._voice_prefs.tts_enabled)
@@ -1162,8 +1372,27 @@ class SettingsDialog(QDialog):
         form.addRow(make_form_label("Follow-up 창(초)"), self._voice_followup_window)
         form.addRow(make_form_label("Runtime URL"), self._voice_runtime_url)
         form.addRow(make_form_label(""), self._voice_runtime_mock)
+        form.addRow(make_form_label("Runtime 상태"), self._voice_runtime_status)
+        vol = max(0.0, min(1.0, float(self._voice_prefs.tts_volume)))
+        self._voice_tts_volume = QSlider(Qt.Orientation.Horizontal)
+        self._voice_tts_volume.setRange(0, 100)
+        self._voice_tts_volume.setValue(int(round(vol * 100)))
+        self._voice_tts_volume.setToolTip("아이리스 음성 출력 크기")
+        self._voice_tts_volume_label = QLabel(f"{self._voice_tts_volume.value()}%")
+        self._voice_tts_volume_label.setMinimumWidth(40)
+        self._voice_tts_volume_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._voice_tts_volume.valueChanged.connect(self._on_tts_volume_changed)
+        vol_row = QHBoxLayout()
+        vol_row.setContentsMargins(0, 0, 0, 0)
+        vol_row.setSpacing(10)
+        vol_row.addWidget(self._voice_tts_volume, 1)
+        vol_row.addWidget(self._voice_tts_volume_label, 0)
+
         form.addRow(make_form_label(""), self._voice_tts_on)
         form.addRow(make_form_label("TTS 모드"), self._voice_tts_mode)
+        form.addRow(make_form_label("음성 출력 크기"), vol_row)
         form.addRow(make_form_label("TTS 엔진"), self._voice_tts_engine)
         form.addRow(make_form_label("TTS 모델"), self._voice_tts_model)
         form.addRow(make_form_label("커스텀 체크포인트"), self._voice_custom_model)
@@ -1298,7 +1527,7 @@ class SettingsDialog(QDialog):
             tts_reference_audio=self._voice_ref_audio.text().strip(),
             tts_reference_text=self._voice_ref_text.toPlainText().strip(),
             tts_voice_prompt_hash=self._voice_prefs.tts_voice_prompt_hash,
-            tts_volume=self._voice_prefs.tts_volume,
+            tts_volume=max(0.0, min(1.0, self._voice_tts_volume.value() / 100.0)),
             tts_use_voice_profile=self._voice_use_profile.isChecked(),
             tts_tone_routing=self._voice_tone_routing.isChecked(),
             tts_ai_voice_fx_enabled=self._voice_ai_voice_fx.isChecked(),
@@ -1440,7 +1669,9 @@ class SettingsDialog(QDialog):
             return
         self._ref_preview_player.stop()
         self._ref_preview_player.setSource(QUrl.fromLocalFile(path))
-        self._ref_preview_player.setVolume(1.0)
+        self._ref_preview_player.setVolume(
+            max(0.0, min(1.0, self._voice_tts_volume.value() / 100.0))
+        )
         self._ref_preview_player.play()
 
     def _select_recommendation(self) -> None:
@@ -1526,6 +1757,7 @@ class SettingsDialog(QDialog):
         if not payload.get("running"):
             self._on_settings_tts_runtime_failed("Voice runtime을 시작하지 못했습니다.", job_id)
             return
+        self._preview_player.set_volume(prefs.tts_volume)
         self._preview_player.set_voice_pitch(prefs.tts_pitch_semitones)
         self._preview_player.set_voice_effect(
             enabled=prefs.tts_ai_voice_fx_enabled,
@@ -1889,12 +2121,33 @@ class SettingsDialog(QDialog):
         if not self._deferred_status_started:
             self._deferred_status_started = True
             QTimer.singleShot(0, self._start_deferred_status_loads)
+        if hasattr(self, "_voice_runtime_status"):
+            self._voice_runtime_status.start_watching()
         self._connect_mic_meter()
         QTimer.singleShot(0, self._sync_mic_meter)
 
     def hideEvent(self, event) -> None:  # noqa: N802
+        if hasattr(self, "_voice_runtime_status"):
+            self._voice_runtime_status.stop_watching()
         self._disconnect_mic_meter()
         super().hideEvent(event)
+
+    def _on_voice_runtime_connected(self, connected: bool) -> None:
+        """설정에서 런타임을 띄우면 메인 창 플래그도 맞춰 TTS가 바로 붙게 한다."""
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "_tts_runtime_ready"):
+            return
+        try:
+            parent._tts_runtime_ready = bool(connected)
+            if connected and hasattr(parent, "_status_header"):
+                idle = (
+                    parent._tts_idle_status()
+                    if hasattr(parent, "_tts_idle_status")
+                    else ("ON" if connected else "OFF")
+                )
+                parent._status_header.set_tts_status(idle)
+        except Exception:
+            pass
 
     def _connect_mic_meter(self) -> None:
         if self._microphone is None or self._mic_meter_connected:
@@ -1916,6 +2169,8 @@ class SettingsDialog(QDialog):
         self._mic_meter_connected = False
 
     def _cancel_deferred_status_workers(self) -> None:
+        if hasattr(self, "_voice_runtime_status"):
+            self._voice_runtime_status.stop_watching()
         for attr in (
             "_voice_refs_worker",
             "_aloha_status_worker",
@@ -2070,7 +2325,44 @@ class SettingsDialog(QDialog):
             self._run_setup_verify()
 
     def _open_setup_wizard(self, *, mode: str) -> None:
+        import sys
+
+        from PyQt6.QtWidgets import QApplication
+
+        from iris.system.setup_protocol import is_setup_preview
         from iris.ui.window.setup_wizard import SetupWizard
+
+        # 설정에서 「환경 다시 설정」도 관리자 권한으로 — 위저드 show 전에 UAC.
+        if sys.platform == "win32" and not is_setup_preview():
+            try:
+                from iris.learning.elevation import elevate_for_setup_protocol, is_elevated
+
+                if not is_elevated():
+                    box = QMessageBox(self)
+                    box.setWindowTitle("실행 프로토콜 · 관리자 권한")
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    box.setText("실행 프로토콜 설치는 관리자 권한이 필요합니다.")
+                    box.setInformativeText(
+                        "지금 재실행을 누르면 Iris가 종료된 뒤 UAC 확인 후 "
+                        "관리자 권한으로 다시 시작됩니다."
+                    )
+                    btn_restart = box.addButton(
+                        "지금 재실행", QMessageBox.ButtonRole.AcceptRole
+                    )
+                    box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+                    box.setDefaultButton(btn_restart)
+                    box.exec()
+                    if box.clickedButton() is btn_restart and elevate_for_setup_protocol(
+                        mode=mode
+                    ):
+                        self.accept()
+                        app = QApplication.instance()
+                        if app is not None:
+                            app.quit()
+                        sys.exit(0)
+                    return
+            except Exception:
+                pass
 
         dlg = SetupWizard(self._settings, mode=mode, parent=self)
         dlg.exec()
@@ -2408,6 +2700,8 @@ class SettingsDialog(QDialog):
             save_voice_preferences(self._db, voice_prefs)
             save_learning_preferences(self._db, learning_prefs)
             self._persist_api_providers()
+            self._persist_chat_title_basis()
+        self._persist_search_calendar_api_keys()
         try:
             from iris.infrastructure.hermes_credentials import resolve_hermes_api_key
 
@@ -2450,6 +2744,21 @@ class SettingsDialog(QDialog):
                         app.quit()
                     sys.exit(0)
         self.accept()
+
+    def _persist_chat_title_basis(self) -> None:
+        combo = getattr(self, "_chat_title_basis", None)
+        if combo is None or self._db is None:
+            return
+        from iris.storage.conversations import (
+            active_conversation_id,
+            refresh_conversation_title,
+            save_title_basis,
+        )
+
+        save_title_basis(self._db, str(combo.currentData() or "last"))
+        cid = active_conversation_id(self._db)
+        if cid is not None:
+            refresh_conversation_title(self._db, cid)
 
     def _current_learning_prefs_from_ui(self) -> LearningPreferences:
         if not hasattr(self, "_perm_level"):

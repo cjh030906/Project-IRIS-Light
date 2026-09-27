@@ -41,3 +41,7 @@ yarn build
 set PORT=3000
 yarn start -- C:\path\to\workspace
 ```
+
+Windows note: IRIS IDE is **browser-target**. `@theia/ffmpeg` is resolved to
+`vendor/theia-ffmpeg-stub` so Visual Studio C++ / node-gyp is **not** required
+for install. Optional `@vscode/windows-ca-certs` is stubbed in `postinstall`.

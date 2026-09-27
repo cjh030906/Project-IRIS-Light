@@ -786,7 +786,9 @@ class SetupProtocol:
         allow_core_skip: bool = False,
     ) -> None:
         self.ollama_base_url = ollama_base_url
-        self.hermes_base_url = hermes_base_url
+        from iris.infrastructure.hermes_client import normalize_hermes_openai_base_url
+
+        self.hermes_base_url = normalize_hermes_openai_base_url(hermes_base_url)
         self.hermes_command = hermes_command or "hermes"
         self.min_model = (min_model or default_min_model()).strip() or DEFAULT_MIN_MODEL
         self.simulate = is_setup_demo() if simulate is None else bool(simulate)
@@ -1246,12 +1248,21 @@ class SetupProtocol:
             )
             if health.ok:
                 weak = " · 약한 키" if ready.key_weak else ""
-                health_msg = (
-                    f"[READY] /health OK 이지만 gateway_ready 실패"
-                    f" ({ready.code}{weak}, key_len={ready.key_len}).\n"
-                    f"{ready.detail}\n"
-                    "조치: API 키 정합 후 gateway 재기동 (시작 프로토콜 다시 설정)."
-                )
+                if ready.code == "models_404" or ready.http_status == 404:
+                    health_msg = (
+                        f"[READY] /health OK 이지만 /v1/models 404"
+                        f" ({ready.code}{weak}, key_len={ready.key_len}).\n"
+                        f"{ready.detail}\n"
+                        "조치: API 키 rotate가 아니라 base_url(/v1) 정합 + "
+                        "gateway 완전 재기동 (시작 프로토콜 다시 설정)."
+                    )
+                else:
+                    health_msg = (
+                        f"[READY] /health OK 이지만 gateway_ready 실패"
+                        f" ({ready.code}{weak}, key_len={ready.key_len}).\n"
+                        f"{ready.detail}\n"
+                        "조치: API 키 정합 후 gateway 재기동 (시작 프로토콜 다시 설정)."
+                    )
             else:
                 health_msg = (
                     f"[HEALTH] Hermes gateway /health 실패 ({health.code})"
@@ -2820,7 +2831,22 @@ class SetupProtocol:
             _progress(
                 f"gateway /health OK · ready 실패 ({ready.code}: {ready.detail}) — 재기동…"
             )
-            if ready.key_weak or ready.code == "no_key":
+            if ready.code == "models_404" or ready.http_status == 404:
+                from iris.infrastructure.hermes_client import (
+                    normalize_hermes_openai_base_url,
+                )
+
+                self.hermes_base_url = normalize_hermes_openai_base_url(
+                    self.hermes_base_url
+                )
+                os.environ["IRIS_HERMES_BASE_URL"] = self.hermes_base_url
+                _upsert_dotenv(
+                    _iris_env_path(),
+                    {"IRIS_HERMES_BASE_URL": self.hermes_base_url},
+                )
+                # 404 ≠ 약한 키 — rotate 금지, .env 키·ENABLED만 보강
+                self._step_hermes_env(force_rotate=False)
+            elif ready.key_weak or ready.code == "no_key" or ready.http_status == 401:
                 self._step_hermes_env(force_rotate=True)
                 key = resolve_hermes_api_key()
             ok = _try_start(prefer_restart=True)
@@ -2922,16 +2948,49 @@ class SetupProtocol:
             detail_s = detail or ""
         elif ready_fail and not self._abort:
             # health OK·models 실패 — 재시도가 no-op이 되지 않게 1회 restart
-            self._emit_stream(
-                "gateway ready 실패 — 키 점검 후 gateway 재기동…", None, replace=False
-            )
             from iris.system.hermes_gateway import probe_gateway_ready
+            from iris.infrastructure.hermes_client import normalize_hermes_openai_base_url
 
             ready = probe_gateway_ready(
                 self.hermes_base_url, timeout_sec=3.0
             )
-            if ready.key_weak or ready.code in ("no_key", "models_http"):
-                self._step_hermes_env(force_rotate=bool(ready.key_weak or ready.code == "no_key"))
+            # 404는 키 불일치가 아님 — base_url 정규화 + 강제 재기동만
+            is_404 = ready.code == "models_404" or ready.http_status == 404
+            is_401 = ready.http_status == 401 or (
+                ready.code == "models_http" and "401" in (ready.detail or "")
+            )
+            if is_404:
+                self.hermes_base_url = normalize_hermes_openai_base_url(
+                    self.hermes_base_url
+                )
+                os.environ["IRIS_HERMES_BASE_URL"] = self.hermes_base_url
+                _upsert_dotenv(
+                    _iris_env_path(),
+                    {"IRIS_HERMES_BASE_URL": self.hermes_base_url},
+                )
+                self._emit_stream(
+                    "gateway /v1/models 404 — base_url 정규화 후 gateway 재기동"
+                    " (키 재발급 없음)…",
+                    None,
+                    replace=False,
+                )
+                # API_SERVER_KEY는 유지하되 .env에 ENABLED·키가 없으면 보강
+                self._step_hermes_env(force_rotate=False)
+            elif is_401 or ready.key_weak or ready.code == "no_key":
+                self._emit_stream(
+                    "gateway ready 401/키 없음 — API 키 재발급 후 gateway 재기동…",
+                    None,
+                    replace=False,
+                )
+                self._step_hermes_env(force_rotate=True)
+            else:
+                self._emit_stream(
+                    "gateway ready 실패 — 키 점검 후 gateway 재기동…",
+                    None,
+                    replace=False,
+                )
+                if ready.code == "models_http":
+                    self._step_hermes_env(force_rotate=False)
             self._step_hermes_gateway(force_restart=True)
             ok, detail = self.verify_core()
             detail_s = detail or ""

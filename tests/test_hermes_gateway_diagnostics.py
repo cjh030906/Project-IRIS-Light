@@ -15,7 +15,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from iris.infrastructure.hermes_client import HealthProbeResult, parse_health_payload
+from iris.infrastructure.hermes_client import (
+    GatewayReadyResult,
+    HealthProbeResult,
+    parse_health_payload,
+)
 from iris.system import hermes_gateway as gw
 
 
@@ -285,7 +289,20 @@ class GatewayDiagnosticsTests(unittest.TestCase):
             looks_like_hermes=True,
             body_summary='{"status":"ok"}',
         )
-        with patch.object(gw, "probe_gateway_health", return_value=healthy):
+        ready = GatewayReadyResult(
+            ok=True,
+            code="ok",
+            health_ok=True,
+            models_ok=True,
+            http_status=200,
+            detail="/v1/models OK",
+            key_len=40,
+        )
+        with (
+            patch.object(gw, "probe_gateway_health", return_value=healthy),
+            patch.object(gw, "probe_gateway_ready", return_value=ready),
+            patch.object(gw, "prune_orphan_gateway_procs", return_value=0),
+        ):
             self.assertTrue(
                 gw.ensure_hermes_gateway_running("http://127.0.0.1:8642/v1")
             )
@@ -293,6 +310,7 @@ class GatewayDiagnosticsTests(unittest.TestCase):
         self.assertIsNotNone(diag)
         assert diag is not None
         self.assertTrue(diag.ok)
+        self.assertTrue(diag.models_ok)
 
     def test_clear_and_mark_already_running_clears_stale_timeout(self) -> None:
         stale = gw.GatewayDiagnosis(
