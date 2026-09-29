@@ -13,16 +13,24 @@ _ICON_PROVIDER = QFileIconProvider()
 _ICON_PX = 16
 
 
+def at_ref_path(raw: str) -> str:
+    """@참조에서 경로만. `C:` 드라이브 콜론은 자르지 않고 `:줄:칸`만 분리한다."""
+    body = (raw or "").strip()
+    if body.startswith("@"):
+        body = body[1:].strip()
+    from iris.ui.chat.chat_blocks import parse_file_chip_location
+
+    path, _line, _col = parse_file_chip_location(body)
+    return path or body
+
+
 def composer_chip_label(path: str) -> str:
     """칩 표시명 — @ref는 basename, 로컬 경로는 파일/폴더명."""
     p = (path or "").strip()
     if not p:
         return ""
-    if p.startswith("@"):
-        tail = p[1:].split(":")[0]
-        name = Path(tail.replace("/", os.sep)).name
-        return name or tail
-    return Path(p).name or p
+    target = at_ref_path(p) if p.startswith("@") else p
+    return Path(target).name or target
 
 
 def composer_chip_icon(path: str, *, workspace_root: str = "") -> QPixmap:
@@ -30,7 +38,7 @@ def composer_chip_icon(path: str, *, workspace_root: str = "") -> QPixmap:
     raw = (path or "").strip()
     fs_path = raw
     if raw.startswith("@"):
-        rel = raw[1:].split(":")[0]
+        rel = at_ref_path(raw)
         ws = (workspace_root or "").strip()
         if ws:
             candidate = Path(ws).expanduser() / rel.replace("/", os.sep)

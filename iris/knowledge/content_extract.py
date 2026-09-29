@@ -326,6 +326,40 @@ def _fetch_url_text_stdlib(url: str, *, timeout: float = 20.0) -> tuple[str, str
     return title, body
 
 
+def explicit_document_title(meta: str) -> str:
+    """PDF/HTML 등 문서 안 제목. 한 글자·드라이브 문자 찌꺼기는 제목이 아니다."""
+    text = " ".join((meta or "").replace("\x00", " ").split())
+    if len(text) < 2 or text.casefold() in {"c", "c:"}:
+        return ""
+    return text
+
+
+def _pdf_metadata_title(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+
+        info = PdfReader(str(path)).metadata
+        raw = str(getattr(info, "title", "") or "") if info is not None else ""
+    except Exception:
+        return ""
+    return explicit_document_title(raw)
+
+
+def source_display_title(path: Path, *, meta: str = "", text: str = "") -> str:
+    """1) 문서 제목  2) 파일명  3) untitled."""
+    title = explicit_document_title(meta)
+    if not title and path.suffix.lower() in {".md", ".markdown"}:
+        for line in (text or "").splitlines()[:12]:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                title = explicit_document_title(stripped.lstrip("#").strip())
+                if title:
+                    break
+    if title:
+        return title
+    return path.name or path.stem or "untitled"
+
+
 def extract_from_source(source: str) -> dict[str, str | bool]:
     """파일 경로 또는 http(s) URL → {kind, title, text, source, truncated}."""
     src = (source or "").strip().strip('"').strip("'")
@@ -355,7 +389,7 @@ def extract_from_source(source: str) -> dict[str, str | bool]:
         text, truncated = _truncate(text)
         return {
             "kind": "pdf",
-            "title": path.stem,
+            "title": source_display_title(path, meta=_pdf_metadata_title(path), text=text),
             "text": text,
             "source": str(path.resolve()),
             "truncated": truncated,
@@ -367,7 +401,7 @@ def extract_from_source(source: str) -> dict[str, str | bool]:
         text, truncated = _truncate(text)
         return {
             "kind": "text",
-            "title": path.stem,
+            "title": source_display_title(path, text=text),
             "text": text,
             "source": str(path.resolve()),
             "truncated": truncated,

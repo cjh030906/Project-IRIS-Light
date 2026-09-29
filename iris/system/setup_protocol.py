@@ -232,6 +232,7 @@ class SetupStepResult:
     action_hint: str = ""
     label: str = ""
     can_install: bool = False  # NeedsUser 카드에 「설치」 버튼
+    log_path: str = ""
     can_login: bool = False  # 「로그인」/「Ollama 열기」 버튼
     install_label: str = ""
     login_label: str = ""
@@ -321,6 +322,7 @@ def _default_state() -> dict[str, Any]:
         "steps": {},
         "optional": {k: {"status": "pending", "message": "", "updated_at": ""} for k in OPTIONAL_IDS},
         "last_error": "",
+        "last_error_detail": {},
         # level: none|quick|full — Ready(quick) vs 검사/smoke(full) 불일치 안내용
         "last_verify": {
             "level": "none",
@@ -477,6 +479,7 @@ def mark_core_ready_if_healthy(
     state["core_ready"] = True
     state["completed_at"] = state.get("completed_at") or _utc_now()
     state["last_error"] = ""
+    state["last_error_detail"] = {}
     save_setup_state(state)
     return True
 
@@ -487,6 +490,7 @@ def reset_core_ready() -> None:
     state["core_ready"] = False
     state["completed_at"] = ""
     state["last_error"] = ""
+    state["last_error_detail"] = {}
     save_setup_state(state)
 
 
@@ -707,6 +711,16 @@ def _winget_available() -> bool:
     return _winget_exe() is not None
 
 
+class UserCancelled(Exception):
+    """사용자가 설치를 중단함. 실패로 보고 재설치하지 않는다."""
+
+
+class InstallStreamTimeout(subprocess.TimeoutExpired):
+    def __init__(self, cmd: list[str], timeout: float, kind: str) -> None:
+        super().__init__(cmd, timeout)
+        self.kind = kind if kind in ("idle", "hard") else "hard"
+
+
 def _kill_proc_tree(proc: subprocess.Popen[bytes]) -> None:
     if proc.poll() is not None:
         return
@@ -754,6 +768,7 @@ class SetupProtocol:
         self._cloud_without_local_confirmed = False
         # ponytail: Hermes 런타임 자동 재설치는 세션당 1회 — 무한 루프 천장
         self._hermes_runtime_repaired = False
+        self._hermes_official_failed = False
 
     def bind_stream(self, fn: StreamFn | None) -> None:
         self._on_stream = fn
@@ -873,18 +888,25 @@ class SetupProtocol:
 
         threading.Thread(target=_reader, daemon=True).start()
         timed_out = False
+        timed_out_kind = ""
         try:
             while True:
                 if self._abort:
                     _kill_proc_tree(proc)
-                    break
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    raise UserCancelled("사용자가 중단함")
                 now = time.monotonic()
                 if hard_limit is not None and (now - started) > hard_limit:
                     timed_out = True
+                    timed_out_kind = "hard"
                     _kill_proc_tree(proc)
                     break
                 if idle_limit is not None and (now - last_activity) > idle_limit:
                     timed_out = True
+                    timed_out_kind = "idle"
                     _kill_proc_tree(proc)
                     break
                 try:
@@ -926,7 +948,7 @@ class SetupProtocol:
             self._active_proc = None
         code = proc.returncode if proc.returncode is not None else 1
         if timed_out:
-            raise subprocess.TimeoutExpired(cmd, hard_limit or idle_limit or 0)
+            raise InstallStreamTimeout(cmd, hard_limit or idle_limit or 0, timed_out_kind)
         return subprocess.CompletedProcess(cmd, code, "\n".join(collected), "")
 
     def last_error(self) -> str:
@@ -1270,6 +1292,7 @@ class SetupProtocol:
         self._state["core_ready"] = True
         self._state["completed_at"] = _utc_now()
         self._state["last_error"] = ""
+        self._state["last_error_detail"] = {}
         self._save_state()
         return True
 
@@ -2307,43 +2330,96 @@ class SetupProtocol:
             env=env,
         )
 
-    def _install_hermes_bypass(self) -> SetupStepResult:
-        """uv managed Python junction 실패 시 시스템/Iris Python 우회 설치."""
-        from iris.system.hermes_install import install_hermes_with_system_python
+    def _hermes_done(self, message: str) -> SetupStepResult:
+        self._hermes_official_failed = False
+        self._state["last_error"] = ""
+        self._state["last_error_detail"] = {}
+        return self._record_step("hermes_install", "done", message[:240])
 
+    def _hermes_cancelled(self) -> SetupStepResult:
+        result = self._record_step("hermes_install", "failed", "사용자가 중단함")
+        self._state["last_error_detail"] = {
+            "step": "hermes_install",
+            "kind": "cancel",
+            "log_path": "",
+            "tail": "사용자가 중단함",
+        }
+        self._save_state()
+        return result
+
+    def _hermes_user_fail(
+        self, message: str, kind: str, log_path: str, tail: str
+    ) -> SetupStepResult:
+        message = redact_secrets(message)
+        self._state["last_error"] = message[:500]
+        self._state["last_error_detail"] = {
+            "step": "hermes_install",
+            "kind": kind,
+            "log_path": log_path,
+            "tail": redact_secrets(tail)[:800],
+        }
+        steps = self._state.setdefault("steps", {})
+        steps["hermes_install"] = {
+            "status": "needs_user",
+            "message": message[:500],
+            "updated_at": _utc_now(),
+        }
+        self._save_state()
+        return SetupStepResult(
+            step_id="hermes_install",
+            status="needs_user",
+            message=message,
+            action_url=HERMES_INSTALL_URL,
+            action_hint="「로그 열기」로 전체 로그를 보고, 「우회로 다시 설치」로 재시도하세요.",
+            can_install=True,
+            install_label="우회로 다시 설치",
+            log_path=log_path,
+        )
+
+    def _install_hermes_bypass(self) -> SetupStepResult:
+        """공식 설치가 끝났거나 실패했을 때 1회. 호출당 우회 한 번."""
+        from iris.system.hermes_install import (
+            error_log_tail,
+            install_hermes_with_system_python,
+        )
+
+        if self._abort:
+            return self._hermes_cancelled()
         self._emit_stream(
-            "uv Python junction 실패(WinError 448) 감지 — 시스템/Iris Python으로 우회 설치…",
+            "시스템 Python으로 Hermes 우회 설치 (staging)…",
             None,
             replace=False,
         )
-        ok, detail = install_hermes_with_system_python(
-            command=self.hermes_command,
-            on_stream=lambda m: self._emit_stream(m, None, replace=False),
-            run_streamed=self._run_streamed,
-            should_abort=lambda: self._abort,
-        )
+        try:
+            result = install_hermes_with_system_python(
+                command=self.hermes_command,
+                on_stream=lambda m: self._emit_stream(m, None, replace=False),
+                run_streamed=self._run_streamed,
+                should_abort=lambda: self._abort,
+            )
+        except UserCancelled:
+            return self._hermes_cancelled()
         refresh_process_path()
-        if ok:
+        if result.ok:
             self._hermes_runtime_repaired = True
-            return self._record_step("hermes_install", "done", detail[:240])
-        return self._needs_user_install_check(
-            "hermes_install",
-            message=f"우회 설치도 실패: {detail[:200]}",
-            action_url=HERMES_INSTALL_URL,
-            can_install=True,
+            return self._hermes_done(result.message)
+        if result.kind == "cancel":
+            return self._hermes_cancelled()
+        return self._hermes_user_fail(
+            result.message,
+            result.kind or "exit",
+            result.log_path,
+            error_log_tail(result.message),
         )
 
     def _install_hermes(self) -> SetupStepResult:
-        from iris.system.hermes_install import (
-            combined_install_log_tail,
-            looks_like_uv_python_mount_failure,
-        )
+        from iris.system.hermes_install import error_log_tail, write_install_log
 
+        if self._abort:
+            return self._hermes_cancelled()
         ok, detail = probe_hermes_runtime(command=self.hermes_command)
         if ok:
-            return self._record_step(
-                "hermes_install", "done", f"Hermes 이미 사용 가능 ({detail})"
-            )
+            return self._hermes_done(f"Hermes 이미 사용 가능 ({detail})")
         if sys.platform != "win32":
             return SetupStepResult(
                 step_id="hermes_install",
@@ -2354,73 +2430,48 @@ class SetupProtocol:
                 label=CORE_STEP_LABELS["hermes_install"],
                 can_install=False,
             )
-        # exe만 있고 trampoline이 깨진 경우 — 재설치 전에 런타임 트리 제거
-        if (hermes_home() / "hermes-agent").is_dir() or hermes_executable(
-            self.hermes_command
-        ):
-            wipe_msg = self._wipe_hermes_agent_runtime()
-            self._emit_stream(f"깨진 Hermes 런타임 정리… {wipe_msg}", None, replace=False)
-            self._hermes_runtime_repaired = True
+        if self._hermes_official_failed:
+            return self._install_hermes_bypass()
 
-        log_bits: list[str] = []
         self._emit_stream("Hermes 공식 설치 스크립트 실행 중…", None, replace=False)
         try:
             proc = self._run_hermes_official_installer()
-            log_bits.append(proc.stdout or "")
-            log_bits.append(proc.stderr or "")
+        except UserCancelled:
+            return self._hermes_cancelled()
         except (OSError, subprocess.TimeoutExpired) as exc:
             refresh_process_path()
             ok_after, detail_after = probe_hermes_runtime(command=self.hermes_command)
             if ok_after:
-                return self._record_step(
-                    "hermes_install",
-                    "done",
-                    f"시간 초과 후 Hermes 사용 가능 확인 ({detail_after})",
-                )
-            log_bits.append(str(exc))
-            blob = combined_install_log_tail(*log_bits)
-            if looks_like_uv_python_mount_failure(blob):
-                return self._install_hermes_bypass()
-            return self._needs_user_install_check(
-                "hermes_install",
-                message=(
-                    f"설치 확인 시간이 지났습니다 ({exc}). "
-                    "이미 설치됐을 수 있습니다. Iris 재시작 후 「완료했어요」."
-                ),
-                action_url=HERMES_INSTALL_URL,
-                can_install=True,
+                return self._hermes_done(f"시간 초과 후 Hermes 사용 가능 ({detail_after})")
+            kind = getattr(exc, "kind", "") or "exit"
+            if kind not in ("idle", "hard"):
+                kind = "hard" if isinstance(exc, subprocess.TimeoutExpired) else "exit"
+            blob = f"{kind}\n{exc}"
+            log_path = write_install_log(blob, prefix="iris-official")
+            self._hermes_official_failed = True
+            self._emit_stream(
+                f"공식 설치 실패 ({kind}). 로그: {log_path}\n우회 설치 1회…",
+                None,
+                replace=False,
             )
+            return self._install_hermes_bypass()
         refresh_process_path()
         ok_after, detail_after = probe_hermes_runtime(command=self.hermes_command)
         if ok_after:
-            return self._record_step(
-                "hermes_install", "done", f"Hermes 설치됨 ({detail_after})"
-            )
-        blob = combined_install_log_tail(*log_bits, detail_after)
-        if looks_like_uv_python_mount_failure(blob):
-            return self._install_hermes_bypass()
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "")[:180]
-            # 실패 로그에 448이 파이프에 안 잡힌 경우에도 Python 실패면 우회
-            if looks_like_uv_python_mount_failure(err) or "Failed to install Python" in (
-                proc.stdout or ""
-            ):
-                return self._install_hermes_bypass()
-            return self._needs_user_install_check(
-                "hermes_install",
-                message=f"설치가 끝나지 않았습니다. {err}",
-                action_url=HERMES_INSTALL_URL,
-                can_install=True,
-            )
-        return self._needs_user_install_check(
-            "hermes_install",
-            message=(
-                "설치 스크립트는 끝났지만 Hermes 런타임이 동작하지 않습니다 "
-                f"({detail_after[:160]}). Iris 재시작 후 「완료했어요」또는 재설치."
-            ),
-            action_url=HERMES_INSTALL_URL,
-            can_install=True,
+            return self._hermes_done(f"Hermes 설치됨 ({detail_after})")
+        blob = (proc.stdout or "") + "\n" + (proc.stderr or "") + "\n" + detail_after
+        log_path = write_install_log(blob, prefix="iris-official")
+        self._hermes_official_failed = True
+        kind = "exit" if proc.returncode != 0 else "probe"
+        self._emit_stream(
+            "공식 설치가 실행 가능한 Hermes를 만들지 못했습니다 "
+            f"({kind}). 로그: {log_path}\n"
+            + error_log_tail(blob)
+            + "\n우회 설치 1회…",
+            None,
+            replace=False,
         )
+        return self._install_hermes_bypass()
 
     def _step_hermes_env(self) -> SetupStepResult:
         home = hermes_home()

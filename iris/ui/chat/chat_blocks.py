@@ -89,6 +89,7 @@ def parse_collapse_block_id(anchor: str) -> str | None:
 
 
 IRIS_FILE_SCHEME = "iris-file://"
+IRIS_WIKI_SCHEME = "iris-wiki://"
 
 _FILE_LOC = re.compile(r"^(.*?)(?::(\d+)(?::(\d+))?)?$")
 
@@ -107,6 +108,22 @@ def parse_iris_file_anchor(anchor: str) -> str | None:
     from urllib.parse import unquote
 
     return unquote(raw[len(IRIS_FILE_SCHEME) :]) or None
+
+
+def wiki_anchor_for(rel_path: str) -> str:
+    from urllib.parse import quote
+
+    rel = (rel_path or "").strip().replace("\\", "/")
+    return f"{IRIS_WIKI_SCHEME}{quote(rel, safe='/:@')}"
+
+
+def parse_iris_wiki_anchor(anchor: str) -> str | None:
+    raw = (anchor or "").strip()
+    if not raw.startswith(IRIS_WIKI_SCHEME):
+        return None
+    from urllib.parse import unquote
+
+    return unquote(raw[len(IRIS_WIKI_SCHEME) :]) or None
 
 
 def parse_file_chip_location(raw_path: str) -> tuple[str, int, int]:

@@ -29,6 +29,10 @@ def main() -> None:
     assert folder_ref in chips, chips
     assert composer_chip_label(ref) == "chat_panel.py", composer_chip_label(ref)
     assert composer_chip_label(folder_ref) == "chat", composer_chip_label(folder_ref)
+    win = "@C:/Users/serin/network_security.pdf"
+    assert composer_chip_label(win) == "network_security.pdf", composer_chip_label(win)
+    lined = "@iris/ui/chat/chat_panel.py:10:2"
+    assert composer_chip_label(lined) == "chat_panel.py", composer_chip_label(lined)
     assert panel.acceptDrops() is True
     assert panel._log.acceptDrops() is True
     print("composer_drop ok", ref, "folder", folder_ref, "chips", len(chips))

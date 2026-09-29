@@ -51,7 +51,7 @@ from iris.storage.api_providers import (
     runtime_model_id,
     usable_models,
 )
-from iris.runtime.chat_session import ChatSession
+from iris.runtime.chat_session import ChatSession, workspace_needs_fresh_chat
 from iris.runtime.chat_turn_gate import ChatTurnGate
 from iris.storage.email_accounts import EmailAccount, find_account, load_email_accounts
 from iris.monitoring.notification_policy import NotificationPolicy
@@ -115,6 +115,7 @@ from iris.ui.control_bindings import (
     stop_control_surface,
 )
 from iris.ui.workers.email_workers import EmailInboxWorker, EmailMessageWorker, EmailSendWorker
+from iris.ui.workers.extension_install_worker import ExtensionInstallWorker
 from iris.ui.workers.wiki_import_worker import WikiImportWorker
 from iris.ui.workers.hermes_workers import (
     HermesChatWorker,
@@ -192,6 +193,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, *, test_mode: bool = False) -> None:
         super().__init__()
+        self._arm_lifecycle_trace()
         self._test_mode = test_mode
         self.setWindowTitle(APP_DISPLAY_NAME)
         icon = load_app_icon()
@@ -219,6 +221,7 @@ class MainWindow(QMainWindow):
         self._state.state_changed.connect(self._on_app_state)
         self._voice_prefs: VoicePreferences = load_voice_preferences(self._db)
         self._chat_session = ChatSession(self._db)
+        self._chat_session.open_launch_chat()
         self._turn_gate = ChatTurnGate()
         self._last_assistant_text = ""
         self._pending_local_vibe_prompt = ""
@@ -328,6 +331,9 @@ class MainWindow(QMainWindow):
         self._turn_dispatcher.turn_dropped.connect(self._on_turn_dropped)
         self._active_turn_source = UserTurnSource.KEYBOARD
         self._wiki_import_worker: WikiImportWorker | None = None
+        self._pdf_export_worker = None
+        self._ext_install_worker: ExtensionInstallWorker | None = None
+        self._pending_ext: dict | None = None
         self._recent_voice_turns: deque[tuple[float, int | None, str]] = deque()
         self._voice_followup_deadline = 0.0
         self._last_tts_playback_ended_at = 0.0
@@ -477,6 +483,7 @@ class MainWindow(QMainWindow):
         self._obsidian_page.set_wiki(self._iris_wiki)
         self._left_sidebar.obsidian_detail.set_wiki(self._iris_wiki)
         self._left_sidebar.obsidian_detail.note_selected.connect(self._obsidian_page.show_note)
+        self._obsidian_page.note_focused.connect(self._left_sidebar.obsidian_detail.select_note)
         self._email_page.refresh_requested.connect(self._refresh_email_inbox)
         self._email_page.compose_requested.connect(self._send_email)
         self._email_page.mail_selected.connect(self._load_email_message)
@@ -1404,7 +1411,7 @@ class MainWindow(QMainWindow):
         if err:
             self._live_activity.append_instant_line(f"chat 저장 실패: {err}")
             return
-        if role == "user":
+        if role in ("user", "assistant"):
             self._refresh_chat_history_panel()
 
     def _drop_last_user_history(self) -> None:
@@ -1450,13 +1457,17 @@ class MainWindow(QMainWindow):
         self._refresh_context_gauge()
         self._refresh_chat_history_panel()
 
-    def _on_new_chat_requested(self) -> None:
+    def _open_fresh_work_chat(self) -> None:
+        """기록은 남기고 빈 채팅만 연다. 이미 빈 채팅이면 그대로 둔다."""
         cid = self._chat_session.start_new()
         if cid == self._conversation_id and not self._history:
             self._refresh_chat_history_panel()
             return
         self._load_conversation(cid)
         self._live_activity.append_instant_line("새 채팅 시작")
+
+    def _on_new_chat_requested(self) -> None:
+        self._open_fresh_work_chat()
 
     def _on_conversation_selected(self, conversation_id: int) -> None:
         cid = int(conversation_id)
@@ -1873,29 +1884,42 @@ class MainWindow(QMainWindow):
         block = f"[첨부 파일]\n{lines}"
         return f"{text}\n\n{block}" if text else block
 
-    def _open_wiki_after_import(self, result: dict) -> None:
-        wiki_rel = str(result.get("rel_path") or "")
+    def _wiki_project_label(self) -> str:
+        root = ""
+        session = getattr(self, "_ide_session", None)
+        if session is not None:
+            root = (session.workspace_root or "").strip()
+        if not root:
+            root = self._current_project_root()
+        return Path(root).name if root else ""
+
+    def _open_saved_wiki_note(self, rel_path: str) -> None:
+        """저장 경로 링크를 눌렀을 때만 그 노트가 선택된 Wiki로 연다."""
+        rel = (rel_path or "").strip().replace("\\", "/")
+        if not rel:
+            return
         self._on_obsidian_icon()
         self._obsidian_page.reload_graph()
-        self._left_sidebar.obsidian_detail.reload()
-        if wiki_rel:
-            self._obsidian_page.show_note(wiki_rel)
+        detail = self._left_sidebar.obsidian_detail
+        detail.blockSignals(True)
+        detail.reload()
+        detail.select_note(rel)
+        detail.blockSignals(False)
+        self._obsidian_page.show_note(rel)
+        self._obsidian_page._graph.focus(rel)
 
     def _wiki_import_success_message(self, result: dict) -> str:
-        wiki_rel = str(result.get("rel_path") or "")
-        title = str(result.get("title") or "")
-        mode = str(result.get("mode") or "raw")
-        trunc = " (본문 일부 잘림)" if result.get("truncated") else ""
-        return (
-            f"위키에 저장했습니다{trunc}.\n\n"
-            f"- 제목: {title}\n"
-            f"- 경로: `{wiki_rel}`\n"
-            f"- 모드: {mode}\n"
-            f"- Wiki 화면에서 노트를 열었습니다."
+        from iris.knowledge.wiki_import_ops import wiki_save_notice
+        from iris.ui.chat.chat_blocks import wiki_anchor_for
+
+        rel = str(result.get("rel_path") or "")
+        return wiki_save_notice(
+            result,
+            project=self._wiki_project_label(),
+            href=wiki_anchor_for(rel),
         )
 
     def _present_wiki_import_success(self, turn: UserTurn, result: dict) -> None:
-        self._open_wiki_after_import(result)
         msg = self._wiki_import_success_message(result)
         panel = self._active_workspace_iris_panel()
         if panel is not None:
@@ -1972,11 +1996,144 @@ class MainWindow(QMainWindow):
         self._refresh_context_gauge()
         self._finish_current_turn(turn_id)
 
+    def _try_local_extension_install(self, turn: UserTurn) -> bool:
+        from iris.system.github_extension_install import (
+            ExtensionRequest,
+            parse_dir_reply,
+            parse_extension_request,
+            parse_secret_reply,
+        )
+
+        text = turn.text or ""
+        pending = self._pending_ext if isinstance(self._pending_ext, dict) else None
+        req = parse_extension_request(text)
+        secrets: dict[str, str] = {}
+        directory: str | None = None
+        display = text
+        if req is not None:
+            self._pending_ext = None
+        elif pending:
+            if text.strip().lower() in ("취소", "취소해줘", "cancel"):
+                self._pending_ext = None
+                self._show_extension_turn(turn, text)
+                self._reply_extension(turn.id, "MCP/Skill 연결을 취소했습니다.")
+                return True
+            missing = [str(k) for k in pending.get("missing") or []]
+            if missing:
+                got = parse_secret_reply(text, missing)
+                if not got:
+                    self._pending_ext = None
+                    return False
+                secrets = {**dict(pending.get("secrets") or {}), **got}
+                directory = str(pending.get("directory") or "") or None
+                req = ExtensionRequest(str(pending.get("url") or ""), str(pending.get("kind") or "auto"))
+                display = text
+                for val in got.values():
+                    display = display.replace(val, "***")
+            elif pending.get("need_dir"):
+                directory = parse_dir_reply(text)
+                if not directory:
+                    self._pending_ext = None
+                    return False
+                secrets = dict(pending.get("secrets") or {})
+                req = ExtensionRequest(str(pending.get("url") or ""), str(pending.get("kind") or "auto"))
+            else:
+                self._pending_ext = None
+                return False
+        else:
+            return False
+        if req is None or not req.url:
+            return False
+        self._show_extension_turn(turn, display)
+        if self._ext_install_worker is not None and self._ext_install_worker.isRunning():
+            self._reply_extension(turn.id, "이전 MCP/Skill 설치가 아직 진행 중입니다.")
+            return True
+        self._pending_ext = None
+        self._ext_context = {
+            "url": req.url,
+            "kind": req.kind,
+            "secrets": secrets,
+            "directory": directory or "",
+        }
+        self._chat.append_message_instant("Iris", "GitHub에서 MCP/Skill 구성을 확인하는 중…")
+        self._live_activity.append_instant_line(f"ext.install start {req.kind} {req.url[:120]}")
+        self._busy = True
+        self._chat.set_generating(True)
+        worker = ExtensionInstallWorker(
+            req,
+            secrets=secrets,
+            directory=directory,
+            reload_gateway=bool(self._settings.hermes_enabled) and not self._test_mode,
+            base_url=self._settings.hermes_base_url,
+            api_key=self._settings.hermes_api_key,
+            command=self._settings.hermes_command,
+            parent=self,
+        )
+        worker.finished_ok.connect(lambda data, tid=turn.id: self._on_extension_install_ok(tid, data))
+        worker.finished_err.connect(lambda err, tid=turn.id: self._on_extension_install_err(tid, err))
+        self._ext_install_worker = worker
+        worker.start()
+        return True
+
+    def _show_extension_turn(self, turn: UserTurn, display: str) -> None:
+        panel = self._active_workspace_iris_panel()
+        if panel is not None:
+            panel.append_user(display)
+        else:
+            self._chat.append_message_instant("You", display)
+        self._record_history("user", display)
+
+    def _reply_extension(self, turn_id: str, message: str) -> None:
+        self._busy = False
+        self._chat.set_generating(False)
+        panel = self._active_workspace_iris_panel()
+        if panel is not None:
+            panel.end_iris(message)
+        else:
+            self._chat.append_message_instant("Iris", message)
+        self._record_history("assistant", message)
+        self._refresh_context_gauge()
+        self._finish_current_turn(turn_id, open_followup=False)
+
+    def _on_extension_install_ok(self, turn_id: str, data: dict) -> None:
+        status = str(data.get("status") or "")
+        if status == "needs_input":
+            ctx = getattr(self, "_ext_context", None) or {}
+            self._pending_ext = {
+                "url": ctx.get("url") or "",
+                "kind": ctx.get("kind") or "auto",
+                "missing": list(data.get("missing_env") or []),
+                "need_dir": bool(data.get("need_dir")) and not list(data.get("missing_env") or []),
+                "secrets": dict(ctx.get("secrets") or {}),
+                "directory": ctx.get("directory") or "",
+            }
+        else:
+            self._pending_ext = None
+        msg = str(data.get("message") or "처리하지 못했습니다.")
+        runtime = str(data.get("runtime") or "").strip()
+        if runtime:
+            msg = f"{msg}\n{runtime}"
+        if status in ("installed", "already"):
+            try:
+                from iris.ui.chat.skill_mcp_dialogs import _sync_wiki_catalog
+
+                _sync_wiki_catalog()
+            except Exception:
+                pass
+        self._live_activity.append_instant_line(f"ext.install {status}")
+        self._ext_context = None
+        self._reply_extension(turn_id, msg)
+
+    def _on_extension_install_err(self, turn_id: str, err: str) -> None:
+        self._pending_ext = None
+        self._ext_context = None
+        self._reply_extension(turn_id, f"MCP/Skill 설치 실패: {err}")
+
     def _try_local_wiki_save(self, turn: UserTurn) -> bool:
-        from iris.knowledge.wiki_import_ops import import_to_wiki
+        from iris.knowledge.wiki_import_ops import import_to_wiki, save_answer_to_wiki
         from iris.knowledge.wiki_save_intent import parse_wiki_save_request
 
-        req = parse_wiki_save_request(turn.text, turn.attachments)
+        req = parse_wiki_save_request(turn.text, turn.attachments, self._history)
         if req is None:
             return False
         display = self._format_user_turn_content(turn)
@@ -1990,7 +2147,9 @@ class MainWindow(QMainWindow):
             self._start_wiki_import_async(turn, req)
             return True
         try:
-            result = import_to_wiki(
+            result = save_answer_to_wiki(
+                self._iris_wiki, title=req.title or "검색 결과", content=req.content,
+            ) if req.content else import_to_wiki(
                 self._iris_wiki,
                 source=req.source,
                 title=req.title,
@@ -2009,6 +2168,92 @@ class MainWindow(QMainWindow):
         self._present_wiki_import_success(turn, result)
         self._finish_current_turn(turn.id)
         return True
+
+    def _try_local_pdf_save(self, turn: UserTurn) -> bool:
+        from iris.knowledge.pdf_export import is_pdf_save_intent, output_path_for, trace
+        from iris.ui.workers.pdf_export_worker import PdfExportWorker
+
+        if not is_pdf_save_intent(turn.text or ""):
+            return False
+        trace("[PDF] request received")
+        display = self._format_user_turn_content(turn)
+        self._chat.append_message_instant("You", display)
+        self._record_history("user", display)
+        worker = getattr(self, "_pdf_export_worker", None)
+        if worker is not None and worker.isRunning():
+            msg = "이전 PDF 저장이 아직 진행 중입니다."
+            self._chat.append_message_instant("Iris", msg)
+            self._record_history("assistant", msg)
+            self._finish_current_turn(turn.id, open_followup=False)
+            return True
+        body = ""
+        for message in reversed(self._history[:-1]):
+            if message.get("role") != "assistant":
+                continue
+            content = (message.get("content") or "").strip()
+            if content and not content.startswith("PDF로 저장") and not content.startswith("PDF 저장"):
+                body = content
+                break
+        if not body:
+            body = (turn.text or "").strip()
+        dest = output_path_for(turn.text or "")
+        self._chat.append_message_instant("Iris", "PDF로 저장하는 중…")
+        self._chat.set_generating(True)
+        export = PdfExportWorker(body, dest, parent=self)
+        export.finished_ok.connect(
+            lambda path, tid=turn.id: self._on_pdf_export_ok(tid, path),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        export.finished_err.connect(
+            lambda err, tid=turn.id: self._on_pdf_export_err(tid, err),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._pdf_export_worker = export
+        export.start()
+        return True
+
+    def _on_pdf_export_ok(self, turn_id: str, path: str) -> None:
+        from iris.knowledge.pdf_export import trace
+
+        trace("[PDF] returning to UI")
+        try:
+            self._chat.set_generating(False)
+            msg = f"PDF로 저장했습니다.\n\n- 경로: `{path}`"
+            self._chat.append_message_instant("Iris", msg)
+            self._record_history("assistant", msg)
+            self._refresh_context_gauge()
+            self._finish_current_turn(turn_id, open_followup=False)
+        except Exception as exc:  # noqa: BLE001 — 슬롯 예외는 PyQt가 qFatal로 프로세스를 죽인다
+            trace(f"[PDF] ui error: {exc}")
+            self._restore_after_pdf_slot(turn_id, f"PDF는 저장됐지만 화면 갱신에 실패했습니다: {exc}")
+
+    def _on_pdf_export_err(self, turn_id: str, err: str) -> None:
+        from iris.knowledge.pdf_export import trace
+
+        trace("[PDF] returning to UI")
+        msg = err or "PDF 저장에 실패했습니다."
+        try:
+            self._chat.set_generating(False)
+            self._chat.append_message_instant("Iris", msg)
+            self._record_history("assistant", msg)
+            self._refresh_context_gauge()
+            self._finish_current_turn(turn_id, open_followup=False)
+        except Exception as exc:  # noqa: BLE001
+            trace(f"[PDF] ui error: {exc}")
+            self._restore_after_pdf_slot(turn_id, msg)
+
+    def _restore_after_pdf_slot(self, turn_id: str, msg: str) -> None:
+        from iris.knowledge.pdf_export import trace
+
+        try:
+            self._chat.set_generating(False)
+            self._chat.append_message_instant("Iris", msg)
+        except Exception as exc:  # noqa: BLE001
+            trace(f"[PDF] ui restore failed: {exc}")
+        try:
+            self._finish_current_turn(turn_id, open_followup=False)
+        except Exception as exc:  # noqa: BLE001
+            trace(f"[PDF] turn finish error: {exc}")
 
     def _dispatch_user_turn(self, turn: object) -> None:
         if not isinstance(turn, UserTurn):
@@ -2032,6 +2277,10 @@ class MainWindow(QMainWindow):
             self._finish_current_turn(turn.id, open_followup=False)
             return
         if self._try_local_wiki_save(turn):
+            return
+        if self._try_local_pdf_save(turn):
+            return
+        if self._try_local_extension_install(turn):
             return
         if self._try_local_workspace_control(text):
             self._finish_current_turn(turn.id, open_followup=False)
@@ -2192,7 +2441,8 @@ class MainWindow(QMainWindow):
     def _is_current_turn(self, turn_id: str) -> bool:
         return self._turn_gate.is_current(turn_id)
 
-    def _finish_current_turn(self, turn_id: str | None = None, *, open_followup: bool) -> None:
+    def _finish_current_turn(self, turn_id: str | None = None, *, open_followup: bool = False) -> None:
+        # 기본 False. 슬롯에서 키워드 누락 → TypeError → PyQt 6 qFatal(0xC0000409)로 IRIS가 죽는다.
         current_id = self._turn_gate.finish(turn_id)
         self._chat.set_generating(False)
         if open_followup:
@@ -4853,8 +5103,12 @@ class MainWindow(QMainWindow):
             "업무 학습(화면 조작 녹화 시작/종료): learning.start / learning.stop. 이미 배운 업무 실행: learning.run. "
             "위키에 저장 / Iris Wiki에 남기기: PDF·URL·파일은 iris_invoke wiki.import_content "
             "(source=path or https URL). 수동 요약만 쓸 때 wiki.write_user_note "
-            "(title + content, optional source_url). Default path user/inbox/{slug}.md. "
+            "(title + content, optional source_url). 검색 후 저장 요청은 먼저 검색하고, "
+            "결과 본문과 출처 Markdown 링크를 wiki.write_user_note로 함께 저장한다. "
+            "Default path user/inbox/{slug}.md. "
             "Never claim a wiki save succeeded without that tool returning ok. "
+            "채팅을 PDF 파일로 저장해 달라는 요청은 Iris가 직접 처리한다. "
+            "terminal·pdf_create.py·PyMuPDF·reportlab로 PDF를 만들지 말 것. "
             "메일/이메일 화면: iris_invoke workspace.open_email. "
             "오늘 온 메일·받은편지 요약: email.list_messages (args.today=true 또는 since=YYYY-MM-DD). "
             "본문 읽기: email.read_message (uid). 일정: workspace.open_calendar + calendar.*. "
@@ -4924,6 +5178,9 @@ class MainWindow(QMainWindow):
                 root = str(Path(workspace_root).expanduser().resolve())
             except OSError:
                 root = ""
+        prev = self._ide_session
+        prev_active = bool(prev.active)
+        prev_root = (prev.workspace_root or "").strip()
         pid_i = int(pid) if pid else None
         hwnd_i = int(hwnd) if hwnd else None
         mode_s = mode if mode in ("workspace", "welcome", "hero") else "welcome"
@@ -4950,6 +5207,13 @@ class MainWindow(QMainWindow):
         ):
             owned_flag = False
         self._ide_window_owned_by_iris = owned_flag
+        if workspace_needs_fresh_chat(
+            prev_active=prev_active,
+            prev_root=prev_root,
+            mode=mode_s,
+            root=root,
+        ):
+            self._open_fresh_work_chat()
 
     def _clear_ide_session(self, reason: str = "") -> None:
         was_companion = self._ui_mode == "ide_companion"
@@ -5030,15 +5294,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 live_open = bool(mgr.workspace)
                 live_root = (mgr.workspace or "").strip()
-            if live_open and live_root and live_root != session.workspace_root:
-                session.workspace_root = live_root
-                session.mode = "workspace"
+            root_changed = False
+            if live_open and live_root:
+                try:
+                    live_root = str(Path(live_root).expanduser().resolve())
+                except OSError:
+                    live_root = live_root.strip()
+                if live_root != (session.workspace_root or ""):
+                    session.workspace_root = live_root
+                    session.mode = "workspace"
+                    root_changed = True
             elif not live_open and session.mode != "welcome":
                 session.mode = "welcome"
             session.last_seen_at = time.time()
             self._ide_session = session
             self._ide_hwnd = session.hwnd
             self._ide_pid = session.pid
+            if root_changed:
+                self._chat.set_workspace_root(session.workspace_root)
+                self._open_fresh_work_chat()
             return
         hwnd = session.hwnd
         if not self._ide_hwnd_alive(hwnd):
@@ -5845,6 +6119,7 @@ class MainWindow(QMainWindow):
             source=source,
             owned=True,
         )
+        self._open_fresh_work_chat()
         if from_hero:
             # 구체는 이미 companion 앵커 — 로그/채팅/파형만 기동 인트로
             QTimer.singleShot(40, self._run_companion_panels_intro)
@@ -6058,6 +6333,7 @@ class MainWindow(QMainWindow):
                 source=source,
                 owned=None,
             )
+            self._open_fresh_work_chat()
             return ""
 
         # new_window=False 일 때만 기존(개발용) Cursor attach — True면 가로채기 금지
@@ -6806,7 +7082,25 @@ class MainWindow(QMainWindow):
         if self._iris_ide_unified and self._ui_mode == "ide_companion":
             self._sync_docked_iris_ide_geometry()
 
+    def _arm_lifecycle_trace(self) -> None:
+        from iris.knowledge.pdf_export import trace
+
+        self.destroyed.connect(lambda: trace("[APP] main window destroyed"))
+        if getattr(MainWindow._arm_lifecycle_trace, "done", False):
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        MainWindow._arm_lifecycle_trace.done = True
+        app.aboutToQuit.connect(lambda: trace("[APP] QApplication.aboutToQuit"))
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        try:
+            from iris.knowledge.pdf_export import trace
+
+            trace("[APP] closeEvent called")
+        except Exception:
+            pass
         guard = getattr(self, "_explorer_drop_guard", None)
         if guard is not None:
             try:

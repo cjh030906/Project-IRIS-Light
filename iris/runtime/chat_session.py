@@ -59,6 +59,12 @@ class ChatSession:
     def start_new(self) -> int:
         return start_new_conversation(self.db)
 
+    def open_launch_chat(self) -> int:
+        """프로그램·창을 열 때. 이전 대화는 두고 빈 채팅을 연다."""
+        cid = start_new_conversation(self.db)
+        self.activate(cid)
+        return cid
+
     def rename(self, conversation_id: int, title: str) -> str | None:
         try:
             rename_conversation(self.db, int(conversation_id), title)
@@ -75,3 +81,20 @@ class ChatSession:
 
     def ensure_active(self) -> int:
         return ensure_active_conversation(self.db)
+
+
+def workspace_needs_fresh_chat(
+    *,
+    prev_active: bool,
+    prev_root: str,
+    mode: str,
+    root: str,
+) -> bool:
+    """IDE를 처음 열거나 workspace가 바뀔 때 새 채팅."""
+    root_s = (root or "").strip()
+    prev = (prev_root or "").strip()
+    if mode == "workspace" and root_s and root_s != prev:
+        return True
+    if mode in ("welcome", "hero") and not prev_active:
+        return True
+    return False
