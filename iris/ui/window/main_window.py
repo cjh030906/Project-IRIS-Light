@@ -133,6 +133,7 @@ from iris.ui.workers.handoff_summary_worker import (
 )
 from iris.ui.workers.history_embed_worker import HistoryEmbedWorker
 from iris.ui.workers.history_evidence_worker import HistoryEvidenceWorker
+from iris.ui.workers.past_chats_worker import EmbedWarmupWorker, PastChatsWorker
 from iris.ui.workers.routine_run_worker import RoutineRunWorker
 from iris.ui.workers.ollama_workers import (
     ChatAttempt,
@@ -200,6 +201,12 @@ MIN_COMPANION_IRIS_WIDTH = 260  # companion sync가 Iris 폭을 0으로 밀지 �
 _HERO_ORB_SCALE = 2.55
 # Assistant 우측 모니터 — 히어로 hide 후 splitter가 0~수 px로 붕괴한 값을 저장하지 않음
 _ASSISTANT_RIGHT_DEFAULT = 340
+# 이전 대화 의미검색을 기다리는 최대 시간. 넘기면 키워드 결과로 먼저 보낸다.
+# bge-m3 질의 임베딩 실측: 중앙 1.2s, 최대 3.3s(콜드 로드 제외).
+_PAST_CHATS_WAIT_MS = 3000
+# 입력 중 임베딩 모델 깨우기 간격. 모델은 30분 붙잡아 두므로(EMBED_KEEP_ALIVE)
+# 그 안에 한 번씩만 다시 깨우면 된다. 이미 떠 있으면 0.6초짜리 호출이다.
+_EMBED_REWARM_SEC = 600
 _ASSISTANT_RIGHT_MIN = 220
 _ASSISTANT_CENTER_MIN = 340
 
@@ -506,6 +513,11 @@ class MainWindow(QMainWindow):
         self._model_switch = ModelSwitchService(self._db, wiki=self._iris_wiki)
         self._history_embed_worker: HistoryEmbedWorker | None = None
         self._history_evidence_worker: HistoryEvidenceWorker | None = None
+        # 이번 턴에만 얹을 '이전 대화 참고' system 메시지. 턴이 끝나면 비운다.
+        self._pending_past_chats = ""
+        self._past_chats_worker: PastChatsWorker | None = None
+        self._embed_warm_worker: EmbedWarmupWorker | None = None
+        self._embed_warmed_at = 0.0
         # 모델이 바뀐 직후 한 턴만 얹을 인수인계 system 메시지. 붙이고 나면 비운다.
         self._pending_handoff = ''
         self._pending_handoff_ctx = None
@@ -598,6 +610,9 @@ class MainWindow(QMainWindow):
         self._chat.skill_inserted.connect(self._on_composer_skill)
         self._chat.mcp_inserted.connect(self._on_composer_mcp)
         self._chat.mic_clicked.connect(self._on_chat_mic_clicked)
+        # 쓰기 시작하거나 마이크를 켜면 임베딩 모델을 미리 깨운다 — 보낼 때 콜드 로드 방지
+        self._chat.composing.connect(self._warm_embedder_soon)
+        self._chat.mic_clicked.connect(self._warm_embedder_soon)
         self._chat.speaker_clicked.connect(self._on_chat_speaker_clicked)
         self._chat.update_action_clicked.connect(self._on_chat_update_action)
         self._chat.ollama_login_clicked.connect(self._on_ollama_cloud_login_clicked)
@@ -2380,7 +2395,7 @@ class MainWindow(QMainWindow):
                 save_selected_model(self._db, model)
         except Exception:  # noqa: BLE001
             pass
-        self._chat.append_message_instant("Iris", f"_{reason} — {model} 으로 이어서 답합니다._")
+        self._chat.append_note(f"{reason} — {model} 으로 이어서 답합니다.")
 
     def _kick_history_embed(self) -> None:
         """밀린 History 임베딩을 백그라운드로 처리한다. 이미 돌고 있으면 건너뛴다."""
@@ -2487,6 +2502,13 @@ class MainWindow(QMainWindow):
         ):
             return
         self._chat_session.delete(cid)
+        # 지운 대화가 "이전 대화 참고"로 되살아나지 않게 History도 같이 지운다.
+        try:
+            from iris.knowledge.history_index import forget_conversation
+
+            forget_conversation(self._db, cid, wiki=self._iris_wiki)
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"History 정리 실패: {str(exc)[:80]}")
         if cid != self._conversation_id:
             self._refresh_chat_history_panel()
             return
@@ -3099,6 +3121,99 @@ class MainWindow(QMainWindow):
         self._pending_local_vibe_prompt = text
         self._live_vibe = None
 
+        self._with_past_chats(turn, text, lambda: self._launch_chat_turn(turn, model))
+
+    def _with_past_chats(self, turn: UserTurn, text: str, launch) -> None:
+        """이전 대화 기록을 찾아 얹은 뒤 `launch()` 한다. 창은 기다리지 않는다.
+
+        의미검색(질의 임베딩)은 워커에서 한다. `_PAST_CHATS_WAIT_MS` 안에 안 오면
+        키워드 결과로 먼저 보내고 늦은 결과는 버린다. 그 사이 사용자가 멈추거나
+        대화를 바꿨으면 아무것도 보내지 않는다.
+        """
+        from iris.runtime.past_chats import find_past_chats, should_search
+
+        self._pending_past_chats = ""
+        try:
+            settings = self._model_switch.history_settings
+            wanted = settings.enabled and settings.reference_past_chats and should_search(text)
+        except Exception:  # noqa: BLE001
+            wanted = False
+        if not wanted:
+            launch()
+            return
+
+        conversation_id = self._conversation_id
+        state = {"done": False}
+
+        def proceed(hits) -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            timer.stop()
+            if not self._is_current_turn(turn.id):
+                return  # 멈췄거나 다른 턴으로 넘어갔다
+            self._apply_past_chats(hits or [])
+            launch()
+
+        def keyword_only() -> None:
+            try:
+                hits = find_past_chats(self._model_switch, text, conversation_id, None)
+            except Exception:  # noqa: BLE001
+                hits = []
+            proceed(hits)
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(keyword_only)
+        try:
+            worker = PastChatsWorker(
+                self._model_switch,
+                self._settings.ollama_base_url,
+                text,
+                conversation_id,
+                parent=self,
+            )
+        except Exception:  # noqa: BLE001
+            keyword_only()
+            return
+        worker.ready.connect(proceed)
+        worker.failed.connect(lambda _msg: keyword_only())
+        self._past_chats_worker = worker
+        timer.start(_PAST_CHATS_WAIT_MS)
+        worker.start()
+
+    def _warm_embedder_soon(self) -> None:
+        """임베딩 모델을 백그라운드로 올려 둔다. 키 입력마다 불려도 한 번만 돈다."""
+        worker = self._embed_warm_worker
+        if worker is not None and worker.isRunning():
+            return
+        now = time.monotonic()
+        if now - self._embed_warmed_at < _EMBED_REWARM_SEC:
+            return
+        # 시작할 때 찍는다 — Ollama가 꺼져 있어 실패해도 키마다 재시도하지 않게.
+        self._embed_warmed_at = now
+        try:
+            worker = EmbedWarmupWorker(
+                self._model_switch, self._settings.ollama_base_url, parent=self
+            )
+        except Exception:  # noqa: BLE001
+            return
+        self._embed_warm_worker = worker
+        worker.start()
+
+    def _apply_past_chats(self, hits: list) -> None:
+        """찾은 기록을 이번 턴 프롬프트에 얹고, 무엇을 참고했는지 화면에 보인다."""
+        from iris.runtime.past_chats import format_past_chats_for_prompt, sources_note
+
+        if not hits:
+            return
+        self._pending_past_chats = format_past_chats_for_prompt(hits)
+        try:
+            self._chat.append_note(sources_note(hits))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _launch_chat_turn(self, turn: UserTurn, model: str) -> None:
         messages = self._chat_messages_with_project_context()
 
         # Hermes ON → 모든 모델(Ollama·NVIDIA API 등)을 Hermes 에이전트로
@@ -3215,6 +3330,7 @@ class MainWindow(QMainWindow):
         # 대화가 맥락이 되므로, 계속 붙여두면 토큰만 먹는다.
         self._pending_handoff = ""
         self._pending_handoff_ctx = None
+        self._pending_past_chats = ""
         self._chat.set_generating(False)
         if open_followup:
             self._open_voice_followup_window()
@@ -3229,7 +3345,8 @@ class MainWindow(QMainWindow):
         text = (partial or "").strip()
         if reason != "conversation_switch":
             return text
-        note = "대화 전환으로 응답을 중단했습니다."
+        from iris.storage.conversations import INTERRUPTED_NOTE as note
+
         return f"{text}\n\n{note}" if text else note
 
     def _cancel_current_turn(self, *, reason: str, preserve_partial_response: bool) -> None:
@@ -5910,6 +6027,11 @@ class MainWindow(QMainWindow):
         if self._pending_handoff:
             # 모델을 막 갈아탔고 원문이 새 컨텍스트에 안 들어간다 — 요약을 얹는다.
             payload.insert(1, {"role": "system", "content": self._pending_handoff})
+        past = getattr(self, "_pending_past_chats", "")
+        if past:
+            # 다른 대화에서 찾은 기록 — 마지막 사용자 말 바로 앞에 둔다.
+            at = len(payload) - 1 if payload[-1].get("role") == "user" else len(payload)
+            payload.insert(at, {"role": "system", "content": past})
         return payload
 
     def _on_ide_icon(self) -> None:

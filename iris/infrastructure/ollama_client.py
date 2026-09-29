@@ -360,15 +360,21 @@ class OllamaClient:
         texts: list[str],
         *,
         timeout_sec: float = 120.0,
+        keep_alive: str | None = None,
     ) -> list[list[float]]:
-        """텍스트 배치 → 벡터. 신형 /api/embed, 실패 시 구형 /api/embeddings 폴백."""
+        """텍스트 배치 → 벡터. 신형 /api/embed, 실패 시 구형 /api/embeddings 폴백.
+
+        `keep_alive` — 모델을 메모리에 붙잡아 둘 시간("30m"). Ollama는 요청마다
+        만료 시각을 그 요청 값(기본 5분)으로 다시 잡으므로 일관되게 넘겨야 한다.
+        """
         items = [str(t or "") for t in texts]
         if not items or not (model or "").strip():
             return []
+        extra = {"keep_alive": keep_alive} if keep_alive else {}
         try:
             data = self._post_json(
                 "/api/embed",
-                {"model": model, "input": items},
+                {"model": model, "input": items, **extra},
                 timeout_sec=timeout_sec,
             )
             vectors = data.get("embeddings")
@@ -381,7 +387,7 @@ class OllamaClient:
         for text in items:
             data = self._post_json(
                 "/api/embeddings",
-                {"model": model, "prompt": text},
+                {"model": model, "prompt": text, **extra},
                 timeout_sec=timeout_sec,
             )
             vec = data.get("embedding")

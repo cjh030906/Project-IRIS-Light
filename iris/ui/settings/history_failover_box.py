@@ -81,6 +81,10 @@ def build_history_failover_box(db: Database) -> QGroupBox:
     kinds_row.addStretch(1)
     lay.addLayout(kinds_row)
 
+    past_chats = QCheckBox("새 채팅에서도 이전 대화 참고 (참고한 기록은 답변 위에 표시)")
+    past_chats.setChecked(history.reference_past_chats)
+    lay.addWidget(past_chats)
+
     form = QFormLayout()
     configure_form(form)
 
@@ -217,7 +221,7 @@ def build_history_failover_box(db: Database) -> QGroupBox:
         on = enabled.isChecked()
         for widget in (
             rec_chat, rec_actions, rec_artifacts, rec_inputs,
-            retrieval, embed_enabled, embed_model,
+            past_chats, retrieval, embed_enabled, embed_model,
         ):
             widget.setEnabled(on)
         embed_model.setEnabled(on and embed_enabled.isChecked())
@@ -244,6 +248,7 @@ def build_history_failover_box(db: Database) -> QGroupBox:
     box.record_artifacts = rec_artifacts  # type: ignore[attr-defined]
     box.record_inputs = rec_inputs  # type: ignore[attr-defined]
     box.retrieval_limit = retrieval  # type: ignore[attr-defined]
+    box.reference_past_chats = past_chats  # type: ignore[attr-defined]
     box.embed_enabled = embed_enabled  # type: ignore[attr-defined]
     box.embed_model = embed_model  # type: ignore[attr-defined]
     box.failover_enabled = failover_enabled  # type: ignore[attr-defined]
@@ -279,6 +284,7 @@ def save_history_failover(db: Database, box: QGroupBox) -> None:
             retrieval_limit=box.retrieval_limit.value(),  # type: ignore[attr-defined]
             embed_model=box.embed_model.text(),  # type: ignore[attr-defined]
             embed_enabled=box.embed_enabled.isChecked(),  # type: ignore[attr-defined]
+            reference_past_chats=box.reference_past_chats.isChecked(),  # type: ignore[attr-defined]
         ),
     )
     save_failover_settings(

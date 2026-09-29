@@ -254,7 +254,7 @@ class _SynonymOllama:
     def pick_embedding_model(self, preferred: str = "") -> str:
         return "syn-embed" if self.installed else ""
 
-    def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+    def embed(self, model: str, texts: list[str], **kwargs) -> list[list[float]]:
         self.embedded.extend(texts)
         return [[1.0 if any(w in t for w in g) else 0.0 for g in self.GROUPS] for t in texts]
 

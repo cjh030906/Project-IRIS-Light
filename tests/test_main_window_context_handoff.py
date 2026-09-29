@@ -57,6 +57,9 @@ class _Chat:
     def append_message_instant(self, who: str, text: str) -> None:
         self.messages.append((who, text))
 
+    def append_note(self, text: str) -> None:
+        self.messages.append(("note", text))
+
     def select_model_silent(self, model: str) -> bool:
         self.selected.append(model)
         return True
@@ -506,6 +509,7 @@ class ContextHandoffWiringTests(TestCase):
         self.assertEqual(self.win._settings.ollama_model, "free:small")
         self.assertEqual(self.win._status_header.model, "free:small")
         self.assertIn("할당량 소진", self.chat.messages[-1][1])
+        self.assertEqual(self.chat.messages[-1][0], "note")
 
     def test_switch_without_partial_text_leaves_the_stream_alone(self) -> None:
         MainWindow._on_chat_model_switched(self.win, "free:small", "서버 오류", False)

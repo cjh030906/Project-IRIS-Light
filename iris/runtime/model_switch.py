@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from iris.knowledge.history_index import (
+    _VEC_MARGIN,
     Embedder,
     OllamaEmbedder,
     SearchHit,
@@ -63,6 +64,12 @@ from iris.storage.failover_prefs import (
 Summarizer = Callable[[str, list[dict[str, str]]], str]
 
 
+# 앱이 쓰는 임베딩 요청은 모두 이 시간만큼 모델을 붙잡아 둔다. 기본 5분이면
+# 잠깐 쉬었다 보낸 첫 메시지마다 콜드 로드(실측 9초, 채팅 모델과 겹치면 60초)를
+# 탄다. 30분이면 대화하는 동안은 떠 있고, 안 쓰면 GPU 664MB를 돌려준다.
+EMBED_KEEP_ALIVE = "30m"
+
+
 def resolve_embedder(
     settings: HistorySettings, ollama_client: object | None
 ) -> Embedder | None:
@@ -75,7 +82,7 @@ def resolve_embedder(
         return None
     if not name:
         return None
-    return OllamaEmbedder(client=ollama_client, model_name=name)
+    return OllamaEmbedder(client=ollama_client, model_name=name, keep_alive=EMBED_KEEP_ALIVE)
 
 
 @dataclass
@@ -165,6 +172,8 @@ class ModelSwitchService:
         conversation_id: int | None = None,
         limit: int | None = None,
         embedder: Embedder | None = None,
+        exclude_conversation_id: int | None = None,
+        vector_margin: float | None = _VEC_MARGIN,
     ) -> list[SearchHit]:
         """`embedder` 를 주면 이번 검색에만 그걸 쓴다(없으면 서비스에 붙은 것)."""
         settings = self.history_settings
@@ -179,6 +188,8 @@ class ModelSwitchService:
             limit=count,
             embedder=embedder or self.embedder,
             conversation_id=conversation_id,
+            exclude_conversation_id=exclude_conversation_id,
+            vector_margin=vector_margin,
         )
 
     def evidence_block(

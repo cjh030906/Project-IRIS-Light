@@ -36,7 +36,7 @@ class _StubOllama:
     def pick_embedding_model(self, preferred: str = "") -> str:
         return self._model
 
-    def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+    def embed(self, model: str, texts: list[str], **kwargs) -> list[list[float]]:
         return [[float(len(t) % 7), 1.0, 0.5] for t in texts]
 
 

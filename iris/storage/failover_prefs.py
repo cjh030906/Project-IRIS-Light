@@ -93,6 +93,9 @@ class HistorySettings:
     # 임베딩 모델. 빈 값이면 설치된 것 중 자동 선택, 없으면 키워드 검색만.
     embed_model: str = ""
     embed_enabled: bool = True
+    # 평소 채팅에서 다른(이전) 대화의 기록을 찾아 참고한다. 참고한 기록은
+    # 답변 위에 출처로 표시되므로 사용자가 보고 끌 수 있다.
+    reference_past_chats: bool = True
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -103,6 +106,7 @@ class HistorySettings:
         self.retrieval_limit = max(0, min(20, int(self.retrieval_limit or 0)))
         self.embed_model = str(self.embed_model or "").strip()
         self.embed_enabled = bool(self.embed_enabled)
+        self.reference_past_chats = bool(self.reference_past_chats)
 
     def records(self, kind: str) -> bool:
         if not self.enabled:

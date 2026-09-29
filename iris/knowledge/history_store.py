@@ -210,7 +210,7 @@ def append_to_wiki(wiki: IrisWiki, entry: HistoryEntry) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         day = entry.created_at[:10]
-        header = f"# History {day}\n\n> 아이리스가 자동으로 남기는 기록입니다. 지우면 검색에서도 빠집니다.\n"
+        header = f"# History {day}\n\n> 아이리스가 자동으로 남기는 기록의 보기용 사본입니다. 이 파일을 고치거나 지워도 검색에는 반영되지 않습니다 — 채팅을 지우면 그 대화의 기록이 여기서도 함께 지워집니다.\n"
         path.write_text(header, encoding="utf-8")
     with path.open("a", encoding="utf-8") as fp:
         fp.write("\n" + render_entry_markdown(entry))

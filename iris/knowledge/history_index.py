@@ -22,6 +22,7 @@ from typing import Protocol
 import numpy as np
 
 from iris.knowledge.history_store import (
+    EPISODE_DIR,
     HistoryEntry,
     ensure_history_schema,
     get_entry,
@@ -63,12 +64,18 @@ class OllamaEmbedder:
 
     client: object
     model_name: str
+    # 모델을 메모리에 붙잡아 둘 시간. None 이면 Ollama 기본(5분).
+    keep_alive: str | None = None
 
     @property
     def model(self) -> str:
         return self.model_name
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        if self.keep_alive:
+            return list(self.client.embed(  # type: ignore[attr-defined]
+                self.model_name, list(texts), keep_alive=self.keep_alive
+            ))
         return list(self.client.embed(self.model_name, list(texts)))  # type: ignore[attr-defined]
 
 
@@ -78,6 +85,8 @@ class SearchHit:
     score: float
     keyword_rank: int | None
     vector_rank: int | None
+    # 질의와의 코사인 유사도. 벡터 검색을 안 했거나 컷에 걸렸으면 None.
+    similarity: float | None = None
 
     @property
     def matched_by(self) -> str:
@@ -372,7 +381,13 @@ def _like_ranked(db: Database, query: str, limit: int) -> list[int]:
     return [int(r["id"]) for r in rows]
 
 
-def _vector_ranked(db: Database, query: str, limit: int, embedder: Embedder) -> list[int]:
+def _vector_ranked(
+    db: Database,
+    query: str,
+    limit: int,
+    embedder: Embedder,
+    margin: float | None = _VEC_MARGIN,
+) -> list[tuple[int, float]]:
     ensure_index_schema(db)
     try:
         qvecs = embedder.embed([query])
@@ -401,8 +416,8 @@ def _vector_ranked(db: Database, query: str, limit: int, embedder: Embedder) -> 
     ordered = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
     if not ordered:
         return []
-    cut = max(_VEC_FLOOR, ordered[0][1] - _VEC_MARGIN)
-    return [hid for hid, score in ordered[: int(limit)] if score >= cut]
+    cut = _VEC_FLOOR if margin is None else max(_VEC_FLOOR, ordered[0][1] - margin)
+    return [(hid, score) for hid, score in ordered[: int(limit)] if score >= cut]
 
 
 def search(
@@ -412,25 +427,40 @@ def search(
     limit: int = 8,
     embedder: Embedder | None = None,
     conversation_id: int | None = None,
+    exclude_conversation_id: int | None = None,
     kinds: tuple[str, ...] | None = None,
     pool: int = 40,
+    vector_margin: float | None = _VEC_MARGIN,
 ) -> list[SearchHit]:
-    """History 하이브리드 검색. 상위 `limit` 건."""
+    """History 하이브리드 검색. 상위 `limit` 건.
+
+    `exclude_conversation_id` — 지금 대화는 이미 모델 컨텍스트에 있으니 빼고
+    찾을 때 쓴다. 안 빼면 방금 보낸 질문이 자기 자신을 1위로 찾아온다.
+    """
     text = (query or "").strip()
     if not text:
         return []
     ensure_index_schema(db)
     kw = _keyword_ranked(db, text, pool)
-    vec = _vector_ranked(db, text, pool, embedder) if embedder is not None else []
+    # vector_margin=None — 1위 대비 컷을 끈다. 1위가 쓸모없는 기록(예: 지금 질문과
+    # 똑같은 옛 질문, 유사도 1.0)이면 컷이 0.9까지 올라 나머지가 다 잘린다.
+    # 이전 대화 참고는 자체 절대 기준으로 거르므로 이걸 끈다.
+    vec = (
+        _vector_ranked(db, text, pool, embedder, vector_margin)
+        if embedder is not None
+        else []
+    )
 
     fused: dict[int, float] = {}
     kw_rank: dict[int, int] = {}
     vec_rank: dict[int, int] = {}
+    vec_sim: dict[int, float] = {}
     for rank, hid in enumerate(kw):
         kw_rank[hid] = rank + 1
         fused[hid] = fused.get(hid, 0.0) + 1.0 / (_RRF_K + rank + 1)
-    for rank, hid in enumerate(vec):
+    for rank, (hid, sim) in enumerate(vec):
         vec_rank[hid] = rank + 1
+        vec_sim[hid] = sim
         fused[hid] = fused.get(hid, 0.0) + 1.0 / (_RRF_K + rank + 1)
 
     hits: list[SearchHit] = []
@@ -440,6 +470,8 @@ def search(
             continue
         if conversation_id is not None and entry.conversation_id != conversation_id:
             continue
+        if exclude_conversation_id is not None and entry.conversation_id == exclude_conversation_id:
+            continue
         if kinds and entry.kind not in kinds:
             continue
         hits.append(
@@ -448,11 +480,82 @@ def search(
                 score=score,
                 keyword_rank=kw_rank.get(hid),
                 vector_rank=vec_rank.get(hid),
+                similarity=vec_sim.get(hid),
             )
         )
         if len(hits) >= int(limit):
             break
     return hits
+
+
+_WIKI_BLOCK_RE = re.compile(r"(?m)^(?=## )")
+_WIKI_ID_RE = re.compile(r"<!--[^>]*\bid:(\d+)\b")
+
+
+def forget_conversation(db: Database, conversation_id: int, *, wiki=None) -> int:
+    """채팅을 지우면 그 대화의 History도 지운다 — DB·키워드·벡터 색인·위키 사본 모두.
+
+    이걸 안 하면 "이전 대화 참고"가 사용자가 지운 대화를 다시 꺼내 온다.
+    conversation_id 가 0(대화 밖에서 생긴 수행 기록 등)이면 아무것도 안 지운다.
+    지운 건수를 돌려준다.
+    """
+    cid = int(conversation_id or 0)
+    if cid <= 0:
+        return 0
+    has_fts = ensure_index_schema(db)
+    rows = db._execute(
+        "SELECT id, rel_path FROM wiki_history WHERE conversation_id = ?", (cid,)
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [int(r["id"]) for r in rows]
+    for hid in ids:
+        db._execute("DELETE FROM wiki_history_vectors WHERE history_id = ?", (hid,))
+        if has_fts:
+            db._execute("DELETE FROM wiki_history_fts WHERE rowid = ?", (hid,))
+    db._execute("DELETE FROM wiki_history WHERE conversation_id = ?", (cid,))
+    db._commit()
+
+    if wiki is not None:
+        gone = set(ids)
+        for rel in {str(r["rel_path"] or "") for r in rows}:
+            if not rel:
+                continue
+            path = wiki.user_root / rel
+            if rel.startswith(EPISODE_DIR + "/"):
+                # 에피소드 노트는 파일 하나가 기록 하나다.
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                _scrub_wiki_file(path, gone)
+    return len(ids)
+
+
+def _scrub_wiki_file(path, gone: set[int]) -> None:
+    """일별 노트에서 지운 id의 `## …` 블록만 뺀다. 다른 대화의 블록은 그대로."""
+    try:
+        if not path.is_file():
+            return
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    blocks = _WIKI_BLOCK_RE.split(text)
+    kept: list[str] = []
+    dropped = False
+    for block in blocks:
+        m = _WIKI_ID_RE.search(block)
+        if m and int(m.group(1)) in gone:
+            dropped = True
+            continue
+        kept.append(block)
+    if not dropped:
+        return
+    try:
+        path.write_text("".join(kept), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def format_hits_for_prompt(hits: list[SearchHit], *, body_limit: int = 700) -> str:
