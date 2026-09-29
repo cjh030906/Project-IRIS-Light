@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from datetime import datetime
@@ -10,6 +11,16 @@ from typing import Any, Optional
 
 
 def default_db_path() -> Path:
+    """기본 DB 경로. `IRIS_DB_PATH` 로 바꿀 수 있다.
+
+    헤드리스 실행기(`iris.routine_cli`)를 진짜 사용자 DB 없이 시험하려면 경로를
+    갈아끼울 수 있어야 한다. 앱은 이 변수를 설정하지 않으므로 평소엔 그대로다.
+    """
+    override = (os.environ.get("IRIS_DB_PATH") or "").strip()
+    if override:
+        path = Path(override).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
     base = Path.home() / ".iris-light"
     base.mkdir(parents=True, exist_ok=True)
     return base / "iris_light.db"
@@ -393,3 +404,12 @@ class Database:
         )
         self._commit()
         return int(cur.lastrowid or 0)
+
+    def close(self) -> None:
+        """연결 종료. 테스트·임시 DB 정리에 쓴다(Windows는 열린 파일을 못 지운다)."""
+        with self._lock:
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+            self._conn.close()

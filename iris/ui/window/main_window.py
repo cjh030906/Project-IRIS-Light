@@ -42,6 +42,12 @@ from iris.core.activity_sink import register_activity_sink
 from iris.core.state_machine import AppState, StateMachine
 from iris.infrastructure.ollama_client import OllamaModelInfo
 from iris.knowledge.iris_wiki import IrisWiki
+from iris.runtime.model_failover import RouteTarget
+from iris.runtime.context_handoff import (
+    build_successor_messages,
+    compact_handoff_task,
+)
+from iris.runtime.model_switch import ModelSwitchService, retrieval_query
 from iris.storage.api_providers import (
     get_api_provider,
     is_api_runtime_model,
@@ -121,7 +127,18 @@ from iris.ui.workers.hermes_workers import (
     HermesHealthWorker,
     HermesModelSyncWorker,
 )
-from iris.ui.workers.ollama_workers import OllamaChatWorker, OllamaModelListWorker
+from iris.ui.workers.handoff_summary_worker import (
+    HandoffSummaryWorker,
+    SummaryRoute,
+)
+from iris.ui.workers.history_embed_worker import HistoryEmbedWorker
+from iris.ui.workers.history_evidence_worker import HistoryEvidenceWorker
+from iris.ui.workers.routine_run_worker import RoutineRunWorker
+from iris.ui.workers.ollama_workers import (
+    ChatAttempt,
+    OllamaChatWorker,
+    OllamaModelListWorker,
+)
 from iris.ui.workers.api_provider_workers import OpenAICompatChatWorker
 from iris.ui.workers.learning_workers import LearningProcessWorker
 from iris.learning.manager import LearningManager
@@ -484,6 +501,20 @@ class MainWindow(QMainWindow):
         self._body_stack.addWidget(self._unified_shell)
 
         self._iris_wiki = IrisWiki(Path(__file__).resolve().parents[3] / "obsidian-vault")
+        # History 기록·모델 전환. 임베더는 여기서 붙이지 않는다 — Ollama 조회가
+        # 네트워크라 UI 스레드를 막는다. 벡터 색인은 HistoryEmbedWorker 가 맡는다.
+        self._model_switch = ModelSwitchService(self._db, wiki=self._iris_wiki)
+        self._history_embed_worker: HistoryEmbedWorker | None = None
+        self._history_evidence_worker: HistoryEvidenceWorker | None = None
+        # 모델이 바뀐 직후 한 턴만 얹을 인수인계 system 메시지. 붙이고 나면 비운다.
+        self._pending_handoff = ''
+        self._pending_handoff_ctx = None
+        self._last_archive_id = ''
+        self._handoff_summary_worker = None
+        self._routine_worker = None
+        self._routine_in_flight = None
+        self._iris_state_cache: dict[str, str] = {}
+        self._routine_wake_wanted = None
         self._obsidian_page.set_wiki(self._iris_wiki)
         self._left_sidebar.obsidian_detail.set_wiki(self._iris_wiki)
         self._left_sidebar.obsidian_detail.note_selected.connect(self._obsidian_page.show_note)
@@ -505,6 +536,26 @@ class MainWindow(QMainWindow):
         self._calendar_remind_timer.timeout.connect(self._check_calendar_reminders)
         if not self._test_mode:
             self._calendar_remind_timer.start()
+
+        # History 벡터 색인 — 밀린 것만 주기적으로 채운다. Ollama가 없으면
+        # 워커가 조용히 아무것도 하지 않으므로 켜둬도 부담이 없다.
+        self._history_embed_timer = QTimer(self)
+        self._history_embed_timer.setInterval(180_000)
+        self._history_embed_timer.timeout.connect(self._kick_history_embed)
+        if not self._test_mode:
+            self._history_embed_timer.start()
+            QTimer.singleShot(8_000, self._kick_history_embed)
+
+        # 예약 루틴 — 캘린더 알림과 같은 1분 주기. 아이리스가 켜져 있을 때만 돈다.
+        self._routine_timer = QTimer(self)
+        self._routine_timer.setInterval(60_000)
+        self._routine_timer.timeout.connect(self._tick_routines)
+        if not self._test_mode:
+            self._routine_timer.start()
+            QTimer.singleShot(12_000, self._sync_iris_wiki)
+            # 토스트 클릭용 URI 스킴 — 앱이 꺼진 뒤에 눌러도 동작하려면
+            # 켜져 있는 동안 미리 걸어 둬야 한다.
+            QTimer.singleShot(15_000, self._register_toast_click)
 
         left_lay = self._assistant_page.center_layout
         right_lay = self._assistant_page.right_layout
@@ -1369,6 +1420,7 @@ class MainWindow(QMainWindow):
         model = (model or "").strip()
         if not model:
             return
+        previous = (self._settings.ollama_model or "").strip()
         model = self._guard_cloud_model_selection(model)
         self._settings.ollama_model = model
         self._settings.model_name = model
@@ -1383,6 +1435,10 @@ class MainWindow(QMainWindow):
                 self._live_activity.append_instant_line(f"모델: {desc}")
         if self._settings.hermes_enabled and model:
             self._sync_hermes_model(model)
+        if previous and previous != model:
+            self._handoff_context_to(previous, model)
+        if previous != model:
+            self._sync_iris_wiki()
         self._refresh_context_gauge()
         self._api_quota_worker.set_cloud_polling(self._is_cloud_model(model))
         self._verify_api_model_once(model)
@@ -1471,15 +1527,8 @@ class MainWindow(QMainWindow):
         self._live_activity.append_instant_line("Ollama usage refresh…")
         self._maybe_refresh_ollama_quota(force=True)
 
-    def _refresh_context_gauge(self) -> None:
-        """선택 모델 컨텍스트 한도 + 실제 전송 메시지 추정 토큰으로 원형 게이지 갱신.
-
-        매 턴 user/assistant append 직후 호출되어 한도 대비 사용량이 누적 상승한다.
-        """
-        model = self._chat.current_model()
-        if not model:
-            self._chat.set_context_usage(0, 128_000)
-            return
+    def _context_limit_for(self, model: str) -> int:
+        """모델 컨텍스트 한도(토큰). 모델당 1회만 조회하고 캐시한다."""
         cache = getattr(self, "_context_limit_cache", None)
         if cache is None:
             self._context_limit_cache = {}
@@ -1494,6 +1543,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 limit = 128_000
             cache[model] = limit
+        return int(limit)
+
+    def _refresh_context_gauge(self) -> None:
+        """선택 모델 컨텍스트 한도 + 실제 전송 메시지 추정 토큰으로 원형 게이지 갱신.
+
+        매 턴 user/assistant append 직후 호출되어 한도 대비 사용량이 누적 상승한다.
+        """
+        model = self._chat.current_model()
+        if not model:
+            self._chat.set_context_usage(0, 128_000)
+            return
+        limit = self._context_limit_for(model)
         # history만이 아니라 시스템/프로젝트 컨텍스트 포함 — 호출마다 실제 페이로드 반영
         try:
             payload = self._chat_messages_with_project_context()
@@ -1552,8 +1613,794 @@ class MainWindow(QMainWindow):
         if err:
             self._live_activity.append_instant_line(f"chat 저장 실패: {err}")
             return
+        self._record_wiki_history("chat", content, role=role)
         if role in ("user", "assistant"):
             self._refresh_chat_history_panel()
+
+    def _record_wiki_history(
+        self,
+        kind: str,
+        body: str,
+        *,
+        role: str = "",
+        title: str = "",
+        source: str = "",
+        tags: str = "",
+    ) -> None:
+        """위키 History 기록 — 실패해도 대화는 계속되어야 한다.
+
+        키워드 색인까지만 여기서 한다(로컬 SQLite라 즉시 끝난다). 임베딩은
+        HistoryEmbedWorker 가 나중에 채운다.
+        """
+        try:
+            self._model_switch.record(
+                kind,
+                body,
+                title=title,
+                conversation_id=self._conversation_id,
+                role=role,
+                source=source,
+                model=self._settings.ollama_model,
+                tags=tags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"History 기록 스킵: {str(exc)[:80]}")
+
+    # ------------------------------------------------------------------
+    # 모델 전환 시 맥락 이관
+    # ------------------------------------------------------------------
+
+    def _route_target_for(self, model: str) -> RouteTarget:
+        from iris.infrastructure.ollama_client import (
+            OllamaModelInfo,
+            display_name_from_runtime,
+        )
+
+        if parse_runtime_model_id(model) is not None:
+            backend = "api"
+        elif self._use_hermes_backend():
+            backend = "hermes"
+        else:
+            backend = "ollama"
+        return RouteTarget(
+            model=model,
+            backend=backend,
+            label=display_name_from_runtime(model),
+            free=not OllamaModelInfo(name=model).is_cloud,
+        )
+
+    def _history_fits(self, model: str, messages: list[dict[str, str]]) -> bool:
+        """원문 전체가 이 모델 컨텍스트에 여유 있게 들어가는가.
+
+        들어가면 요약하지 않는다 — 원문이 늘 요약보다 정확하다. 답변이 들어갈
+        자리를 남겨야 하므로 한도의 80%까지만 쓴다.
+        """
+        try:
+            limit = self._context_limit_for(model)
+            used = estimate_messages_tokens(messages)
+        except Exception:  # noqa: BLE001
+            return True
+        return used <= int(limit * 0.8)
+
+    def _handoff_context_to(self, from_model: str, to_model: str) -> None:
+        """모델이 바뀌었다 — 원문을 아카이브하고, 필요하면 인수인계문을 예약한다.
+
+        아카이브는 언제나 남긴다(나중에 원문을 되찾는 근거). 인수인계문은 원문이
+        새 모델에 안 들어갈 때만 붙인다 — 들어가는데 요약을 끼우면 토큰만 버린다.
+        """
+        history = list(self._history)
+        if not history:
+            return
+        try:
+            result = self._model_switch.switch(
+                self._conversation_id,
+                history,
+                self._route_target_for(to_model),
+                from_target=self._route_target_for(from_model),
+                reason="사용자 전환",
+                # 구 모델에 동기로 요약을 시키면 UI가 그동안 멈춘다. 규칙 기반
+                # 정리는 사용자 요구사항을 글자 그대로 옮기므로 이 경로에선 충분하다.
+                summarizer=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"맥락 이관 스킵: {str(exc)[:80]}")
+            return
+
+        self._last_archive_id = result.archive_id
+        if self._history_fits(to_model, history):
+            # 원문이 다 들어간다 — 요약은 손해다. 진행 중인 요약도 필요 없다.
+            self._cancel_handoff_summary()
+            self._pending_handoff = ""
+            self._pending_handoff_ctx = None
+            self._live_activity.append_instant_line(
+                f"{result.notice} 원문 {len(history)}턴 그대로 전달합니다."
+            )
+            return
+        self._pending_handoff_ctx = result.context
+        self._pending_handoff = result.messages[0]["content"]
+        self._live_activity.append_instant_line(
+            f"{result.notice} 컨텍스트가 좁아 요약으로 넘깁니다."
+        )
+        # 규칙 기반을 먼저 걸어 뒀으니, 구 모델 요약은 뒤에서 받아 갈아끼운다.
+        self._start_handoff_summary(from_model, result.context)
+        # History 발췌도 지금은 키워드 결과다. 의미검색 결과는 뒤에서 받아 갈아끼운다.
+        self._start_handoff_evidence(history, result.context)
+        self._kick_history_embed()
+
+    # ------------------------------------------------------------------
+    # IRIS 칸 — 상태 스냅샷과 예약 루틴
+    # ------------------------------------------------------------------
+
+    def _current_iris_state(self) -> dict[str, str]:
+        """지금 상태를 라벨→문구로. 비밀값은 build_state 가 걸러낸다."""
+        from iris.knowledge.iris_state import build_state
+        from iris.storage.api_providers import load_api_providers
+
+        try:
+            providers = load_api_providers(self._db) if self._db else []
+        except Exception:  # noqa: BLE001
+            providers = []
+        history = self._model_switch.history_settings
+        embed = ""
+        if history.enabled and history.embed_enabled:
+            # 실제로 쓰는 임베딩 모델명은 색인 워커가 정한다. 여기서 네트워크를
+            # 타면 안 되므로 이미 벡터가 쌓인 모델을 DB에서 되읽는다.
+            try:
+                row = self._db._execute(
+                    "SELECT model FROM wiki_history_vectors ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+                embed = str(row["model"]) if row else ""
+            except Exception:  # noqa: BLE001
+                embed = ""
+        return build_state(
+            ollama_model=self._settings.ollama_model,
+            hermes_enabled=bool(self._settings.hermes_enabled),
+            hermes_base_url=self._settings.hermes_base_url,
+            hermes_api_key=self._settings.hermes_api_key,
+            api_providers=providers,
+            history=history,
+            failover=self._model_switch.failover_settings,
+            embed_model=embed,
+        )
+
+    def _sync_iris_wiki(
+        self,
+        *,
+        routine: object = None,
+        removed: object = None,
+        previous_name: str = "",
+        change: str = "",
+    ) -> None:
+        """IRIS 칸을 다시 쓴다. 상태가 바뀌었으면 History 에도 한 줄 남긴다."""
+        from dataclasses import replace as _replace
+
+        from iris.knowledge.iris_state import (
+            diff_state,
+            remove_routine_note,
+            sync_iris_index,
+            sync_routine_note,
+        )
+        from iris.storage.routines import list_routines
+
+        try:
+            state = self._current_iris_state()
+            sync_iris_index(self._iris_wiki, state, list_routines(self._db))
+            if routine is not None:
+                if previous_name and previous_name != getattr(routine, "name", ""):
+                    # 이름이 바뀌면 옛 노트가 유령으로 남는다.
+                    remove_routine_note(self._iris_wiki, _replace(routine, name=previous_name))
+                sync_routine_note(self._iris_wiki, routine)
+            if removed is not None:
+                remove_routine_note(self._iris_wiki, removed)
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"IRIS 칸 갱신 스킵: {str(exc)[:80]}")
+            return
+
+        self._sync_routine_wake()
+
+        changes = diff_state(self._iris_state_cache, state)
+        self._iris_state_cache = state
+        lines = [change] if change else []
+        lines.extend(changes)
+        if lines:
+            self._record_wiki_history(
+                "action",
+                "\n".join(f"- {line}" for line in lines),
+                title="IRIS 상태 변경",
+                tags="iris-state",
+            )
+
+    def _register_toast_click(self) -> None:
+        """토스트를 누르면 아이리스가 뜨도록 `iris-light:` 스킴을 등록한다."""
+        try:
+            from iris.system.uri_handler import register
+
+            status = register()
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"알림 클릭 등록 스킵: {str(exc)[:80]}")
+            return
+        if not status.registered and status.detail not in ("Windows 에서만 지원합니다",):
+            self._live_activity.append_instant_line(
+                f"알림 클릭 등록 실패: {status.detail[:80]}"
+            )
+
+    def _sync_routine_wake(self) -> None:
+        """꺼져 있어도 돌릴 루틴이 있으면 Windows 작업을 등록, 없으면 해제한다.
+
+        schtasks 는 프로세스를 띄워 수백 ms 걸린다. 여기는 UI 스레드라 매번 부르면
+        루틴을 고칠 때마다 창이 움찔한다. **원하는 상태가 바뀔 때만** 부른다 —
+        루틴이 몇 개 바뀌었든 "깨우기가 필요한가"라는 답이 같으면 할 일이 없다.
+        """
+        from iris.storage.routines import list_routines
+        from iris.system.routine_wake import is_supported, sync
+
+        if not is_supported():
+            return
+        try:
+            wanted = any(r.wake_when_closed and r.enabled for r in list_routines(self._db))
+        except Exception:  # noqa: BLE001
+            return
+        if getattr(self, "_routine_wake_wanted", None) == wanted:
+            return
+        self._routine_wake_wanted = wanted
+        status = sync(wanted)
+        if wanted and not status.registered:
+            self._live_activity.append_instant_line(
+                f"꺼짐 상태 실행 등록 실패 — {status.detail[:100]}"
+            )
+        elif wanted:
+            self._live_activity.append_instant_line(
+                f"아이리스가 꺼져 있어도 루틴이 돕니다 ({status.detail})."
+            )
+
+    def _tick_routines(self) -> None:
+        """1분마다 — 지금 돌릴 루틴이 있으면 하나 돌린다."""
+        if self._db is None:
+            return
+        from iris.runtime.routine_runner import collect_due, record_missed
+
+        try:
+            run_now, missed = collect_due(self._db)
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"루틴 확인 실패: {str(exc)[:80]}")
+            return
+
+        for due in missed:
+            # 놓친 건 실행하지 않는다. 다만 조용히 넘기지도 않는다.
+            record_missed(self._db, due)
+            self._live_activity.append_instant_line(
+                f"루틴 '{due.routine.name}' — {due.check.note()}"
+            )
+        if missed:
+            self._sync_iris_wiki()
+
+        if not run_now or self._routine_worker is not None:
+            return
+        self._start_routine(run_now[0])
+
+    def _run_routine_now(self, routine: object) -> bool:
+        """예약을 기다리지 않고 지금 실행. 이미 하나 돌고 있으면 False."""
+        from datetime import datetime
+
+        from iris.runtime.routine_runner import DueRoutine
+        from iris.runtime.routine_schedule import OUTCOME_DUE, DueCheck
+
+        if self._routine_worker is not None:
+            return False
+        due = DueRoutine(
+            routine=routine,
+            check=DueCheck(
+                outcome=OUTCOME_DUE,
+                scheduled_for=datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        return self._start_routine(due)
+
+    def _start_routine(self, due: object) -> bool:
+        from iris.runtime.routine_runner import build_run_messages
+
+        routine = due.routine
+        # 루틴에 모델을 고정해 뒀으면 그걸 쓴다. 안 그러면 지금 선택된 모델.
+        wanted = (routine.model or "").strip() or self._settings.ollama_model
+        route = self._summary_route_for(wanted)
+        if route is None and routine.model:
+            # 고정해 둔 모델이 사라졌다(설정에서 API 삭제 등) — 현재 모델로 물러선다.
+            self._live_activity.append_instant_line(
+                f"루틴 '{routine.name}' — 지정 모델 '{routine.model}' 을 쓸 수 없어 "
+                f"현재 모델로 실행합니다."
+            )
+            route = self._summary_route_for(self._settings.ollama_model)
+        if route is None:
+            self._live_activity.append_instant_line(
+                f"루틴 '{routine.name}' — 쓸 모델을 정하지 못해 건너뜁니다."
+            )
+            return False
+        # MCP 도구는 Hermes 게이트웨이를 거칠 때만 붙는다. 직행 경로에서
+        # 이걸 안 알려주면 모델이 "오늘 뉴스"를 지어낸다.
+        tools_available = route.backend == "hermes"
+
+        def prepare(note):
+            # 워커 스레드에서 돈다 — 웹 검색·질의 임베딩 모두 네트워크 왕복이다.
+            return build_run_messages(
+                routine,
+                evidence=self._routine_evidence(routine, note),
+                tools_available=tools_available,
+            )
+
+        try:
+            worker = RoutineRunWorker(routine.id, route, prepare=prepare, parent=self)
+        except Exception as exc:  # noqa: BLE001
+            self._live_activity.append_instant_line(f"루틴 시작 실패: {str(exc)[:80]}")
+            return False
+        worker.finished_ok.connect(self._on_routine_finished)
+        worker.failed.connect(self._on_routine_failed)
+        worker.note.connect(self._live_activity.append_instant_line)
+        self._routine_worker = worker
+        self._routine_in_flight = due
+        self._live_activity.append_instant_line(f"루틴 실행 중 — {routine.name}")
+        worker.start()
+        return True
+
+    def _routine_evidence(self, routine: object, note) -> str:
+        """루틴에 넣어 줄 근거 — 웹 검색 결과 + 과거 History.
+
+        검색어가 있으면 **IRIS 가 직접 검색해서** 결과를 넣는다. 모델이 도구를
+        부르길 기다리지 않는다(직행 경로엔 도구가 없고, 그 상태로 "오늘 뉴스"를
+        시키면 모델이 가짜 헤드라인을 지어낸다 — 실측 확인).
+
+        `RoutineRunWorker` 스레드에서 불린다. 위젯은 만지지 말고 `note` 로 알린다.
+        """
+        parts: list[str] = []
+        query = (getattr(routine, "search", "") or "").strip()
+        if query:
+            try:
+                from iris.runtime.routine_search import format_evidence, run_search
+
+                found = run_search(
+                    query,
+                    engine=getattr(routine, "search_engine", "") or "google_news",
+                )
+                parts.append(format_evidence(found))
+                if found.error:
+                    note(f"루틴 검색 실패 — {found.error[:80]}")
+            except Exception as exc:  # noqa: BLE001
+                note(f"루틴 검색 스킵: {str(exc)[:80]}")
+        try:
+            past = self._model_switch.semantic_evidence_block(
+                routine.task, OllamaClient(self._settings.ollama_base_url)
+            )
+        except Exception:  # noqa: BLE001
+            past = ""
+        if past:
+            parts.append(past)
+        return "\n\n".join(p for p in parts if p)
+
+    def _take_routine_flight(self, routine_id: int):
+        """결과가 지금 돌던 루틴의 것인지 확인하고 상태를 비운다."""
+        due = self._routine_in_flight
+        self._routine_worker = None
+        self._routine_in_flight = None
+        if due is None or due.routine.id != int(routine_id):
+            return None
+        return due
+
+    def _on_routine_finished(self, routine_id: int, text: str) -> None:
+        from iris.runtime.routine_runner import record_result
+
+        due = self._take_routine_flight(routine_id)
+        if due is None:
+            return
+        updated = record_result(self._db, due, text=text)
+        self._deliver_routine(updated or due.routine, text, due.check)
+        self._sync_iris_wiki(routine=updated or due.routine)
+
+    def _on_routine_failed(self, routine_id: int, error: str) -> None:
+        from iris.runtime.routine_runner import record_result
+
+        due = self._take_routine_flight(routine_id)
+        if due is None:
+            return
+        updated = record_result(self._db, due, error=error)
+        self._live_activity.append_instant_line(
+            f"루틴 '{due.routine.name}' 실패: {error[:80]}"
+        )
+        if due.routine.wants("notify"):
+            self._notes.try_add_alert(
+                0, "routine_failed", f"{due.routine.name} 실패", error[:120], "routine"
+            )
+        self._sync_iris_wiki(routine=updated or due.routine)
+
+    def _deliver_routine(self, routine: object, text: str, check: object) -> None:
+        """루틴마다 정해 둔 방식으로 결과를 전한다. 기본은 채팅 + 알림."""
+        from iris.runtime.routine_runner import format_delivery, notify_summary
+
+        body = format_delivery(routine, text, check)
+        if routine.wants("chat"):
+            try:
+                self._chat.append_message_instant("Iris", body)
+                self._record_history("assistant", body)
+            except Exception:  # noqa: BLE001
+                pass
+        if routine.wants("notify"):
+            try:
+                self._notes.try_add_alert(
+                    0,
+                    "routine_done",
+                    routine.name,
+                    notify_summary(routine, text),
+                    "routine",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if routine.wants("voice"):
+            try:
+                self._speak_alert(notify_summary(routine, text, limit=300))
+            except Exception:  # noqa: BLE001
+                pass
+        if routine.wants("wiki"):
+            self._record_wiki_history(
+                "artifact", text, title=f"{routine.name} 실행 결과", tags="routine"
+            )
+
+    def _summary_route_for(self, model: str) -> SummaryRoute | None:
+        """요약을 어느 백엔드로 보낼지. 못 정하면 None(규칙 기반으로 남는다).
+
+        해석은 여기 UI 스레드에서 끝낸다 — 워커는 DB를 읽지 않는다.
+        """
+        name = (model or "").strip()
+        if not name:
+            return None
+        if self._use_hermes_backend():
+            try:
+                from iris.infrastructure.hermes_client import resolve_hermes_inference
+
+                target = resolve_hermes_inference(
+                    name, db=self._db, ollama_base_url=self._settings.ollama_base_url
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            return SummaryRoute(
+                backend="hermes",
+                model=name,
+                base_url=self._settings.hermes_base_url,
+                api_key=self._settings.hermes_api_key,
+                command=self._settings.hermes_command,
+                target=target,
+            )
+        parsed = parse_runtime_model_id(name)
+        if parsed is not None:
+            provider_id, api_model = parsed
+            provider = get_api_provider(self._db, provider_id) if self._db else None
+            if provider is None or not (provider.base_url or "").strip():
+                return None
+            return SummaryRoute(
+                backend="api",
+                model=api_model,
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                auth_style=provider.auth_style,
+            )
+        return SummaryRoute(
+            backend="ollama", model=name, base_url=self._settings.ollama_base_url
+        )
+
+    def _start_handoff_summary(self, from_model: str, context: object) -> None:
+        """구 모델에게 인수인계문을 쓰게 한다. 창은 기다리지 않는다.
+
+        규칙 기반 인수인계문은 이미 걸려 있다. 요약이 제때 도착하면 갈아끼우고,
+        늦으면 버린다 — 이미 나간 요청은 되돌릴 수 없다.
+        """
+        if not self.failover_wants_summary():
+            return
+        route = self._summary_route_for(from_model)
+        if route is None:
+            return
+        self._cancel_handoff_summary()
+        task = compact_handoff_task(
+            archive_id=getattr(context, "archive_id", ""),
+            session_token=getattr(context, "session_token", ""),
+            generation=getattr(context, "generation", 0),
+            conversation_id=self._conversation_id,
+        )
+        messages = [*list(self._history), {"role": "user", "content": task}]
+        try:
+            worker = HandoffSummaryWorker(
+                route,
+                messages,
+                archive_id=getattr(context, "archive_id", ""),
+                parent=self,
+            )
+            worker.finished_ok.connect(self._on_handoff_summary_ready)
+            worker.failed.connect(
+                lambda msg: self._live_activity.append_instant_line(
+                    f"인수인계 요약 실패 — 자동 정리를 유지합니다: {msg[:60]}"
+                )
+            )
+            self._handoff_summary_worker = worker
+            worker.start()
+        except Exception as exc:  # noqa: BLE001
+            # 요약은 덤이다. 규칙 기반 인수인계문은 이미 걸려 있으므로
+            # 여기서 터져도 전환 자체는 그대로 성립해야 한다.
+            self._handoff_summary_worker = None
+            self._live_activity.append_instant_line(
+                f"인수인계 요약을 시작하지 못했습니다 — 자동 정리 유지: {str(exc)[:60]}"
+            )
+            return
+        self._live_activity.append_instant_line(
+            f"{from_model} 에게 인수인계문을 요청했습니다…"
+        )
+
+    def failover_wants_summary(self) -> bool:
+        try:
+            settings = self._model_switch.failover_settings
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(settings.ask_old_model_summary)
+
+    def _start_handoff_evidence(self, history: list[dict[str, str]], context: object) -> None:
+        """인수인계에 얹을 History 발췌를 의미검색으로 다시 찾는다. 창은 기다리지 않는다."""
+        query = retrieval_query(history)
+        if not query:
+            return
+        try:
+            worker = HistoryEvidenceWorker(
+                self._model_switch,
+                self._settings.ollama_base_url,
+                query,
+                tag=getattr(context, "archive_id", ""),
+                parent=self,
+            )
+        except Exception:  # noqa: BLE001
+            return  # 키워드 발췌가 이미 걸려 있다
+        worker.ready.connect(self._on_handoff_evidence_ready)
+        self._history_evidence_worker = worker
+        worker.start()
+
+    def _on_handoff_evidence_ready(self, block: str, archive_id: str) -> None:
+        """의미검색 발췌가 도착했다 — 요약과 같은 조건일 때만 갈아끼운다."""
+        from dataclasses import replace
+
+        context = self._pending_handoff_ctx
+        if context is None or not self._pending_handoff:
+            return
+        if archive_id and archive_id != getattr(context, "archive_id", ""):
+            return
+        if self._busy:
+            return
+        if not block.strip() or block == getattr(context, "wiki_block", ""):
+            return
+        upgraded = replace(context, wiki_block=block)
+        self._pending_handoff_ctx = upgraded
+        self._pending_handoff = build_successor_messages(upgraded)[0]["content"]
+
+    def _cancel_handoff_summary(self) -> None:
+        worker = self._handoff_summary_worker
+        self._handoff_summary_worker = None
+        if worker is not None and worker.isRunning():
+            worker.request_cancel()
+
+    def _on_handoff_summary_ready(self, text: str, archive_id: str) -> None:
+        """요약이 도착했다 — 아직 쓸모 있을 때만 갈아끼운다."""
+        from dataclasses import replace
+
+        context = self._pending_handoff_ctx
+        if context is None or not self._pending_handoff:
+            return  # 이미 턴이 나갔거나 전환이 취소됐다
+        if archive_id and archive_id != getattr(context, "archive_id", ""):
+            return  # 그 사이 또 전환됐다 — 낡은 요약이다
+        if self._busy:
+            return  # 요청이 이미 나갔다. 다음 턴에 얹으면 시점이 어긋난다
+        upgraded = replace(context, handoff_text=text, llm_written=True)
+        self._pending_handoff_ctx = upgraded
+        self._pending_handoff = build_successor_messages(upgraded)[0]["content"]
+        self._live_activity.append_instant_line(
+            f"인수인계문을 {context.from_model or '이전 모델'} 작성본으로 교체했습니다."
+        )
+
+    def _fallback_targets(self, primary_model: str) -> list[RouteTarget]:
+        """설정된 전환 후보들(첫 칸=현재 모델 제외)."""
+        try:
+            plan = self._model_switch.plan_for(self._route_target_for(primary_model))
+        except Exception:  # noqa: BLE001
+            return []
+        return [a.target for a in plan.attempts[1:]] if plan.has_fallback else []
+
+    def _payload_for_candidate(
+        self, target: RouteTarget, messages: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """후보가 받을 messages — 원문이 들어가면 원문, 아니면 압축 맥락."""
+        if self._history_fits(target.model, messages):
+            return messages
+        return self._handoff_messages_for(target)
+
+    def _fallback_attempts(
+        self, primary_model: str, messages: list[dict[str, str]]
+    ) -> list[ChatAttempt]:
+        """Ollama 직행 경로의 전환 체인.
+
+        워커는 DB도 위키도 만지지 않는다. 전환이 필요해지는 시점에는 구 모델이
+        이미 죽어 있으므로(429) 요약을 부탁할 수 없어, 폴백 messages 는 규칙 기반
+        인수인계문으로 만든다.
+        """
+        attempts = [ChatAttempt(primary_model, messages, label=primary_model)]
+        for target in self._fallback_targets(primary_model):
+            # Hermes 를 끈 상태의 이 경로는 Ollama 데몬만 부를 수 있다.
+            if target.backend not in ("", "ollama"):
+                continue
+            attempts.append(
+                ChatAttempt(
+                    target.model,
+                    self._payload_for_candidate(target, messages),
+                    label=target.label,
+                    free=target.free,
+                )
+            )
+        return attempts
+
+    def _api_fallback_attempts(
+        self,
+        primary_model: str,
+        messages: list[dict[str, str]],
+        provider: object,
+        api_model: str,
+    ) -> list[ChatAttempt]:
+        """Hermes 를 끈 상태의 커스텀 API 경로 체인.
+
+        후보마다 프로바이더가 다를 수 있어 base_url·키까지 후보에 실어 보낸다.
+        Ollama 이름처럼 이 경로로 못 부르는 후보는 뺀다.
+        """
+        from iris.ui.workers.chat_attempt import ApiCall
+
+        attempts = [
+            ChatAttempt(
+                primary_model,
+                messages,
+                label=f"{provider.name}/{api_model}",
+                target=ApiCall(
+                    base_url=provider.base_url,
+                    api_key=provider.api_key,
+                    model=api_model,
+                    auth_style=provider.auth_style,
+                ),
+            )
+        ]
+        for target in self._fallback_targets(primary_model):
+            parsed = parse_runtime_model_id(target.model)
+            if parsed is None:
+                continue  # Ollama 로컬 이름 — 이 워커로는 못 부른다
+            pid, upstream = parsed
+            candidate = get_api_provider(self._db, pid) if self._db else None
+            if candidate is None or not (candidate.base_url or "").strip():
+                continue
+            attempts.append(
+                ChatAttempt(
+                    target.model,
+                    self._payload_for_candidate(target, messages),
+                    label=f"{candidate.name}/{upstream}",
+                    free=target.free,
+                    target=ApiCall(
+                        base_url=candidate.base_url,
+                        api_key=candidate.api_key,
+                        model=upstream,
+                        auth_style=candidate.auth_style,
+                    ),
+                )
+            )
+        return attempts
+
+    def _hermes_fallback_attempts(
+        self,
+        primary_model: str,
+        messages: list[dict[str, str]],
+        primary_target: object,
+    ) -> list[ChatAttempt]:
+        """Hermes 경로의 전환 체인.
+
+        Hermes 게이트웨이는 Ollama 이름과 `api:{provider}:{model}` 둘 다 받으므로
+        후보의 선언된 백엔드로 거르지 않는다. 대신 타깃 해석을 **여기 UI 스레드에서**
+        미리 끝낸다 — 해석이 DB(등록된 API 설정)를 읽기 때문에 워커에서 하면 안 된다.
+        해석되지 않는 후보는 조용히 뺀다.
+        """
+        from iris.infrastructure.hermes_client import resolve_hermes_inference
+
+        attempts = [
+            ChatAttempt(
+                primary_model,
+                messages,
+                label=getattr(primary_target, "label", primary_model),
+                target=primary_target,
+            )
+        ]
+        for target in self._fallback_targets(primary_model):
+            try:
+                resolved = resolve_hermes_inference(
+                    target.model,
+                    db=self._db,
+                    ollama_base_url=self._settings.ollama_base_url,
+                )
+            except Exception:  # noqa: BLE001
+                # 삭제된 API·이름 오타 등 — 어차피 못 부를 후보다.
+                continue
+            attempts.append(
+                ChatAttempt(
+                    target.model,
+                    self._payload_for_candidate(target, messages),
+                    label=getattr(resolved, "label", target.label),
+                    free=target.free,
+                    target=resolved,
+                )
+            )
+        return attempts
+
+    def _handoff_messages_for(self, target: RouteTarget) -> list[dict[str, str]]:
+        """폴백 후보용 압축 맥락. 실패하면 원문을 그대로 쓴다.
+
+        후보는 매 턴 미리 만들어 두지만 실제로 쓰이는 일은 드물다. 그래서
+        아카이브도 History 기록도 남기지 않는다(`archive=False`) — 일어나지도
+        않은 전환이 기록되면 안 된다. 진짜 전환됐을 때는 워커가 `switched` 를
+        올리고 `_on_chat_model_switched` 가 그때 기록한다.
+        """
+        try:
+            result = self._model_switch.prepare_handoff(
+                self._conversation_id,
+                list(self._history),
+                target,
+                from_target=self._route_target_for(self._settings.ollama_model),
+                reason="할당량 소진",
+                summarizer=None,
+                archive=False,
+            )
+        except Exception:  # noqa: BLE001
+            return self._chat_messages_with_project_context()
+        return result.messages
+
+    def _on_chat_model_switched(self, model: str, reason: str, had_text: bool) -> None:
+        """워커가 모델을 갈아탔다 — 화면·선택 상태를 맞추고 그제서야 기록한다."""
+        self._live_activity.append_instant_line(f"모델 전환: {model} — {reason}")
+        previous = (self._settings.ollama_model or "").strip()
+        self._record_wiki_history(
+            "action",
+            f"{previous or '이전 모델'} → {model} 자동 전환 — {reason}",
+            title="모델 전환",
+            tags="model-switch",
+        )
+        if had_text:
+            # 앞 모델이 흘려보낸 조각이 화면에 남아 있다. 빈 본문으로 확정해 지우면
+            # 다음 청크가 들어올 때 append_stream_chunk 가 새 메시지를 다시 연다.
+            try:
+                self._chat.end_stream_message("")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._chat.select_model_silent(model)
+            self._settings.ollama_model = model
+            self._saved_model = model
+            self._status_header.set_model_name(model)
+            if self._db is not None:
+                save_selected_model(self._db, model)
+        except Exception:  # noqa: BLE001
+            pass
+        self._chat.append_message_instant("Iris", f"_{reason} — {model} 으로 이어서 답합니다._")
+
+    def _kick_history_embed(self) -> None:
+        """밀린 History 임베딩을 백그라운드로 처리한다. 이미 돌고 있으면 건너뛴다."""
+        worker = self._history_embed_worker
+        if worker is not None and worker.isRunning():
+            return
+        try:
+            worker = HistoryEmbedWorker(
+                self._db,
+                self._iris_wiki,
+                self._settings.ollama_base_url,
+                parent=self,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        worker.failed.connect(
+            lambda msg: self._live_activity.append_instant_line(f"History 색인 실패: {msg[:80]}")
+        )
+        self._history_embed_worker = worker
+        worker.start()
 
     def _drop_last_user_history(self) -> None:
         """실패한 턴 되돌리기 — 세션이 메모리·DB를 같이 뺀다."""
@@ -2279,6 +3126,7 @@ class MainWindow(QMainWindow):
                 api_key=self._settings.hermes_api_key,
                 command=self._settings.hermes_command,
                 target=target,
+                attempts=self._hermes_fallback_attempts(model, messages, target),
                 parent=self,
             )
             self._start_chat_worker(worker, turn.id)
@@ -2305,6 +3153,9 @@ class MainWindow(QMainWindow):
                 messages,
                 display_model=f"{provider.name}/{api_model}",
                 auth_style=provider.auth_style,
+                attempts=self._api_fallback_attempts(
+                    model, messages, provider, api_model
+                ),
                 parent=self,
             )
             self._start_chat_worker(worker, turn.id)
@@ -2315,6 +3166,7 @@ class MainWindow(QMainWindow):
             model,
             messages,
             think=True,
+            attempts=self._fallback_attempts(model, messages),
             parent=self,
         )
         self._start_chat_worker(worker, turn.id)
@@ -2330,6 +3182,7 @@ class MainWindow(QMainWindow):
             getattr(worker, "content_chunk", None),
             getattr(worker, "finished_ok", None),
             getattr(worker, "failed", None),
+            getattr(worker, "switched", None),
         ):
             if sig is None:
                 continue
@@ -2338,6 +3191,8 @@ class MainWindow(QMainWindow):
             except TypeError:
                 pass
         worker.connecting.connect(lambda model, host, tid=turn_id: self._on_chat_connecting_for_turn(model, host, tid))
+        if hasattr(worker, "switched"):
+            worker.switched.connect(self._on_chat_model_switched)
         if hasattr(worker, "tool_progress"):
             worker.tool_progress.connect(lambda message, tid=turn_id: self._on_hermes_tool_progress_for_turn(message, tid))
         if hasattr(worker, "thinking_started"):
@@ -2356,6 +3211,10 @@ class MainWindow(QMainWindow):
 
     def _finish_current_turn(self, turn_id: str | None = None, *, open_followup: bool) -> None:
         current_id = self._turn_gate.finish(turn_id)
+        # 인수인계문은 전환 직후 한 턴만 얹는다. 그 뒤로는 새 모델이 스스로 쌓은
+        # 대화가 맥락이 되므로, 계속 붙여두면 토큰만 먹는다.
+        self._pending_handoff = ""
+        self._pending_handoff_ctx = None
         self._chat.set_generating(False)
         if open_followup:
             self._open_voice_followup_window()
@@ -5027,14 +5886,31 @@ class MainWindow(QMainWindow):
             "오늘 온 메일·받은편지 요약: email.list_messages (args.today=true 또는 since=YYYY-MM-DD). "
             "본문 읽기: email.read_message (uid). 일정: workspace.open_calendar + calendar.*. "
             "기본 화면/홈으로: workspace.open_assistant (Companion이면 ide.exit_companion 후). "
-            "마이크 끄기: voice.mic_off / 켜기: voice.mic_on / 토글: voice.toggle_mic. ",
+            "마이크 끄기: voice.mic_off / 켜기: voice.mic_on / 토글: voice.toggle_mic. "
+            "반복 예약(\"매일 9시에 뉴스 3개\", \"매주 금요일 메일 정리\", \"30분마다 확인\"): "
+            "routine.create 로 등록하라. task 에는 사용자가 말한 문장을 **그대로** 넣어라 "
+            "— 요약하거나 액션으로 쪼개면 개수·형식 조건을 잃는다. "
+            "kind=daily|weekly|interval|once, time_of_day=HH:MM, weekdays=mon,fri, "
+            "interval_minutes=N, at=ISO(once). deliver 는 기본 chat,notify 이고 "
+            "사용자가 \"소리로\"·\"알림 말고\" 같은 말을 하면 그때만 바꿔라. "
+            "루틴이 **오늘의 사실**(뉴스·날씨·환율·주가·경기 결과)을 다뤄야 하면 "
+            "search 에 검색어를 반드시 넣어라 — 넣지 않으면 모델이 그럴듯한 가짜를 "
+            "지어낸다. 예: task=\"오늘 주요 뉴스 3개 정리\", search=\"한국 주요 뉴스 속보\". "
+            "계산·번역·글쓰기처럼 지식만으로 되는 일은 search 를 비워 둬라. "
+            "이미 있는 것 보기/고치기/지우기: routine.list / routine.update / routine.delete "
+            "(끄기만 원하면 지우지 말고 update enabled=false). 지금 한 번 돌리기: routine.run. "
+            "등록·변경하면 Iris Wiki IRIS 칸에 자동으로 남으니 따로 wiki 저장을 부르지 마라. ",
         )
         if root:
             bits.append(f"Project root: {root}")
             bits.append(
                 "바이브코딩은 Iris 채팅으로 진행합니다. IDE 내장 AI를 대체하지 않습니다."
             )
-        return [{"role": "system", "content": "\n".join(bits)}, *messages]
+        payload = [{"role": "system", "content": "\n".join(bits)}, *messages]
+        if self._pending_handoff:
+            # 모델을 막 갈아탔고 원문이 새 컨텍스트에 안 들어간다 — 요약을 얹는다.
+            payload.insert(1, {"role": "system", "content": self._pending_handoff})
+        return payload
 
     def _on_ide_icon(self) -> None:
         if self._hero_exit_pending:
@@ -6807,7 +7683,13 @@ class MainWindow(QMainWindow):
     def _open_settings_dialog(self) -> None:
         # ponytail: SetupWizard와 동일 — frameless MainWindow + modal child가
         # Windows에서 0xC0000409 크래시 유발. 설정은 독립 top-level로 연다.
-        dlg = SettingsDialog(self._settings, self._db, None, microphone=self._mic)
+        dlg = SettingsDialog(
+            self._settings,
+            self._db,
+            None,
+            microphone=self._mic,
+            routine_runner=self._run_routine_now,
+        )
         try:
             fg = self.frameGeometry()
             dlg.adjustSize()
@@ -6822,6 +7704,9 @@ class MainWindow(QMainWindow):
             if sel is None:
                 return
             self._refresh_chat_history_panel()
+            # 설정에서 모델·History·자동 전환이 바뀐다 — IRIS 칸에 반영하고
+            # 무엇이 달라졌는지 History 에도 남긴다.
+            QTimer.singleShot(0, self._sync_iris_wiki)
             self._settings.ollama_base_url = sel.ollama_base_url
             self._settings.ollama_model = sel.ollama_model
             self._settings.hermes_command = sel.hermes_command
@@ -7035,6 +7920,21 @@ class MainWindow(QMainWindow):
                 self._email_chat_worker.wait(1500)
             if self._boot_checks_worker is not None and self._boot_checks_worker.isRunning():
                 self._boot_checks_worker.wait(3000)
+            if (
+                self._history_embed_worker is not None
+                and self._history_embed_worker.isRunning()
+            ):
+                self._history_embed_worker.request_cancel()
+                self._history_embed_worker.wait(2000)
+            if (
+                self._handoff_summary_worker is not None
+                and self._handoff_summary_worker.isRunning()
+            ):
+                self._handoff_summary_worker.request_cancel()
+                self._handoff_summary_worker.wait(2000)
+            if self._routine_worker is not None and self._routine_worker.isRunning():
+                self._routine_worker.request_cancel()
+                self._routine_worker.wait(2000)
             if (
                 self._startup_health_worker is not None
                 and self._startup_health_worker.isRunning()

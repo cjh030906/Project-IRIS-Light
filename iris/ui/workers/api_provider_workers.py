@@ -8,6 +8,12 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from iris.infrastructure import openai_compat_client as oai
 from iris.storage.api_providers import ApiProvider
+from iris.ui.workers.chat_attempt import (
+    ApiCall,
+    ChatAttempt,
+    decide_fallback,
+    normalize_attempts,
+)
 
 
 def _host_label(base_url: str) -> str:
@@ -103,6 +109,9 @@ class OpenAICompatChatWorker(QThread):
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
+    # (새 모델, 사유, 이미 흘려보낸 content 가 있었는지)
+    switched = pyqtSignal(str, str, bool)
+
     def __init__(
         self,
         base_url: str,
@@ -112,6 +121,7 @@ class OpenAICompatChatWorker(QThread):
         *,
         display_model: str = "",
         auth_style: str = "bearer",
+        attempts: list[ChatAttempt] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -122,30 +132,82 @@ class OpenAICompatChatWorker(QThread):
         self._messages = messages
         self._display = display_model or model
         self._cancel = False
+        if not attempts:
+            attempts = [
+                ChatAttempt(
+                    display_model or model,
+                    messages,
+                    label=display_model or model,
+                    target=ApiCall(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        auth_style=auth_style,
+                    ),
+                )
+            ]
+        self._attempts = normalize_attempts(attempts, model=model, messages=messages)
+        self._final_model = self._attempts[0].model
+
+    @property
+    def final_model(self) -> str:
+        return self._final_model
 
     def request_cancel(self) -> None:
         self._cancel = True
 
+    def _sleep_ms(self, delay_ms: int) -> None:
+        waited = 0
+        while waited < delay_ms and not self._cancel:
+            step = min(100, delay_ms - waited)
+            self.msleep(step)
+            waited += step
+
     def run(self) -> None:
-        host = _host_label(self._base_url)
-        self.connecting.emit(self._display, host)
-        parts: list[str] = []
-        try:
-            for ev in oai.stream_chat(
-                self._base_url,
-                self._api_key,
-                self._model,
-                self._messages,
-                auth_style=self._auth_style,
-            ):
-                if self._cancel:
-                    break
-                ch = ev.get("content")
-                if isinstance(ch, str) and ch:
-                    parts.append(ch)
-                    self.content_chunk.emit(ch)
-                if ev.get("done"):
-                    break
-            self.finished_ok.emit("".join(parts))
-        except Exception as exc:
-            self.failed.emit(str(exc))
+        last_error = ""
+        for index, attempt in enumerate(self._attempts):
+            if self._cancel:
+                break
+            call = attempt.target
+            if call is None:
+                last_error = f"{attempt.model}: 호출 정보 없음"
+                continue
+            self._final_model = attempt.model
+            self.connecting.emit(attempt.label, _host_label(call.base_url))
+
+            parts: list[str] = []
+            try:
+                for ev in oai.stream_chat(
+                    call.base_url,
+                    call.api_key,
+                    call.model,
+                    attempt.messages,
+                    auth_style=call.auth_style,
+                ):
+                    if self._cancel:
+                        break
+                    ch = ev.get("content")
+                    if isinstance(ch, str) and ch:
+                        parts.append(ch)
+                        self.content_chunk.emit(ch)
+                    if ev.get("done"):
+                        break
+                self.finished_ok.emit("".join(parts))
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+
+            has_next = index + 1 < len(self._attempts)
+            if self._cancel or not has_next:
+                break
+            step = decide_fallback(last_error, index)
+            if step is None:
+                break
+            self._sleep_ms(step.delay_ms)
+            if self._cancel:
+                break
+            nxt = self._attempts[index + 1]
+            self.switched.emit(nxt.model, nxt.reason_hint or step.reason, bool(parts))
+
+        if not self._cancel:
+            self.failed.emit(last_error or "모델 응답 실패")

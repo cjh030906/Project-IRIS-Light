@@ -100,6 +100,11 @@ from iris.ui.settings.hud_dialog import (
     make_scroll_body,
     make_title,
 )
+from iris.ui.settings.history_failover_box import (
+    build_history_failover_box,
+    save_history_failover,
+)
+from iris.ui.settings.routines_box import build_routines_box
 from iris.ui.settings.voice_runtime_status import VoiceRuntimeStatusWidget
 from iris.ui.shared.theme_tokens import TOKENS
 
@@ -238,8 +243,11 @@ class SettingsDialog(QDialog):
         parent=None,
         *,
         microphone: MicrophoneController | None = None,
+        routine_runner=None,
     ) -> None:
         super().__init__(parent)
+        # 루틴 '지금 실행' 콜백 — 이 창은 부모 없이 떠서 창을 직접 못 찾는다.
+        self._routine_runner = routine_runner
         configure_hud_dialog(
             self,
             title="Iris Light 설정",
@@ -351,6 +359,14 @@ class SettingsDialog(QDialog):
             chat_box = build_chat_title_box(db)
             self._chat_title_basis = chat_box.title_basis
             content_lay.addWidget(make_collapsible(chat_box))
+            self._history_failover_box = build_history_failover_box(db)
+            content_lay.addWidget(make_collapsible(self._history_failover_box))
+            self._routines_box = build_routines_box(
+                db,
+                model_names=self._known_model_names(),
+                on_run_now=self._request_routine_run,
+            )
+            content_lay.addWidget(make_collapsible(self._routines_box))
             content_lay.addWidget(make_collapsible(self._build_voice_box()))
             content_lay.addWidget(make_collapsible(self._build_permission_box()))
             content_lay.addWidget(make_collapsible(self._build_learning_runtime_box()))
@@ -373,6 +389,40 @@ class SettingsDialog(QDialog):
         if db is not None:
             self._sync_ide_selection_ui_quick()
             self._reload_account_list()
+
+    def _known_model_names(self) -> list[str]:
+        """루틴 모델 고정 콤보를 채울 후보. 조회 실패는 빈 목록으로 넘긴다."""
+        names: list[str] = []
+        current = (self._settings.ollama_model or "").strip()
+        if current:
+            names.append(current)
+        try:
+            from iris.storage.api_providers import load_api_providers, runtime_model_id
+
+            for provider in load_api_providers(self._db) if self._db else []:
+                for model in provider.models:
+                    rid = runtime_model_id(provider.id, model)
+                    if rid not in names:
+                        names.append(rid)
+        except Exception:  # noqa: BLE001
+            pass
+        return names
+
+    def _request_routine_run(self, routine_id: int) -> bool:
+        """설정 창의 '지금 실행'.
+
+        이 창은 frameless 크래시를 피하려고 **부모 없이** 뜬다(위 주석 참고).
+        그래서 self.parent() 로는 MainWindow 에 닿지 못한다 — 실행 콜백을 생성 시
+        직접 받는다.
+        """
+        from iris.storage.routines import get_routine
+
+        if self._routine_runner is None or self._db is None:
+            return False
+        routine = get_routine(self._db, routine_id)
+        if routine is None:
+            return False
+        return bool(self._routine_runner(routine))
 
     @staticmethod
     def _open_signup_url(url: str) -> None:
@@ -2701,6 +2751,9 @@ class SettingsDialog(QDialog):
             save_learning_preferences(self._db, learning_prefs)
             self._persist_api_providers()
             self._persist_chat_title_basis()
+            box = getattr(self, "_history_failover_box", None)
+            if box is not None:
+                save_history_failover(self._db, box)
         self._persist_search_calendar_api_keys()
         try:
             from iris.infrastructure.hermes_credentials import resolve_hermes_api_key
