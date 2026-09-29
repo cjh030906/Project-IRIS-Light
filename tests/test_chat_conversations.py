@@ -6,8 +6,10 @@ import tempfile
 from pathlib import Path
 from unittest import TestCase
 
+from iris.runtime.chat_session import ChatSession, workspace_needs_fresh_chat
 from iris.storage.conversations import (
     DEFAULT_TITLE,
+    TITLE_BASIS_FIRST,
     active_conversation_id,
     append_message,
     clear_conversation_messages,
@@ -17,15 +19,18 @@ from iris.storage.conversations import (
     get_conversation,
     history_dicts,
     list_conversations,
+    load_title_basis,
     pop_last_user_message,
+    refresh_conversation_title,
     rename_conversation,
+    save_title_basis,
     set_active_conversation_id,
     start_new_conversation,
     suggest_title,
+    summarize_reply,
     summarize_work_title,
     title_from_text,
 )
-from iris.runtime.chat_session import ChatSession, workspace_needs_fresh_chat
 from iris.storage.database import Database
 
 
@@ -84,11 +89,20 @@ class ChatConversationTests(TestCase):
         assert kept is not None
         self.assertEqual(kept.title, "PDF 저장 종료 오류 수정")
 
-    def test_same_topic_keeps_first_title(self) -> None:
+    def test_user_text_does_not_become_title(self) -> None:
+        conv = create_conversation(self.db)
+        append_message(self.db, conv.id, "user", "IRIS 구조 알려줘")
+        reloaded = get_conversation(self.db, conv.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.title, DEFAULT_TITLE)
+
+    def test_first_basis_keeps_first_topic(self) -> None:
+        save_title_basis(self.db, TITLE_BASIS_FIRST)
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
-        append_message(self.db, conv.id, "assistant", "ui/system으로 나뉩니다.")
-        append_message(self.db, conv.id, "user", "그럼 패키지 폴더는 어디야?")
+        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
+        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
+        append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
         self.assertEqual(reloaded.title, "IRIS 구조")
@@ -96,12 +110,39 @@ class ChatConversationTests(TestCase):
     def test_topic_shift_updates_title(self) -> None:
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
-        append_message(self.db, conv.id, "assistant", "ui/system으로 나뉩니다.")
+        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
         append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
+        append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
         self.assertEqual(reloaded.title, "내일 부산 여행 일정")
         self.assertFalse(reloaded.title_locked)
+
+    def test_first_basis_skips_reply_before_user(self) -> None:
+        save_title_basis(self.db, TITLE_BASIS_FIRST)
+        conv = create_conversation(self.db)
+        append_message(self.db, conv.id, "assistant", "무엇을 도와드릴까요?")
+        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
+        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
+        reloaded = get_conversation(self.db, conv.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.title, "IRIS 구조")
+
+    def test_switching_basis_retitles_unlocked_chat(self) -> None:
+        conv = create_conversation(self.db)
+        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
+        append_message(self.db, conv.id, "assistant", "첫 답변입니다.")
+        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
+        append_message(self.db, conv.id, "assistant", "마지막 답변입니다.")
+        self.assertEqual(get_conversation(self.db, conv.id).title, "내일 부산 여행 일정")
+        save_title_basis(self.db, TITLE_BASIS_FIRST)
+        refresh_conversation_title(self.db, conv.id)
+        self.assertEqual(get_conversation(self.db, conv.id).title, "IRIS 구조")
+        self.assertEqual(load_title_basis(self.db), TITLE_BASIS_FIRST)
+
+    def test_summarize_reply_skips_code_fence(self) -> None:
+        title = summarize_reply("```python\nprint(1)\n```\n설치가 끝났습니다. 이어서 실행하세요.")
+        self.assertEqual(title, "설치가 끝났습니다.")
 
     def test_summaries_are_short_work_titles(self) -> None:
         cases = {

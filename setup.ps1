@@ -72,13 +72,35 @@ function Fail([string]$Message, [string[]]$Hints) {
     Write-Host "전체 기록: $LogFile" -ForegroundColor DarkGray
     if (Test-Path $PipLog) { Write-Host "설치 상세: $PipLog" -ForegroundColor DarkGray }
     Write-Host ""
-    # Inno 대화상자가 읽을 한 줄 — UTF-8. 숨김 창이라 이 파일 없으면 원인 전달이 안 된다.
+    # Inno LoadStringsFromFile 은 UTF-8 BOM + ASCII FAIL: 이 가장 안전하다
     try {
-        [System.IO.File]::WriteAllText($FailReasonFile, "설치 실패: $Message", [System.Text.UTF8Encoding]::new($false))
+        $oneLine = ($Message -replace '[\r\n]+', ' ').Trim()
+        if ($oneLine.Length -gt 300) { $oneLine = $oneLine.Substring(0, 300) + "..." }
+        $payload = "FAIL: $oneLine`r`n설치 실패: $oneLine`r`n"
+        [System.IO.File]::WriteAllText(
+            $FailReasonFile,
+            $payload,
+            (New-Object System.Text.UTF8Encoding $true)
+        )
     } catch { }
     Stop-Log
     exit 1
 }
+
+# 숨김 설치에서 예외가 나도 원인 파일을 남긴다 (빈 Setup 대화상자 방지)
+trap {
+    try {
+        $m = $_.Exception.Message
+        if (-not $m) { $m = "$_" }
+        Fail "스크립트 오류: $m" @(
+            "설치 폴더에서 setup.bat 을 다시 실행하세요",
+            ".\setup.ps1 -Recreate"
+        )
+    } catch {
+        exit 1
+    }
+}
+
 
 # Inno/숨김 창에서도 방금 깐 Python 이 보이도록 Machine+User PATH 를 다시 읽는다.
 function Refresh-ProcessPath {
@@ -300,25 +322,204 @@ Write-Ok "Python $PyVersion ($PyExe $($PyArgs -join ' '))"
 # ------------------------------------------------------- 2. 가상환경
 Write-Step "가상환경(.venv) 준비"
 
+function Test-VenvUsable([string]$Path) {
+    $cfg = Join-Path $Path "pyvenv.cfg"
+    $py = Join-Path $Path "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $cfg)) { return $false }
+    if (-not (Test-Path -LiteralPath $py)) { return $false }
+    # 잠긴/접근 거부 python.exe 는 “존재”만으로 쓰면 이후 단계에서 trap 으로 죽는다
+    try {
+        $item = Get-Item -LiteralPath $py -ErrorAction Stop
+        if ($item.Length -lt 1024) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+# .venv\Scripts\python.exe / IRIS.exe 가 살아 있으면 Remove-Item 이
+# 「'python.exe' 경로에 대한 액세스가 거부되었습니다」로 즉시 실패한다
+# (Inno 가 매번 -Recreate 로 돌릴 때 재설치·업그레이드 PC에서 흔함).
+function Stop-IrisVenvHolders {
+    param([string]$Tree, [string]$AppRoot = $Root)
+    if (-not $Tree) { return }
+    $norm = $null
+    $app = $null
+    try { $norm = [IO.Path]::GetFullPath($Tree).TrimEnd('\') } catch { return }
+    if ($AppRoot) {
+        try { $app = [IO.Path]::GetFullPath($AppRoot).TrimEnd('\') } catch { $app = $null }
+    }
+    $irisExe = if ($app) { Join-Path $app "IRIS.exe" } else { $null }
+    $me = $PID
+    $killed = 0
+    foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+        if (-not $proc -or $proc.ProcessId -eq $me) { continue }
+        $exe = [string]$proc.ExecutablePath
+        $cmd = [string]$proc.CommandLine
+        $hit = $false
+        if ($exe -and $exe.StartsWith($norm, [StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
+        if ($irisExe -and $exe -and $exe.Equals($irisExe, [StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
+        if (-not $hit -and $cmd -and $cmd.IndexOf($norm, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $hit = $true
+        }
+        if (-not $hit) { continue }
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+            $killed++
+        } catch { }
+    }
+    if ($killed -gt 0) {
+        Write-Warn "잠금 프로세스 $killed 개 종료 (.venv / IRIS)"
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# Remove-Item 실패(Access Denied) 시 rename → trash 로 자리를 비운다.
+# 이미 쓴 방법(강제 Remove만 / SilentlyContinue)과 다르게 hermes force_retire 와 같은 계약.
+function Remove-TreeSafe {
+    param([string]$Path, [string]$Label = ".venv")
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $true }
+
+    Stop-IrisVenvHolders -Tree $Path -AppRoot $Root
+
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        } catch {
+            Write-Warn "$Label 삭제 재시도 $i/5: $($_.Exception.Message)"
+            Stop-IrisVenvHolders -Tree $Path -AppRoot $Root
+            Start-Sleep -Milliseconds (400 * $i)
+        }
+    }
+
+    $parent = Split-Path -Parent $Path
+    $leaf = Split-Path -Leaf $Path
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $trashName = "$leaf.trash-$stamp"
+    $trash = Join-Path $parent $trashName
+
+    $moved = $false
+    try {
+        [System.IO.Directory]::Move($Path, $trash)
+        $moved = $true
+        Write-Warn "$Label 잠금 — $trashName 으로 이동 후 정리"
+    } catch {
+        try {
+            Rename-Item -LiteralPath $Path -NewName $trashName -ErrorAction Stop
+            $moved = $true
+            Write-Warn "$Label 잠금 — $trashName 으로 이름 변경 후 정리"
+        } catch {
+            Write-Warn "$Label 디렉터리 rename 실패: $($_.Exception.Message)"
+        }
+    }
+
+    # 디렉터리 rename 이 막히면 잠긴 exe 만 치우고 트리를 다시 지운다
+    if (-not $moved -and (Test-Path -LiteralPath $Path)) {
+        foreach ($rel in @("Scripts\python.exe", "Scripts\pythonw.exe", "Scripts\IRIS.exe")) {
+            $locked = Join-Path $Path $rel
+            if (-not (Test-Path -LiteralPath $locked)) { continue }
+            $q = "$locked.quarantine-$stamp"
+            try {
+                [System.IO.File]::Move($locked, $q)
+                Write-Warn "$Label 파일 quarantine: $rel"
+            } catch {
+                try {
+                    Rename-Item -LiteralPath $locked -NewName ((Split-Path $rel -Leaf) + ".quarantine-$stamp") -ErrorAction Stop
+                } catch { }
+            }
+        }
+        Stop-IrisVenvHolders -Tree $Path -AppRoot $Root
+        Start-Sleep -Milliseconds 400
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        } catch { }
+        try {
+            [System.IO.Directory]::Move($Path, $trash)
+            $moved = $true
+        } catch {
+            Write-Warn "$Label 최종 이동 실패: $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    if (-not $moved) { return -not (Test-Path -LiteralPath $Path) }
+
+    # ponytail: 설치를 막지 않도록 trash 는 best-effort. 실패해도 새 .venv 자리는 비었다.
+    try {
+        $empty = Join-Path $parent ".iris-empty-wipe-$stamp"
+        New-Item -ItemType Directory -Force -Path $empty | Out-Null
+        $null = & robocopy $empty $trash /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+        Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $trash -Recurse -Force -ErrorAction SilentlyContinue
+    } catch { }
+    # 오래된 trash 잔존 ≤3
+    try {
+        $old = @(Get-ChildItem -LiteralPath $parent -Directory -Filter "$leaf.trash-*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+        if ($old.Count -gt 3) {
+            $old | Select-Object -Skip 3 | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch { }
+    return -not (Test-Path -LiteralPath $Path)
+}
+
+function Fail-VenvLocked([string]$Detail) {
+    Fail "가상환경 정리 실패 (파일 잠금): $Detail" @(
+        "실행 중인 IRIS / 터미널의 .venv python 을 모두 종료하세요",
+        "작업 관리자에서 IRIS.exe · python.exe · pythonw.exe 확인",
+        "백신/Controlled Folder Access 가 설치 폴더를 잠그면 예외 추가 후 setup.bat 재실행",
+        ".\setup.ps1 -Recreate"
+    )
+}
+
 if ($Recreate -and (Test-Path $VenvPath)) {
-    Write-Info "-Recreate: 기존 .venv 삭제"
-    Remove-Item -Recurse -Force $VenvPath
+    Write-Info "-Recreate: 기존 .venv 삭제 (잠금 해제 포함)"
+    if (-not (Remove-TreeSafe -Path $VenvPath -Label ".venv")) {
+        Fail-VenvLocked $VenvPath
+    }
 }
 
 $VenvPy = Join-Path $VenvPath "Scripts\python.exe"
+$VenvCfg = Join-Path $VenvPath "pyvenv.cfg"
 
-if (Test-Path $VenvPy) {
-    $VenvVersion = & $VenvPy -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-    if (-not $VenvVersion -or $VenvVersion -notmatch '^3\.(11|12|13)$') {
+# Scripts만 남고 pyvenv.cfg 가 없으면 python 이 "No pyvenv.cfg" 로 즉사한다 → 자동 재생성
+if ((Test-Path $VenvPath) -and -not (Test-VenvUsable $VenvPath)) {
+    Write-Warn "깨진 .venv 감지 — 삭제 후 다시 만듭니다"
+    if (-not (Remove-TreeSafe -Path $VenvPath -Label ".venv")) {
+        Fail-VenvLocked $VenvPath
+    }
+}
+
+if (Test-VenvUsable $VenvPath) {
+    try {
+        $VenvVersion = & $VenvPy -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+    } catch {
+        Write-Warn ".venv python 실행 거부 — 재생성합니다: $($_.Exception.Message)"
+        if (-not (Remove-TreeSafe -Path $VenvPath -Label ".venv")) {
+            Fail-VenvLocked "$VenvPy ($($_.Exception.Message))"
+        }
+        $VenvVersion = $null
+    }
+}
+if ((Test-Path $VenvPath) -and (Test-VenvUsable $VenvPath) -and $VenvVersion) {
+    if ($VenvVersion -notmatch '^3\.(11|12|13)$') {
         Fail "기존 .venv의 Python($VenvVersion)은 Hermes와 호환되지 않습니다." @(
             ".\setup.ps1 -Recreate 로 3.11–3.13 가상환경을 새로 만드세요"
         )
     }
     Write-Ok ".venv 이미 존재 — 재사용 (새로 만들려면 -Recreate)"
 } else {
+    if (Test-Path $VenvPath) {
+        # 반쯤 남은 트리면 venv 생성이 실패한다
+        if (-not (Remove-TreeSafe -Path $VenvPath -Label ".venv")) {
+            Fail-VenvLocked $VenvPath
+        }
+    }
     Write-Info "생성 중..."
     & $PyExe @PyArgs -m venv $VenvPath
-    if (-not (Test-Path $VenvPy)) {
+    if (-not (Test-VenvUsable $VenvPath)) {
         Fail "가상환경 생성에 실패했습니다." @(
             "$PyExe $($PyArgs -join ' ') -m ensurepip 실행 후 재시도",
             "Microsoft Store 버전 Python은 문제가 생길 수 있습니다. python.org 배포판을 권장합니다"
@@ -326,12 +527,13 @@ if (Test-Path $VenvPy) {
     }
     Write-Ok "생성 완료: $VenvPath"
 }
+$VenvPy = Join-Path $VenvPath "Scripts\python.exe"
 
 # ------------------------------------------------------- 3. pip 업그레이드
 Write-Step "pip 업그레이드"
 
 # PATH 에 깨진 정션/마운트(WinError 448)가 있으면 pip 이 설치 중 죽는다.
-# (예: 일부 클라우드 PC · Cua driver bin 등)
+# (예: 일부 클라우드 PC · Cua driver bin 등) — 0.1.7 검증된 최소 스크럽만 유지
 function Set-PipSafePath {
     $keep = New-Object System.Collections.Generic.List[string]
     foreach ($part in @(
@@ -354,8 +556,48 @@ function Set-PipSafePath {
         }
     }
     $env:Path = ($keep -join ';')
+    $env:PYTHONNOUSERSITE = "1"
 }
+
+function Get-PipLogErrorTail {
+    if (-not (Test-Path -LiteralPath $PipLog)) { return "" }
+    try {
+        $lines = Get-Content -LiteralPath $PipLog -Tail 120 -ErrorAction Stop
+    } catch { return "" }
+    $hit = $lines | Where-Object { $_ -match 'ERROR:|WinError\s*\d+|No matching distribution|Could not find|SSLError|ProxyError' }
+    if (-not $hit) { $hit = $lines | Select-Object -Last 5 }
+    $err = ($hit | Select-Object -Last 3) -join " | "
+    if ($err.Length -gt 280) { $err = $err.Substring($err.Length - 280) }
+    return $err
+}
+
+function Ensure-VenvPip {
+    & $VenvPy -m pip --version 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $true }
+    Write-Warn "venv pip 없음 — ensurepip 실행"
+    & $VenvPy -m ensurepip --upgrade 2>$null | Out-Null
+    & $VenvPy -m pip --version 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Invoke-PipInstallRequirements {
+    param([string[]]$ExtraArgs = @())
+    Set-PipSafePath
+    if (-not (Ensure-VenvPip)) { return 1 }
+    & $VenvPy -m pip install --upgrade pip --disable-pip-version-check --no-input -q
+    & $VenvPy -m pip install -r $Requirements --log $PipLog `
+        --disable-pip-version-check --no-input --retries 8 --timeout 120 `
+        @ExtraArgs
+    return $LASTEXITCODE
+}
+
 Set-PipSafePath
+if (-not (Ensure-VenvPip)) {
+    Fail "가상환경에 pip 를 설치하지 못했습니다." @(
+        ".\setup.ps1 -Recreate 로 다시 시도하세요",
+        "python.org 에서 Python 3.12 설치 시 pip 옵션을 켜세요"
+    )
+}
 
 & $VenvPy -m pip install --upgrade pip --disable-pip-version-check --no-input -q
 if ($LASTEXITCODE -ne 0) { Write-Warn "pip 업그레이드 실패 — 기존 pip으로 계속합니다" } else { Write-Ok "pip 최신" }
@@ -364,7 +606,10 @@ if ($LASTEXITCODE -ne 0) { Write-Warn "pip 업그레이드 실패 — 기존 pip
 Write-Step "의존성 설치 (requirements.txt) — 수 분 걸릴 수 있습니다"
 
 $Requirements = Join-Path $Root "requirements.txt"
-# 끊긴 다운로드·SSL 가로채기 환경까지 — 재시도 + trusted-host 폴백
+if (-not (Test-Path -LiteralPath $Requirements)) {
+    Fail "requirements.txt 가 없습니다: $Requirements" @("Setup.exe 를 다시 받아 설치하세요")
+}
+
 $pipRc = 1
 $pipAttempts = @(
     @{ Extra = @(); Label = "기본" },
@@ -375,19 +620,15 @@ $pipAttempts = @(
             "--trusted-host", "files.pythonhosted.org",
             "--trusted-host", "pypi.python.org"
         )
-        Label = "trusted-host 폴백"
+        Label = "trusted-host"
     }
 )
 foreach ($attempt in 1..$pipAttempts.Count) {
     $spec = $pipAttempts[$attempt - 1]
     if ($attempt -gt 1) {
-        Write-Warn "$($spec.Label) $attempt/$($pipAttempts.Count) — 이미 받은 패키지는 건너뜁니다"
-        Set-PipSafePath
+        Write-Warn "$($spec.Label) $attempt/$($pipAttempts.Count)"
     }
-    & $VenvPy -m pip install -r $Requirements --log $PipLog `
-        --disable-pip-version-check --no-input --retries 5 --timeout 60 `
-        @($spec.Extra)
-    $pipRc = $LASTEXITCODE
+    $pipRc = Invoke-PipInstallRequirements -ExtraArgs $spec.Extra
     if ($pipRc -eq 0) { break }
 }
 if ($pipRc -ne 0) {
@@ -430,20 +671,52 @@ if missing:
     sys.exit(1)
 print("OK")
 '@
-$checkFile = Join-Path $env:TEMP "iris_setup_check.py"
+$checkFile = Join-Path $Root "_iris_setup_check.py"
 Set-Content -Path $checkFile -Value $check -Encoding utf8
-# 검사 결과는 stdout으로만 받는다 — 네이티브 stderr를 2>&1 로 합치면
-# PowerShell 5.1이 성공한 실행도 실패로 표시한다
 $result = & $VenvPy $checkFile
 $checkRc = $LASTEXITCODE
 Remove-Item $checkFile -ErrorAction SilentlyContinue
 
+# 이전 실패로 비어 있는 .venv 가 재사용된 경우 — 한 번 지우고 재설치 (setup.bat -Recreate 와 동일)
 if ($checkRc -ne 0) {
-    Fail "핵심 패키지 import 검증 실패: $result" @(
-        ".\setup.ps1 -Recreate 로 재설치",
-        "네트워크/프록시 상태를 확인하세요",
-        "사내망이라면: $VenvPy -m pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org",
-        "Visual C++ 재배포 패키지가 없으면 PyQt6 로드가 실패할 수 있습니다: winget install -e --id Microsoft.VCRedist.2015+.x64"
+    Write-Warn "핵심 패키지 없음 — .venv 재생성 후 1회 재설치합니다"
+    try {
+        if (Test-Path $VenvPath) {
+            if (-not (Remove-TreeSafe -Path $VenvPath -Label ".venv")) {
+                throw "venv locked: $VenvPath"
+            }
+        }
+        & $PyExe @PyArgs -m venv $VenvPath
+        if (-not (Test-VenvUsable $VenvPath)) { throw "venv recreate failed" }
+        $VenvPy = Join-Path $VenvPath "Scripts\python.exe"
+        $trusted = @(
+            "--trusted-host", "pypi.org",
+            "--trusted-host", "files.pythonhosted.org",
+            "--trusted-host", "pypi.python.org"
+        )
+        $null = Invoke-PipInstallRequirements -ExtraArgs $trusted
+        Set-Content -Path $checkFile -Value $check -Encoding utf8
+        $result = & $VenvPy $checkFile
+        $checkRc = $LASTEXITCODE
+        Remove-Item $checkFile -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warn "재설치 복구 중 오류: $($_.Exception.Message)"
+        $checkRc = 1
+    }
+}
+
+if ($checkRc -ne 0) {
+    $pipHint = Get-PipLogErrorTail
+    if ($pipHint) {
+        $msg = "패키지 설치 실패: $pipHint"
+    } else {
+        $short = "$result"
+        if ($short.Length -gt 160) { $short = $short.Substring(0, 160) + "..." }
+        $msg = "핵심 패키지 검증 실패: $short"
+    }
+    Fail $msg @(
+        "인터넷 연결 확인 후 setup.bat 재실행",
+        "상세 로그: $PipLog"
     )
 }
 if ($pipRc -ne 0) {

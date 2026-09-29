@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -67,6 +71,22 @@ def hud_dialog_qss() -> str:
             font-weight: 600;
             color: {t.text_accent};
         }}
+        QGroupBox[sectionBody="true"] {{
+            margin-top: 0px;
+            padding-top: 8px;
+        }}
+        QToolButton#HudSectionToggle {{
+            background: transparent;
+            border: none;
+            color: {t.neon_cyan};
+            font-size: {t.font_size_heading};
+            font-weight: 600;
+            text-align: left;
+            padding: 8px 2px 4px 2px;
+        }}
+        QToolButton#HudSectionToggle:hover {{
+            color: {t.text_accent};
+        }}
         QGroupBox::title {{
             subcontrol-origin: margin;
             subcontrol-position: top left;
@@ -86,9 +106,49 @@ def hud_dialog_qss() -> str:
         QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
             border: 1px solid {t.accent_border};
         }}
+        QComboBox {{
+            color: {t.text_primary};
+        }}
+        QComboBox:!editable, QComboBox::drop-down:editable {{
+            color: {t.text_primary};
+        }}
+        QComboBox QAbstractItemView {{
+            background-color: {t.space_navy};
+            color: {t.text_primary};
+            border: 1px solid {t.border_color};
+            outline: none;
+            selection-background-color: rgba(37, 99, 235, 0.45);
+            selection-color: {t.text_primary};
+            padding: 4px 0;
+        }}
+        QComboBox QAbstractItemView::item {{
+            color: {t.text_primary};
+            padding: 6px 10px;
+            min-height: 22px;
+        }}
+        QComboBox QAbstractItemView::item:selected {{
+            color: {t.text_primary};
+            background-color: rgba(56, 189, 248, 0.22);
+        }}
         QComboBox::drop-down {{
             border: none;
             width: 22px;
+        }}
+        QSlider::groove:horizontal {{
+            background: {t.border_subtle};
+            height: 6px;
+            border-radius: 3px;
+        }}
+        QSlider::handle:horizontal {{
+            background: {t.neon_cyan};
+            width: 14px;
+            height: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
+        }}
+        QSlider::sub-page:horizontal {{
+            background: rgba(34, 211, 238, 0.45);
+            border-radius: 3px;
         }}
         QCheckBox {{
             color: {t.text_primary};
@@ -150,6 +210,25 @@ def hud_dialog_qss() -> str:
     """
 
 
+class _DeferDarkTitlebar(QObject):
+    """Show 때 다크 타이틀바. 생성 중 winId()는 Windows가 빈 흰 클라이언트를 먼저 그린다."""
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() == QEvent.Type.Show:
+            force_dark_titlebar(watched)
+        return False
+
+
+def _seal_dialog_background(dialog: QDialog) -> None:
+    """스타일시트가 첫 프레임보다 늦어도 지우기 색이 흰색이 아니게."""
+    bg = QColor(TOKENS.space_deep)
+    pal = dialog.palette()
+    pal.setColor(QPalette.ColorRole.Window, bg)
+    pal.setColor(QPalette.ColorRole.Base, bg)
+    dialog.setPalette(pal)
+    dialog.setAutoFillBackground(True)
+
+
 def configure_hud_dialog(
     dialog: QDialog,
     *,
@@ -171,8 +250,11 @@ def configure_hud_dialog(
     dialog.resize(default_w, default_h)
     dialog.setSizeGripEnabled(True)
     dialog.setStyleSheet(hud_dialog_qss())
-    # 네이티브 타이틀바가 OS 라이트모드/강조색에 끌려가지 않도록 앱 다크 테마로 고정
-    force_dark_titlebar(dialog)
+    _seal_dialog_background(dialog)
+    # ponytail: winId()를 여기서 부르면 HWND가 위젯 트리보다 먼저 생겨 흰 화면이 한 박자 뜬다.
+    filt = _DeferDarkTitlebar(dialog)
+    dialog.installEventFilter(filt)
+    dialog._hud_title_filter = filt  # type: ignore[attr-defined]
 
 
 def make_title(text: str) -> QLabel:
@@ -197,6 +279,74 @@ def make_form_label(text: str) -> QLabel:
     lab.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     lab.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
     return lab
+
+
+def make_collapsible(box: QGroupBox, *, expanded: bool = True) -> QWidget:
+    """설정 항목. 기본은 펼침. 헤더를 누르면 본문이 접힌다."""
+    title = box.title() or "항목"
+    box.setTitle("")
+    box.setProperty("sectionBody", True)
+    box.setVisible(expanded)
+
+    wrap = QWidget()
+    lay = QVBoxLayout(wrap)
+    lay.setContentsMargins(0, 4, 0, 0)
+    lay.setSpacing(0)
+
+    btn = QToolButton(wrap)
+    btn.setObjectName("HudSectionToggle")
+    btn.setText(title)
+    btn.setCheckable(True)
+    btn.setChecked(expanded)
+    btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    btn.setArrowType(
+        Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+    )
+    btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _toggle(open_: bool) -> None:
+        box.setVisible(open_)
+        btn.setArrowType(
+            Qt.ArrowType.DownArrow if open_ else Qt.ArrowType.RightArrow
+        )
+
+    btn.toggled.connect(_toggle)
+    lay.addWidget(btn)
+    lay.addWidget(box)
+    return wrap
+
+
+def build_chat_title_box(db) -> QGroupBox:
+    """채팅 제목 기준. combo는 box.title_basis 에 둔다."""
+    from iris.storage.conversations import (
+        TITLE_BASIS_FIRST,
+        TITLE_BASIS_LAST,
+        load_title_basis,
+    )
+
+    box = QGroupBox("채팅")
+    lay = QVBoxLayout(box)
+    lay.setSpacing(TOKENS.spacing_sm)
+    lay.addWidget(
+        make_hint(
+            "채팅 제목은 사용자가 입력한 문장이 아니라, 아이리스 답변의 첫 문장을 요약해 붙입니다. "
+            "마지막 대화는 가장 최근 답변, 첫 대화는 첫 입력에 대한 첫 답변을 기준으로 합니다. "
+            "직접 수정한 제목은 바뀌지 않습니다."
+        )
+    )
+    form = QFormLayout()
+    configure_form(form)
+    combo = QComboBox()
+    combo.addItem("마지막 대화", TITLE_BASIS_LAST)
+    combo.addItem("첫 대화", TITLE_BASIS_FIRST)
+    idx = combo.findData(load_title_basis(db))
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+    combo.setMinimumHeight(32)
+    form.addRow(make_form_label("제목 기준"), combo)
+    lay.addLayout(form)
+    box.title_basis = combo  # type: ignore[attr-defined]
+    return box
 
 
 def configure_form(form: QFormLayout) -> None:
@@ -393,5 +543,8 @@ if __name__ == "__main__":
     assert "IrisHudDialog" in qss or "QDialog#IrisHudDialog" in qss
     assert TOKENS.neon_cyan in qss
     assert "min-width: 148px" in qss
+    assert "QComboBox QAbstractItemView" in qss
+    assert "QSlider::groove:horizontal" in qss
     assert "IrisHudConfirm" in _confirm_qss(accent=TOKENS.warning)
+    assert "HudSectionToggle" in qss
     print("hud_dialog ok")

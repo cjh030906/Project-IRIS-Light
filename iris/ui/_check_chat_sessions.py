@@ -25,10 +25,10 @@ from iris.ui.sidebar.left_sidebar_panel import LeftSidebarPanel
 def _check_history_panel(app: QApplication, db: Database) -> None:
     first = create_conversation(db)
     append_message(db, first.id, "user", "IRIS 구조 알려줘")
-    append_message(db, first.id, "assistant", "ui/system/infrastructure로 나뉩니다.")
+    append_message(db, first.id, "assistant", "ui와 system으로 나뉩니다.")
     second = create_conversation(db)
     append_message(db, second.id, "user", "새 채팅 기능 붙여줘")
-    append_message(db, second.id, "assistant", "사이드바에 붙였습니다.")
+    append_message(db, second.id, "assistant", "채팅 목록을 왼쪽 패널에 붙였습니다.")
 
     panel = ChatHistoryPanel()
     panel.set_conversations(list_conversations(db), active_id=second.id)

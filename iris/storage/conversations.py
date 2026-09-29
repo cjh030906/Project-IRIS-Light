@@ -9,55 +9,18 @@ from datetime import datetime
 from iris.storage.database import Database
 
 ACTIVE_CHAT_PREF_KEY = "active_chat_conversation_id"
+CHAT_TITLE_BASIS_KEY = "chat_title_basis"
+TITLE_BASIS_LAST = "last"
+TITLE_BASIS_FIRST = "first"
 DEFAULT_TITLE = "새 채팅"
 _TITLE_LIMIT = 36
 _USER_TITLE_LIMIT = 48
 
-# ponytail: 어휘 겹침으로 주제 전환을 본다. 오탐이 늘면 LLM 제목 생성으로 교체.
-_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*|[가-힣]{2,}")
-_STOPWORDS = frozenset(
-    {
-        "and",
-        "for",
-        "the",
-        "this",
-        "that",
-        "with",
-        "from",
-        "please",
-        "can",
-        "you",
-        "how",
-        "what",
-        "just",
-        "okay",
-        "yes",
-        "그리고",
-        "그래서",
-        "그럼",
-        "아니면",
-        "또는",
-        "이것",
-        "그것",
-        "저것",
-        "알려줘",
-        "해줘",
-        "해주세요",
-        "짜줘",
-        "관련",
-        "대해",
-        "대한",
-        "뭔가",
-        "어떻게",
-        "무엇",
-        "왜요",
-    }
-)
-_FOLLOWUP_RE = re.compile(
-    r"^(그럼|그리고|그래서|아니면|또는|또|다시|응|네|아니|"
-    r"ok|okay|yes|no|thanks?|고마워|감사|더|자세히|왜요?)\b",
-    re.IGNORECASE,
-)
+# ponytail: 답변 첫 문장을 제목으로 자른다. 품질이 부족하면 LLM 요약으로 교체.
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_TOOL_RE = re.compile(r"IRIS_TOOL_\w+_(?:START|END)")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_SENTENCE_RE = re.compile(r"^(.+?[.!?。])(?:\s|$)")
 
 
 @dataclass(frozen=True)
@@ -90,6 +53,63 @@ def title_from_text(text: str, *, limit: int = _TITLE_LIMIT) -> str:
     if len(body) > limit:
         return body[: max(1, limit - 1)] + "…"
     return body
+
+
+def load_title_basis(db: Database) -> str:
+    raw = (db.get_preference(CHAT_TITLE_BASIS_KEY, TITLE_BASIS_LAST) or "").strip()
+    if raw in (TITLE_BASIS_FIRST, TITLE_BASIS_LAST):
+        return raw
+    return TITLE_BASIS_LAST
+
+
+def save_title_basis(db: Database, basis: str) -> str:
+    value = basis if basis in (TITLE_BASIS_FIRST, TITLE_BASIS_LAST) else TITLE_BASIS_LAST
+    db.set_preference(CHAT_TITLE_BASIS_KEY, value)
+    return value
+
+
+def summarize_reply(text: str, *, limit: int = _TITLE_LIMIT) -> str:
+    """아이리스 답변의 첫 문장을 제목 길이로 자른다."""
+    body = _FENCE_RE.sub(" ", text or "")
+    body = _TOOL_RE.sub(" ", body)
+    body = _LINK_RE.sub(r"\1", body)
+    lines: list[str] = []
+    for line in body.splitlines():
+        line = re.sub(r"^[\s#>*\-]+", "", line)
+        line = re.sub(r"^\d+[.)]\s*", "", line)
+        line = re.sub(r"[*_`]+", "", line).strip()
+        if line:
+            lines.append(line)
+    body = " ".join(lines)
+    if not body:
+        return DEFAULT_TITLE
+    match = _SENTENCE_RE.match(body)
+    sentence = match.group(1) if match else body
+    return title_from_text(sentence, limit=limit)
+
+
+def _message_parts(msg: ChatMessage | dict[str, str]) -> tuple[str, str]:
+    if isinstance(msg, dict):
+        return str(msg.get("role") or ""), str(msg.get("content") or "")
+    return msg.role, msg.content
+
+
+# ponytail: 어휘 겹침으로 주제 전환을 본다. 오탐이 늘면 LLM 제목 생성으로 교체.
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*|[가-힣]{2,}")
+_STOPWORDS = frozenset(
+    {
+        "and", "for", "the", "this", "that", "with", "from", "please", "can", "you",
+        "how", "what", "just", "okay", "yes",
+        "그리고", "그래서", "그럼", "아니면", "또는",
+        "이것", "그것", "저것", "알려줘", "해줘", "해주세요", "짜줘",
+        "관련", "대해", "대한", "뭔가", "어떻게", "무엇", "왜요",
+    }
+)
+_FOLLOWUP_RE = re.compile(
+    r"^(그럼|그리고|그래서|아니면|또는|또|다시|응|네|아니|"
+    r"ok|okay|yes|no|thanks?|고마워|감사|더|자세히|왜요?)\b",
+    re.IGNORECASE,
+)
 
 
 def _tokens(text: str) -> frozenset[str]:
@@ -233,23 +253,30 @@ def summarize_work_title(text: str) -> str:
     return title
 
 
-def suggest_title(messages: list[ChatMessage] | list[dict[str, str]]) -> str:
-    """현재 대화 맥락의 제목 — 첫 주제를 요약하고, 크게 바뀌면 새 주제를 요약."""
+def _user_lines(messages: list[ChatMessage] | list[dict[str, str]]) -> list[str]:
     users: list[str] = []
     for msg in messages:
-        if isinstance(msg, dict):
-            role, content = str(msg.get("role") or ""), str(msg.get("content") or "")
-        else:
-            role, content = msg.role, msg.content
+        role, content = _message_parts(msg)
         body = content.strip()
         if role == "user" and body:
             users.append(body)
+    return users
+
+
+def suggest_title(
+    messages: list[ChatMessage] | list[dict[str, str]],
+    *,
+    basis: str = TITLE_BASIS_LAST,
+) -> str:
+    """작업 내용을 짧게 요약. first는 첫 주제, last는 마지막으로 바뀐 주제."""
+    users = _user_lines(messages)
     if not users:
         return DEFAULT_TITLE
     start = 0
-    for i in range(1, len(users)):
-        if topic_shifted(users[start], [users[i]]):
-            start = i
+    if basis != TITLE_BASIS_FIRST:
+        for i in range(1, len(users)):
+            if topic_shifted(users[start], [users[i]]):
+                start = i
     anchor = _anchor_line(users[start:])
     if not _is_topic_line(anchor):
         return DEFAULT_TITLE
@@ -458,11 +485,14 @@ def _maybe_refresh_title(db: Database, conversation_id: int) -> None:
     messages = list_messages(db, conversation_id)
     if not any(m.role == "assistant" and m.content.strip() for m in messages):
         return
-    suggested = suggest_title(messages)
+    basis = load_title_basis(db)
+    suggested = suggest_title(messages, basis=basis)
     if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
         return
     if conv.title in ("", DEFAULT_TITLE):
         _set_title(db, conversation_id, suggested, locked=False)
+        return
+    if basis == TITLE_BASIS_FIRST:
         return
     users = [
         m.content.strip()
@@ -472,6 +502,22 @@ def _maybe_refresh_title(db: Database, conversation_id: int) -> None:
     anchor = _anchor_line(users) if users else ""
     if anchor and topic_shifted(anchor, [users[-1]]):
         _set_title(db, conversation_id, suggested, locked=False)
+
+
+def refresh_conversation_title(db: Database, conversation_id: int) -> None:
+    """설정 변경 직후, 잠기지 않은 제목을 현재 기준으로 다시 맞춘다."""
+    ensure_chat_schema(db)
+    conv = get_conversation(db, conversation_id)
+    if conv is None or conv.title_locked:
+        return
+    messages = list_messages(db, conversation_id)
+    if not any(m.role == "assistant" and m.content.strip() for m in messages):
+        return
+    suggested = suggest_title(messages, basis=load_title_basis(db))
+    if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
+        return
+    _set_title(db, conversation_id, suggested, locked=False)
+    db._commit()
 
 
 def rename_conversation(db: Database, conversation_id: int, title: str) -> str:

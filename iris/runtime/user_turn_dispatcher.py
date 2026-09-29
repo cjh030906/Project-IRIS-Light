@@ -8,6 +8,12 @@ from .user_turn import UserTurn, UserTurnSource
 
 
 class UserTurnDispatcher(QObject):
+    """텍스트·음성 입력을 한 턴으로 큐잉한다.
+
+    추론과 HTTP는 하지 않는다. UI는 ``turn_ready``를 구독해 실행한다.
+    새 에이전트 도구는 여기가 아니라 Hermes 스킬/MCP에 둔다.
+    """
+
     turn_ready = pyqtSignal(object)  # UserTurn
     turn_queued = pyqtSignal(object, str)  # UserTurn, reason
     turn_dropped = pyqtSignal(object, str)  # UserTurn, reason

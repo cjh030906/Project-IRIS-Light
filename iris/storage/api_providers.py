@@ -23,9 +23,132 @@ BASE_URL_PRESETS: tuple[tuple[str, str], ...] = (
     ("OpenRouter", "https://openrouter.ai/api/v1"),
     ("Anthropic", "https://api.anthropic.com/v1"),
     ("Groq", "https://api.groq.com/openai/v1"),
+    ("Mistral", "https://api.mistral.ai/v1"),
+    ("Cerebras", "https://api.cerebras.ai/v1"),
+    ("Cloudflare Workers AI", "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"),
+    ("SambaNova", "https://api.sambanova.ai/v1"),
+    ("Cohere", "https://api.cohere.com/compatibility/v1"),
+    ("Z.ai (GLM)", "https://api.z.ai/api/paas/v4"),
+    ("Alibaba Qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    ("SiliconFlow", "https://api.siliconflow.cn/v1"),
+    ("ModelScope", "https://api-inference.modelscope.cn/v1"),
+    ("Ollama Cloud", "https://ollama.com/v1"),
+    ("DeepSeek", "https://api.deepseek.com/v1"),
     ("Together", "https://api.together.xyz/v1"),
     ("Ollama (로컬)", "http://127.0.0.1:11434/v1"),
     ("LM Studio (로컬)", "http://127.0.0.1:1234/v1"),
+)
+
+
+@dataclass(frozen=True)
+class FreeLlmOffer:
+    """무료 한도 LLM. 한도는 제공자 정책이라 바뀐다. signup_url은 키 발급 페이지."""
+
+    name: str
+    limit_note: str
+    signup_url: str
+    base_url: str
+
+
+# 2026-09-29 기준. GitHub Models는 2026-07-30 종료라 제외.
+# 상시 무료 한도·가입 무료 할당만. 일회성 유료 체험 크레딧(Together 등)은 넣지 않음.
+FREE_LLM_OFFERS: tuple[FreeLlmOffer, ...] = (
+    FreeLlmOffer(
+        "Google Gemini",
+        "카드 없이 Flash 무료 · 약 15회/분, 1,500회/일",
+        "https://aistudio.google.com/apikey",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
+    FreeLlmOffer(
+        "NVIDIA NIM",
+        "개발용 서버리스 무료 · 전화 인증, 모델별 약 40회/분",
+        "https://build.nvidia.com/settings/api-keys",
+        "https://integrate.api.nvidia.com/v1",
+    ),
+    FreeLlmOffer(
+        "Groq",
+        "카드 없이 상시 무료 · 모델별 분당·일일 한도",
+        "https://console.groq.com/keys",
+        "https://api.groq.com/openai/v1",
+    ),
+    FreeLlmOffer(
+        "OpenRouter",
+        "이름 끝이 :free 인 모델 · 분당·일일 상한",
+        "https://openrouter.ai/keys",
+        "https://openrouter.ai/api/v1",
+    ),
+    FreeLlmOffer(
+        "Mistral",
+        "Experiment 무료 한도 · 낮은 초당 호출",
+        "https://console.mistral.ai/api-keys",
+        "https://api.mistral.ai/v1",
+    ),
+    FreeLlmOffer(
+        "Cerebras",
+        "무료 추론 한도 · 모델별 분당·일일 토큰",
+        "https://cloud.cerebras.ai/",
+        "https://api.cerebras.ai/v1",
+    ),
+    FreeLlmOffer(
+        "Hugging Face",
+        "토큰으로 라우터 추론 · 크레딧·속도 제한",
+        "https://huggingface.co/settings/tokens",
+        "https://router.huggingface.co/v1",
+    ),
+    FreeLlmOffer(
+        "Cloudflare Workers AI",
+        "하루 약 1만 뉴런 무료 · Base URL에 계정 ID 필요",
+        "https://dash.cloudflare.com/profile/api-tokens",
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+    ),
+    FreeLlmOffer(
+        "SambaNova",
+        "개발용 무료 호출 · 모델별 약 20회/일",
+        "https://cloud.sambanova.ai/",
+        "https://api.sambanova.ai/v1",
+    ),
+    FreeLlmOffer(
+        "Cohere",
+        "체험 무료 키 · 비상업 한도",
+        "https://dashboard.cohere.com/api-keys",
+        "https://api.cohere.com/compatibility/v1",
+    ),
+    FreeLlmOffer(
+        "Z.ai (GLM)",
+        "Flash 계열 무료 한도 · 동시 1요청",
+        "https://z.ai/manage-apikey/apikey-list",
+        "https://api.z.ai/api/paas/v4",
+    ),
+    FreeLlmOffer(
+        "Alibaba Qwen",
+        "가입 무료 할당 · 모델·지역별, 이후 종량",
+        "https://modelstudio.console.alibabacloud.com/",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    ),
+    FreeLlmOffer(
+        "SiliconFlow",
+        "일부 오픈 모델 무료 한도",
+        "https://cloud.siliconflow.cn/account/ak",
+        "https://api.siliconflow.cn/v1",
+    ),
+    FreeLlmOffer(
+        "ModelScope",
+        "일일 무료 호출 · 모델별 상한",
+        "https://modelscope.cn/my/myaccesstoken",
+        "https://api-inference.modelscope.cn/v1",
+    ),
+    FreeLlmOffer(
+        "Ollama Cloud",
+        "클라우드 무료 한도 · 세션·주간 제한",
+        "https://ollama.com/settings/keys",
+        "https://ollama.com/v1",
+    ),
+    FreeLlmOffer(
+        "DeepSeek",
+        "가입 무료 크레딧 · 소진 후 종량제",
+        "https://platform.deepseek.com/api_keys",
+        "https://api.deepseek.com/v1",
+    ),
 )
 
 
@@ -59,6 +182,17 @@ class ApiProvider:
             if s and s not in cleaned:
                 cleaned.append(s)
         self.models = cleaned
+
+
+def preset_index_for_base_url(url: str) -> int:
+    """Base URL과 같은 프리셋 칸. 없으면 0(직접 입력)."""
+    needle = (url or "").strip().rstrip("/")
+    if not needle:
+        return 0
+    for index, (_label, preset) in enumerate(BASE_URL_PRESETS):
+        if (preset or "").rstrip("/") == needle:
+            return index
+    return 0
 
 
 def parse_models_text(text: str) -> list[str]:
@@ -273,6 +407,16 @@ if __name__ == "__main__":
     assert parse_models_text("a, b\nc") == ["a", "b", "c"]
     assert mask_api_key("nvapi-abcdefghijklmnop") == "nvap…mnop"
     assert BASE_URL_PRESETS[0] == ("직접 입력", "")
+    names = [o.name for o in FREE_LLM_OFFERS]
+    assert len(names) == len(set(names)) and len(names) >= 10
+    assert all(o.signup_url.startswith("https://") and o.base_url.startswith("http") for o in FREE_LLM_OFFERS)
+    assert any("nvidia" in o.signup_url for o in FREE_LLM_OFFERS)
+    assert any("aistudio.google.com" in o.signup_url for o in FREE_LLM_OFFERS)
+    assert all(preset_index_for_base_url(o.base_url) > 0 for o in FREE_LLM_OFFERS)
+    gemini = next(o for o in FREE_LLM_OFFERS if "Gemini" in o.name)
+    nvidia = next(o for o in FREE_LLM_OFFERS if "NVIDIA" in o.name)
+    assert BASE_URL_PRESETS[preset_index_for_base_url(gemini.base_url)][0] == "Google Gemini"
+    assert BASE_URL_PRESETS[preset_index_for_base_url(nvidia.base_url)][0] == "NVIDIA NIM"
     # 하위호환 — 신규 필드가 없는 기존 저장분
     legacy = _from_dict({"id": "a1", "name": "Old", "base_url": "https://x/v1"})
     assert legacy.auth_style == "bearer"

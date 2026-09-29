@@ -27,7 +27,7 @@ cd Project-IRIS-Light
 | 주의 | `iris/ui/` | HUD — PyQt6 GPL 결합 |
 | 최소화 | `iris/runtime/`, `iris/system/`, `iris/infrastructure/` | Core — 버그/보안 위주 |
 
-상세: [`docs/guides/extending-iris.md`](docs/guides/extending-iris.md)
+상세: [`docs/guides/extending-iris.md`](docs/guides/extending-iris.md) — 패턴(어댑터·전략·인터페이스), 증상별 수정 위치, UI 커스텀, 포크 후 절차.
 
 ---
 

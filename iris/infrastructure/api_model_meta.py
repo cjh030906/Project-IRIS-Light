@@ -36,11 +36,48 @@ def _mentions_tools(detail: str) -> bool:
     return "tool" in text or "function" in text
 
 
-def _state_from_status(status: int) -> str:
-    # 401/403/429/5xx·네트워크는 모델 탓이 아님 → 미확정으로 남김
+def model_is_gone(detail: str) -> bool:
+    """본문이 모델 부재·비채팅일 때만 True.
+
+    options·max_tokens·unsupported parameter 같은 요청 형식 400은 모델이 죽은 게 아니다.
+    """
+    text = (detail or "").lower()
+    needles = (
+        "embedding",
+        "not a chat",
+        "does not support chat",
+        "doesn't support chat",
+        "not found",
+        "does not exist",
+        "doesn't exist",
+        "no longer available",
+        "unknown model",
+        "model_not_found",
+        "invalid model",
+    )
+    return any(n in text for n in needles)
+
+
+def state_from_http(status: int, detail: str = "") -> str:
+    """401/403/429/5xx·형식 400은 미확정(목록 유지). 404·비채팅 본문만 제외."""
     if status in (401, 403, 429) or status == 0 or status >= 500:
         return "unverified"
+    if status == 404 or model_is_gone(detail):
+        return "unavailable"
+    if status in (400, 422):
+        return "unverified"
     return "unavailable"
+
+
+def chat_error_hides_model(err: str) -> bool:
+    """실제 채팅 실패가 모델을 목록에서 뺄 사유인지.
+
+    Hermes options 400·파라미터 거부는 숨기지 않는다.
+    """
+    text = err or ""
+    if "HTTP 404" in text or model_is_gone(text):
+        return True
+    return False
 
 
 def verify_model(
@@ -51,23 +88,26 @@ def verify_model(
     auth_style: str = "bearer",
     timeout: float = 20.0,
 ) -> tuple[str, str, str]:
-    """(model_state, tool_support, detail). tools 실은 1토큰 요청 1회로 판정함."""
+    """(model_state, tool_support, detail). tools 실은 1토큰 요청 1회로 판정함.
+
+    400/422는 도구 거부인지 모델 부재인지 본문만으로 안 갈리므로, 도구 없이 한 번 더 보낸다.
+    """
     try:
         oai.chat_smoke(
             base_url, api_key, model, auth_style=auth_style, tools=True, timeout=timeout
         )
         return "ok", "yes", "tools 200"
     except oai.HttpFail as exc:
-        if exc.status in (400, 422) and _mentions_tools(exc.detail):
-            # 도구만 거부 — 도구 없이 대화가 되는지 재확인
+        if exc.status in (400, 422):
             try:
                 oai.chat_smoke(
                     base_url, api_key, model, auth_style=auth_style, timeout=timeout
                 )
-                return "ok", "no", f"tools 거부: {exc.detail[:120]}"
             except oai.HttpFail as plain:
-                return _state_from_status(plain.status), "unknown", str(plain)
-        return _state_from_status(exc.status), "unknown", str(exc)
+                return state_from_http(plain.status, plain.detail), "unknown", str(plain)
+            tool = "no" if _mentions_tools(exc.detail) else "unknown"
+            return "ok", tool, f"tools 없이 대화 가능: {exc.detail[:120]}"
+        return state_from_http(exc.status, exc.detail), "unknown", str(exc)
 
 
 def tool_support_label(state: str) -> str:
@@ -80,10 +120,14 @@ if __name__ == "__main__":
     assert tool_support_from_listing({"supports_tools": True}) == "yes"
     assert tool_support_from_listing({"id": "x"}) == "unknown"
     assert tool_support_from_listing(None) == "unknown"
-    assert _state_from_status(404) == "unavailable"
-    assert _state_from_status(429) == "unverified"
-    assert _state_from_status(0) == "unverified"
-    assert _state_from_status(503) == "unverified"
+    assert state_from_http(404, "") == "unavailable"
+    assert state_from_http(429, "rate limit") == "unverified"
+    assert state_from_http(0, "") == "unverified"
+    assert state_from_http(503, "overloaded") == "unverified"
+    assert state_from_http(400, "Unsupported parameter(s): options") == "unverified"
+    assert state_from_http(400, "input must be text embedding") == "unavailable"
+    assert chat_error_hides_model("Hermes: HTTP 400 Unsupported parameter(s): options") is False
+    assert chat_error_hides_model("HTTP 404 model not found") is True
     assert _mentions_tools('{"error":"Function calling is not enabled"}')
     assert not _mentions_tools('{"error":"quota exceeded"}')
     assert tool_support_label("unknown") == "도구 미확인"

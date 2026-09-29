@@ -161,6 +161,9 @@
 | IA | `docs/ia/IA.md` |
 | 음성 | `docs/voice.md` · `docs/voice_architecture.md` |
 | API | `docs/api/API-명세서.md` |
+| 확장·수정 위치 | `docs/guides/extending-iris.md` |
+| AI가 읽는 패키지 헤더 | `docs/guides/agent-readable-docs.md` |
+| UI 툴킷 전환 | `docs/guides/ui-toolkit-migration.md` |
 | AI 진단 | `docs/코드리뷰/IRIS_AI_Architecture_Diagnosis.md` |
 | 코드리뷰 조치 | `docs/code-review/조치-소요-사항-총괄표.md` |
 

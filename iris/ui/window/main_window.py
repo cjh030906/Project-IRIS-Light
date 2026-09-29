@@ -40,7 +40,7 @@ from iris.audio.workers import (
 from iris.config.settings import load_settings
 from iris.core.activity_sink import register_activity_sink
 from iris.core.state_machine import AppState, StateMachine
-from iris.infrastructure.ollama_client import OllamaModelInfo
+from iris.infrastructure.ollama_client import OllamaModelInfo, apply_ollama_cleanup
 from iris.knowledge.iris_wiki import IrisWiki
 from iris.storage.api_providers import (
     get_api_provider,
@@ -65,7 +65,13 @@ from iris.monitoring.call_monitor import CallMonitorService
 from iris.runtime import UserTurn, UserTurnDispatcher, UserTurnSource
 from iris.runtime.voice_intents import IntentContext, VoiceIntent, match_intent
 from iris.storage.database import Database
-from iris.storage.model_prefs import load_selected_model, save_selected_model
+from iris.storage.model_prefs import (
+    load_ollama_model_probes,
+    load_selected_model,
+    ollama_cleanup_has_verdict,
+    save_ollama_model_probe,
+    save_selected_model,
+)
 from iris.storage.user_profile import load_user_profile, save_user_profile
 from iris.storage.voice_prefs import VoicePreferences, load_voice_preferences, save_voice_preferences
 from iris.system.api_quota_worker import ApiQuotaWorker
@@ -104,7 +110,14 @@ from iris.ui.widgets.context_ring import estimate_messages_tokens
 from iris.ui.window.cyberspace_background import CyberspaceBackground
 from iris.ui.shared.cyberspace_theme import apply_cyberspace_theme
 from iris.ui.widgets.drag_tab import DragTab
-from iris.ui.window.frameless_chrome import FramelessShell, center_on_screen, suppress_native_window_border
+from iris.ui.window.frameless_chrome import (
+    FramelessShell,
+    center_on_screen,
+    enable_windows_snap_caption,
+    refresh_snap_button_rect,
+    suppress_native_window_border,
+    windows_snap_native_reply,
+)
 from iris.ui.sidebar.left_sidebar_panel import LeftSidebarPanel
 from iris.ui.monitor.live_activity_panel import LiveActivityPanel, UiActivityRelay
 from iris.ui.notification.notification_panel import NotificationPanel
@@ -122,7 +135,11 @@ from iris.ui.workers.hermes_workers import (
     HermesHealthWorker,
     HermesModelSyncWorker,
 )
-from iris.ui.workers.ollama_workers import OllamaChatWorker, OllamaModelListWorker
+from iris.ui.workers.ollama_workers import (
+    OllamaChatWorker,
+    OllamaModelListWorker,
+    OllamaModelsVerifyWorker,
+)
 from iris.ui.workers.api_provider_workers import OpenAICompatChatWorker
 from iris.ui.workers.learning_workers import LearningProcessWorker
 from iris.learning.manager import LearningManager
@@ -226,6 +243,9 @@ class MainWindow(QMainWindow):
         self._last_assistant_text = ""
         self._pending_local_vibe_prompt = ""
         self._live_vibe: dict | None = None
+        self._turn_write_path = ""
+        self._suppress_reveal_write = False
+        self._image_extract_worker = None
         self._chat_worker: QThread | None = None
         self._stt_warmup_worker: STTWarmupWorker | None = None
         self._stt_warmup_model = ""
@@ -236,6 +256,8 @@ class MainWindow(QMainWindow):
         self._tts_runtime_ready = False
         self._tts_bootstrap_worker: TTSRuntimeBootstrapWorker | None = None
         self._model_worker: OllamaModelListWorker | None = None
+        self._ollama_cleanup_worker: OllamaModelsVerifyWorker | None = None
+        self._listed_models: list[OllamaModelInfo] = []
         self._api_verify_worker: QThread | None = None
         self._hermes_health_worker: HermesHealthWorker | None = None
         self._hermes_model_worker: HermesModelSyncWorker | None = None
@@ -322,6 +344,16 @@ class MainWindow(QMainWindow):
         self._runtime_boot_started = False
         self._control_surface = None
         self._saved_model = load_selected_model(self._db) or self._settings.ollama_model.strip()
+        # 미로그인 클라우드를 초기 선택으로 두지 않음 — 목록 로드 후 로컬로 확정
+        try:
+            from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
+
+            if cloud_model_blocked_without_login(self._saved_model):
+                self._saved_model = ""
+                self._settings.ollama_model = ""
+                self._settings.model_name = ""
+        except Exception:
+            pass
         if self._saved_model:
             self._settings.ollama_model = self._saved_model
             self._settings.model_name = self._saved_model
@@ -546,6 +578,7 @@ class MainWindow(QMainWindow):
         self._chat.mic_clicked.connect(self._on_chat_mic_clicked)
         self._chat.speaker_clicked.connect(self._on_chat_speaker_clicked)
         self._chat.update_action_clicked.connect(self._on_chat_update_action)
+        self._chat.ollama_login_clicked.connect(self._on_ollama_cloud_login_clicked)
         left_lay.addWidget(self._chat, 3)
 
         history_panel = self._left_sidebar.chat_history
@@ -698,6 +731,18 @@ class MainWindow(QMainWindow):
             tick.timeout.connect(self._on_startup_gate_tick)
             self._startup_gate_tick = tick
         tick.start(5000)
+        # 관리자 재실행 직후 — 설정/위저드에서 요청한 실행 프로토콜을 이어서 연다.
+        try:
+            from iris.learning.elevation import consume_pending_setup_wizard
+
+            pending = consume_pending_setup_wizard()
+        except Exception:
+            pending = None
+        if pending:
+            tick.stop()
+            self._pending_setup_mode = pending
+            QTimer.singleShot(40, self._show_pending_setup_wizard)
+            return
         if is_setup_preview():
             tick.stop()
             QTimer.singleShot(40, self._show_first_run_setup)
@@ -714,6 +759,40 @@ class MainWindow(QMainWindow):
         self._startup_health_worker = worker
         worker.finished_ok.connect(self._on_startup_health_ready)
         worker.start()
+
+    def _show_pending_setup_wizard(self) -> None:
+        mode = getattr(self, "_pending_setup_mode", None) or "repair"
+        self._pending_setup_mode = None
+        if mode == "first_run":
+            self._show_first_run_setup()
+            return
+        from iris.config.settings import load_settings
+        from iris.system.setup_protocol import is_core_ready, is_setup_preview
+        from iris.ui.window.setup_wizard import SetupWizard
+
+        cy = getattr(self, "_cyberspace_bg", None)
+        if cy is not None:
+            cy.hide()
+        dlg = SetupWizard(self._settings, mode="repair", parent=None)
+        self._setup_wizard = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._setup_wizard = None
+            if cy is not None:
+                cy.show()
+        if is_core_ready() or is_setup_preview():
+            self._settings = load_settings(self._env_path)
+            self._start_runtime_boot()
+        else:
+            self._notes.try_add_alert(
+                target_id=0,
+                category="ERROR_DETECTED",
+                title="시작 프로토콜",
+                message="Core가 준비되지 않았습니다. 설정에서 「환경 다시 설정」을 실행하세요.",
+                focus_hint="",
+                event_id=0,
+            )
 
     def _on_startup_gate_tick(self) -> None:
         worker = self._startup_health_worker
@@ -953,6 +1032,30 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_app_update_apply_failed)
         worker.start()
 
+    def _on_ollama_cloud_login_clicked(self) -> None:
+        """채팅 [로그인] — Ollama 데스크톱 앱 UI에서 로그인하도록 앱만 연다."""
+        from iris.system.ollama_server import ensure_ollama_running, open_ollama_app
+
+        ok, detail = open_ollama_app()
+        ensure_ollama_running(self._settings.ollama_base_url, wait_sec=2.0)
+        if ok:
+            self._live_activity.append_instant_line(f"Ollama 앱 열기 ({detail[:80]})")
+            self._chat.append_message_instant(
+                "Iris",
+                "Ollama 앱을 열었습니다. "
+                "작업 표시줄/트레이의 Ollama 아이콘을 클릭해 창을 연 뒤, "
+                "앱 안에서 ollama.com 계정으로 로그인하세요. "
+                "(웹사이트만 로그인하면 Iris에는 반영되지 않습니다.)",
+            )
+            self._maybe_refresh_ollama_quota(force=True)
+            return
+        self._live_activity.append_instant_line(f"Ollama 앱 실행 실패: {detail[:120]}")
+        self._chat.append_message_instant(
+            "Iris",
+            f"Ollama 앱을 열지 못했습니다: {detail[:160]}. "
+            "시작 메뉴에서 Ollama를 직접 연 뒤 앱에서 로그인하세요.",
+        )
+
     def _on_app_update_applied(self, message: str) -> None:
         self._app_update_apply_worker = None
         self._pending_update_remote_sha = ""
@@ -1026,6 +1129,20 @@ class MainWindow(QMainWindow):
         model = (model or "").strip()
         if not model:
             return
+        from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
+
+        if cloud_model_blocked_without_login(model):
+            local = self._first_local_picker_model()
+            self._live_activity.append_instant_line(
+                f"Hermes model sync skip (클라우드 미로그인): {model}"
+            )
+            if local and local != model and self._chat.select_model_silent(local):
+                self._settings.ollama_model = local
+                self._settings.model_name = local
+                self._saved_model = local
+                model = local
+            else:
+                return
         if self._hermes_model_worker is not None and self._hermes_model_worker.isRunning():
             return
         try:
@@ -1116,37 +1233,121 @@ class MainWindow(QMainWindow):
                 )
         return out
 
-    def _on_models_loaded(self, models: object) -> None:
-        items: list[OllamaModelInfo] = list(models) if isinstance(models, list) else []
-        items = self._append_ok_api_models(items)
+    def _visible_models(self, items: list[OllamaModelInfo]) -> list[OllamaModelInfo]:
+        """정리에서 제외된 올라마 모델은 피커에 넣지 않는다. API는 usable_models가 이미 걸렀다."""
+        probes = load_ollama_model_probes(self._db) if self._db is not None else {}
+        visible: list[OllamaModelInfo] = []
+        for item in items:
+            if is_api_runtime_model(item.name):
+                visible.append(item)
+                continue
+            kept = apply_ollama_cleanup(item, probes.get(item.name))
+            if kept is not None:
+                visible.append(kept)
+        return visible
+
+    def _publish_model_list(self, items: list[OllamaModelInfo], *, boot: bool) -> None:
+        visible = self._visible_models(items)
         preferred = (
-            self._saved_model
+            self._chat.current_model()
+            or self._saved_model
             or self._settings.ollama_model
             or self._settings.model_name
         )
         if preferred in ("(unset)",):
             preferred = ""
-        self._chat.set_models(items, selected=preferred)
-        if items:
-            chosen = self._chat.current_model()
-            self._apply_selected_model(chosen, persist=False)
-            n_api = sum(1 for m in items if is_api_runtime_model(m.name))
-            n_cloud = sum(
-                1
-                for m in items
-                if getattr(m, "is_cloud", False) and not is_api_runtime_model(m.name)
-            )
-            n_local = len(items) - n_cloud - n_api
+        from iris.infrastructure.hermes_errors import resolve_initial_model
+
+        names = [str(m.name).strip() for m in visible if str(getattr(m, "name", "") or "").strip()]
+        resolved = resolve_initial_model(preferred, names)
+        if resolved and resolved != preferred and boot:
             self._live_activity.append_instant_line(
-                f"Models: {n_local} local + {n_cloud} cloud + {n_api} API"
+                f"클라우드 미로그인 — 초기 모델을 로컬 '{resolved}'로 선택"
             )
+        self._chat.set_models(visible, selected=resolved or preferred)
+        if visible:
+            chosen = self._chat.current_model()
+            persist = bool(resolved and resolved != preferred)
+            self._apply_selected_model(chosen, persist=persist)
+            if boot:
+                n_api = sum(1 for m in visible if is_api_runtime_model(m.name))
+                n_cloud = sum(
+                    1
+                    for m in visible
+                    if getattr(m, "is_cloud", False) and not is_api_runtime_model(m.name)
+                )
+                n_local = len(visible) - n_cloud - n_api
+                self._live_activity.append_instant_line(
+                    f"Models: {n_local} local + {n_cloud} cloud + {n_api} API"
+                )
             if self._settings.hermes_enabled and chosen:
                 self._sync_hermes_model(chosen)
         else:
             self._chat.set_model_status("(모델 없음)")
-        if self._intro is not None:
-            self._intro.notify_models_ready()
-        self._start_boot_checks()
+        if boot:
+            if self._intro is not None:
+                self._intro.notify_models_ready()
+            self._start_boot_checks()
+
+    def _on_models_loaded(self, models: object) -> None:
+        items: list[OllamaModelInfo] = list(models) if isinstance(models, list) else []
+        items = self._append_ok_api_models(items)
+        self._listed_models = items
+        self._publish_model_list(items, boot=True)
+        self._maybe_start_ollama_cleanup()
+
+    def _maybe_start_ollama_cleanup(self) -> None:
+        """실행 프로토콜 직후, 또는 아직 정리 판정이 없으면 올라마 모델을 자동 실측."""
+        if self._test_mode:
+            return
+        from iris.system.setup_protocol import is_setup_preview, ollama_model_cleanup_pending
+
+        if is_setup_preview():
+            return
+        worker = self._ollama_cleanup_worker
+        if worker is not None and worker.isRunning():
+            return
+        pending = ollama_model_cleanup_pending()
+        settled = self._db is not None and ollama_cleanup_has_verdict(self._db)
+        if not pending and settled:
+            return
+        self._live_activity.append_instant_line("Ollama 모델 정리 중…")
+        worker = OllamaModelsVerifyWorker(self._settings.ollama_base_url, parent=self)
+        worker.verified_one.connect(self._on_ollama_model_verified)
+        worker.progress.connect(self._on_ollama_cleanup_progress)
+        worker.finished_all.connect(self._on_ollama_cleanup_done)
+        self._ollama_cleanup_worker = worker
+        worker.start()
+
+    def _on_ollama_model_verified(self, model: str, state: str, tool: str) -> None:
+        if self._db is None:
+            return
+        save_ollama_model_probe(self._db, model, state=state, tool=tool)
+
+    def _on_ollama_cleanup_progress(self, done: int, total: int, usable: int) -> None:
+        if done != 1 and done != total and done % 10 != 0:
+            return
+        self._live_activity.append_instant_line(
+            f"Ollama 모델 정리 {done}/{total} · 사용 가능 {usable}"
+        )
+
+    def _on_ollama_cleanup_done(
+        self, models: object, usable: int, total: int, complete: bool
+    ) -> None:
+        from iris.system.setup_protocol import clear_ollama_model_cleanup_pending
+
+        self._ollama_cleanup_worker = None
+        if complete:
+            clear_ollama_model_cleanup_pending()
+        fresh = [m for m in models if isinstance(m, OllamaModelInfo)] if isinstance(models, list) else []
+        if fresh:
+            api = [m for m in self._listed_models if is_api_runtime_model(m.name)]
+            seen = {m.name for m in fresh}
+            self._listed_models = fresh + [m for m in api if m.name not in seen]
+        self._live_activity.append_instant_line(
+            f"Ollama 모델 정리 완료 — 사용 가능 {usable} / 전체 {total} (제외 {total - usable})"
+        )
+        self._publish_model_list(self._listed_models, boot=False)
 
     def _on_models_failed(self, err: str) -> None:
         # Ollama 실패해도 정상 API 모델은 피커에 표시
@@ -1225,10 +1426,53 @@ class MainWindow(QMainWindow):
     def _on_model_changed(self, model: str) -> None:
         self._apply_selected_model(model, persist=True)
 
+    def _first_local_picker_model(self) -> str:
+        """피커에 있는 로컬 채팅 모델 하나 (임베딩·클라우드 제외)."""
+        from iris.system.setup_protocol import prefer_chat_model
+
+        names: list[str] = []
+        for m in getattr(self._chat, "_picker_models", None) or []:
+            n = str(getattr(m, "runtime", None) or getattr(m, "name", "") or "").strip()
+            if n:
+                names.append(n)
+        if not names:
+            combo = getattr(self._chat, "_model_combo", None)
+            if combo is not None:
+                for i in range(combo.count()):
+                    n = str(combo.itemData(i) or "").strip()
+                    if n:
+                        names.append(n)
+        return prefer_chat_model(names) or ""
+
+    def _guard_cloud_model_selection(self, model: str) -> str:
+        """미로그인 클라우드면 로컬로 폴백하고 안내. 반환=실제 쓸 모델명."""
+        from iris.infrastructure.hermes_errors import (
+            CLOUD_AUTH_USER_MSG,
+            cloud_model_blocked_without_login,
+        )
+
+        if not cloud_model_blocked_without_login(model):
+            return model
+        local = self._first_local_picker_model()
+        self._live_activity.append_instant_line(
+            f"클라우드 미로그인 — '{model}' 사용 불가"
+            + (f", 로컬 '{local}'로 전환" if local else "")
+        )
+        self._chat.append_ollama_cloud_login_prompt(CLOUD_AUTH_USER_MSG)
+        if local and self._chat.select_model_silent(local):
+            try:
+                if self._db is not None:
+                    save_selected_model(self._db, local)
+            except Exception:
+                pass
+            return local
+        return model
+
     def _apply_selected_model(self, model: str, *, persist: bool) -> None:
         model = (model or "").strip()
         if not model:
             return
+        model = self._guard_cloud_model_selection(model)
         self._settings.ollama_model = model
         self._settings.model_name = model
         self._saved_model = model
@@ -1270,13 +1514,14 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _mark_api_model_unavailable_on_4xx(self, err: str) -> None:
-        """실제 대화가 404/400으로 거부되면 그 실측을 캐시에 남겨 목록에서 뺌."""
+        """모델이 없다고 확인된 대화 실패만 목록에서 뺀다. options 400은 남긴다."""
+        from iris.infrastructure.api_model_meta import chat_error_hides_model
+
         runtime = self._chat.current_model()
         parsed = parse_runtime_model_id(runtime)
         if parsed is None or self._db is None:
             return
-        text = err or ""
-        if not any(f"HTTP {code}" in text for code in (400, 403, 404, 422)):
+        if not chat_error_hides_model(err or ""):
             return
         provider_id, model = parsed
         record_model_probe(
@@ -1908,6 +2153,164 @@ class MainWindow(QMainWindow):
         self._obsidian_page.show_note(rel)
         self._obsidian_page._graph.focus(rel)
 
+    def _gate_chat_completion(self, text: str) -> str:
+        from pathlib import Path
+
+        from iris.ui.chat.file_write_claim import settle_completion_claim
+
+        verified = str(getattr(self, "_turn_write_path", "") or "")
+        state = self._live_vibe or {}
+        if not verified:
+            abs_path = state.get("abs_path")
+            if abs_path and Path(str(abs_path)).is_file() and state.get("started"):
+                verified = str(abs_path)
+        gate = settle_completion_claim(
+            text,
+            verified_path=verified,
+            try_write=self._write_fenced_once,
+        )
+        self._suppress_reveal_write = gate.suppress_followup_write
+        return gate.display
+
+    def _write_fenced_once(self, code: str, lang: str) -> dict | None:
+        surface = getattr(self, "_control_surface", None)
+        if surface is None or not code.strip():
+            return None
+        profile = load_user_profile(self._db)
+        root = (profile.project_root or "").strip()
+        if not root:
+            return None
+        from iris.system.project_ops import default_generated_rel_path
+
+        rel = default_generated_rel_path(self._pending_local_vibe_prompt or "", lang)
+        written = surface.registry.invoke(
+            "project.write_file",
+            {
+                "project_root": root,
+                "rel_path": rel,
+                "content": code,
+                "open": True,
+            },
+        )
+        return written if isinstance(written, dict) else None
+
+    def _at_path_search_roots(self) -> list[str]:
+        roots: list[str] = []
+        try:
+            profile = load_user_profile(self._db)
+            roots.extend(str(p) for p in (profile.project_parents or []) if str(p).strip())
+        except Exception:
+            pass
+        from iris.storage.ide_recent_folders import list_recent_folders
+
+        roots.extend(path for _name, path in list_recent_folders(limit=20))
+        return roots
+
+    def _pipe_open_editors(self) -> list[dict]:
+        client_fn = getattr(self, "_iris_ide_bridge_client", None)
+        if not callable(client_fn):
+            return []
+        try:
+            data = client_fn().get_open_editors()
+        except Exception:
+            return []
+        editors = data.get("editors") if isinstance(data, dict) else None
+        return [item for item in editors if isinstance(item, dict)] if isinstance(editors, list) else []
+
+    def _pipe_open_folder(self, path: str) -> None:
+        surface = getattr(self, "_control_surface", None)
+        if surface is None:
+            return
+        surface.registry.invoke("ide.open_folder", {"path": path, "new_window": True})
+
+    def _pipe_open_file(self, path: str) -> None:
+        from iris.ui.control_bindings import _ide_open_file_path
+
+        _ide_open_file_path(self, path)
+
+    def _reply_pipe(self, message: str) -> None:
+        self._chat.append_message_instant("Iris", message)
+        self._record_history("assistant", message)
+        self._refresh_context_gauge()
+
+    def _handle_image_code_pipe(self, turn: UserTurn, model: str) -> bool:
+        from iris.ui.chat.file_write_claim import image_write_request, prepare_image_code_pipe, start_image_extract
+
+        if not image_write_request(turn.text, list(turn.attachments)):
+            return False
+        profile = load_user_profile(self._db)
+        root = (profile.project_root or "").strip()
+        session = self._get_bound_ide_session(refresh=True)
+        workspace = (session.workspace_root or "").strip() if session else ""
+        if not root:
+            root = workspace
+        plan = prepare_image_code_pipe(
+            turn.text,
+            list(turn.attachments),
+            project_root=root,
+            workspace_root=workspace,
+            search_roots=self._at_path_search_roots(),
+            list_editors=self._pipe_open_editors,
+            open_folder=self._pipe_open_folder,
+            open_file=self._pipe_open_file,
+        )
+        if plan["action"] == "passthrough":
+            return False
+        if plan["action"] == "ask":
+            self._reply_pipe(str(plan["message"]))
+            self._finish_current_turn(turn.id, open_followup=False)
+            return True
+        parsed = parse_runtime_model_id(model)
+        api_base = ""
+        api_key = ""
+        auth_style = "bearer"
+        vision_model = model
+        if parsed is not None:
+            provider = get_api_provider(self._db, parsed[0])
+            vision_model = parsed[1]
+            if provider is not None and provider.base_url:
+                api_base = provider.base_url
+                api_key = provider.api_key
+                auth_style = provider.auth_style or "bearer"
+        rel = str(plan["rel"])
+        self._image_extract_worker = start_image_extract(
+            self,
+            str(plan["image"]),
+            on_text=lambda text, tid=turn.id, rel_path=rel, project=root: self._on_image_code_ready(
+                tid, project, rel_path, text
+            ),
+            model=vision_model,
+            ollama_base_url=self._settings.ollama_base_url,
+            api_base_url=api_base,
+            api_key=api_key,
+            auth_style=auth_style,
+        )
+        return True
+
+    def _on_image_code_ready(self, turn_id: str, project_root: str, rel: str, text: str) -> None:
+        if not self._is_current_turn(turn_id):
+            return
+        from iris.ui.chat.file_write_claim import commit_extracted_code
+
+        def _write(rel_path: str, content: str) -> dict:
+            surface = getattr(self, "_control_surface", None)
+            if surface is None:
+                return {"ok": False}
+            written = surface.registry.invoke(
+                "project.write_file",
+                {
+                    "project_root": project_root,
+                    "rel_path": rel_path,
+                    "content": content,
+                    "open": True,
+                },
+            )
+            return written if isinstance(written, dict) else {"ok": False}
+
+        outcome = commit_extracted_code(text, rel=rel, write_file=_write)
+        self._reply_pipe(str(outcome["message"]))
+        self._finish_current_turn(turn_id, open_followup=False)
+
     def _wiki_import_success_message(self, result: dict) -> str:
         from iris.knowledge.wiki_import_ops import wiki_save_notice
         from iris.ui.chat.chat_blocks import wiki_anchor_for
@@ -2308,6 +2711,20 @@ class MainWindow(QMainWindow):
             self._refresh_models()
             self._finish_current_turn(turn.id, open_followup=False)
             return
+        from iris.infrastructure.hermes_errors import (
+            CLOUD_AUTH_USER_MSG,
+            cloud_model_blocked_without_login,
+        )
+
+        if cloud_model_blocked_without_login(model):
+            local = self._first_local_picker_model()
+            if local and self._chat.select_model_silent(local):
+                self._apply_selected_model(local, persist=True)
+                model = local
+            else:
+                self._chat.append_ollama_cloud_login_prompt(CLOUD_AUTH_USER_MSG)
+                self._finish_current_turn(turn.id, open_followup=False)
+                return
         if self._use_hermes_backend() and not self._hermes_online:
             self._live_activity.append_instant_line(
                 "Hermes gateway Offline — 기동 후 연결을 시도합니다…"
@@ -2331,6 +2748,10 @@ class MainWindow(QMainWindow):
         self._begin_auto_tts_response()
         self._chat.set_generating(True)
         self._sync_voice_conversation_state()
+        self._turn_write_path = ""
+        self._suppress_reveal_write = False
+        if self._handle_image_code_pipe(turn, model):
+            return
 
         # ponytail: 트리거 키워드 체크 없이 항상 후보로 둔다 — 실제 게이트는
         # _feed_live_vibe_stream/_try_reveal_local_vibe_code의 코드블록 감지
@@ -2667,15 +3088,16 @@ class MainWindow(QMainWindow):
             self._finish_current_turn(open_followup=False)
             return
         text = (content or "").strip()
+        shown = self._gate_chat_completion(text)
         if getattr(self._chat, "_stream_active", False):
-            self._chat.end_stream_message(text or None)
-        elif text:
-            self._chat.append_message("Iris", text)
+            self._chat.end_stream_message(shown or None)
+        elif shown:
+            self._chat.append_message("Iris", shown)
         else:
             self._chat.append_message_instant("Iris", "(빈 응답)")
-        if text:
-            self._record_history("assistant", text)
-            self._last_assistant_text = text
+        if shown:
+            self._record_history("assistant", shown)
+            self._last_assistant_text = shown
             self._try_reveal_local_vibe_code(text)
         self._refresh_context_gauge()
         if self._use_hermes_backend() and not self._hermes_online:
@@ -2762,21 +3184,20 @@ class MainWindow(QMainWindow):
             state["closed"] = True
 
     def _live_vibe_try_start(self, state: dict) -> None:
+        from iris.system.project_ops import code_fence_body_start
+
         raw = state["raw"]
-        fence_idx = raw.find("```")
-        if fence_idx < 0:
-            if len(raw) > 4000:
+        opened = code_fence_body_start(raw)
+        if opened is None:
+            if "```" not in raw and len(raw) > 4000:
                 state["raw"] = raw[-4000:]
             return
-        nl_idx = raw.find("\n", fence_idx)
-        if nl_idx < 0:
-            return  # lang 태그 줄이 아직 안 끝남 — 다음 청크 대기
-        lang = raw[fence_idx + 3 : nl_idx].strip()
+        lang, code_start = opened
         if not self._live_vibe_open_target(state, lang):
             state["closed"] = True
             return
         state["started"] = True
-        state["code_start"] = nl_idx + 1
+        state["code_start"] = code_start
         state["written_len"] = 0
         state["last_write_at"] = 0.0
 
@@ -2877,6 +3298,9 @@ class MainWindow(QMainWindow):
         state = self._live_vibe
         self._pending_local_vibe_prompt = ""
         self._live_vibe = None
+        if getattr(self, "_suppress_reveal_write", False):
+            self._suppress_reveal_write = False
+            return
         if not prompt:
             return
         if state is not None and state.get("tool_written"):
@@ -2898,7 +3322,11 @@ class MainWindow(QMainWindow):
                 if not is_run_request(prompt):
                     if not state.get("opened"):
                         return
-                    self._chat.append_message_instant("Iris", f"IDE에 `{rel}` 파일을 열었습니다.")
+                    from iris.ui.chat.file_write_claim import reveal_line
+
+                    self._chat.append_message_instant(
+                        "Iris", reveal_line(str(state.get("abs_path") or ""))
+                    )
                     return
                 ran = surface.registry.invoke(
                     "project.run",
@@ -2957,13 +3385,9 @@ class MainWindow(QMainWindow):
                 return
             if not is_run_request(prompt):
                 result = written.get("result") if isinstance(written.get("result"), dict) else {}
-                if not result.get("opened"):
-                    self._chat.append_message_instant(
-                        "Iris",
-                        f"IDE에 `{rel}` 파일을 썼지만 열리지는 않았습니다.",
-                    )
-                    return
-                self._chat.append_message_instant("Iris", f"IDE에 `{rel}` 파일을 열었습니다.")
+                from iris.ui.chat.file_write_claim import reveal_line
+
+                self._chat.append_message_instant("Iris", reveal_line(str(result.get("path") or "")))
                 return
             ran = surface.registry.invoke(
                 "project.run",
@@ -4203,10 +4627,13 @@ class MainWindow(QMainWindow):
         self._drop_last_user_history()
         self._refresh_context_gauge()
         self._live_activity.append_instant_line(f"Error: {err}")
-        self._chat.append_message_instant(
-            "Iris",
-            f"{self._backend_label()} 오류: {err}",
-        )
+        from iris.infrastructure.hermes_errors import is_cloud_auth_user_message
+
+        label = self._backend_label()
+        if is_cloud_auth_user_message(err):
+            self._chat.append_ollama_cloud_login_prompt(f"{label} 오류: {err}")
+        else:
+            self._chat.append_message_instant("Iris", f"{label} 오류: {err}")
         self._chat_worker = None
         self._maybe_refresh_ollama_quota()
         self._finish_current_turn(open_followup=False)
@@ -4283,6 +4710,9 @@ class MainWindow(QMainWindow):
         else:
             self._email_page.set_mails([])
             self._left_sidebar.email_folder.set_status("설정에서 이메일 계정을 추가하세요.")
+            from iris.ui.settings.email_connect_guide import run_email_connect_guide
+
+            QTimer.singleShot(0, lambda: run_email_connect_guide(self))
 
     def _on_calendar_icon(self) -> None:
         self._workspace_mode = "calendar"
@@ -5549,7 +5979,19 @@ class MainWindow(QMainWindow):
             self._iris_ide_window = IrisIdeWindow()
             self._iris_ide_window.files_dropped.connect(self._attach_os_drop_paths)
             self._iris_ide_window.folder_opened.connect(self._on_iris_ide_welcome_folder)
+            self._iris_ide_window.close_requested.connect(self._on_iris_ide_caption_close)
         return self._iris_ide_window
+
+    def _on_iris_ide_caption_close(self) -> None:
+        if self._ui_mode == "ide_companion":
+            self._exit_ide_companion()
+            return
+        if self._ui_mode == "ide_hero" or getattr(self, "_hero_enter_pending", False):
+            self._exit_iris_ide_hero()
+            return
+        win = self._iris_ide_window
+        if win is not None:
+            win.close_window()
 
     def _on_iris_ide_welcome_folder(self, folder: str) -> None:
         """웰컴 Open folder / Recent — Theia control 없이 Qt에서 직접 연다."""
@@ -6918,17 +7360,22 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self._settings, self._db, None, microphone=self._mic)
         try:
             fg = self.frameGeometry()
-            dlg.adjustSize()
+            # adjustSize()는 펼친 섹션 전체 높이로 레이아웃을 한 번에 돌려
+            # Windows가 흰 클라이언트를 먼저 보여 준다. 기본 크기(스크롤)를 유지한다.
             dlg.move(
                 fg.x() + max(0, (fg.width() - dlg.width()) // 2),
                 fg.y() + max(0, (fg.height() - dlg.height()) // 2),
             )
         except Exception:
             pass
-        if dlg.exec():
+        dlg.exec()
+        self._maybe_start_ollama_cleanup()
+        self._refresh_models(probe_cloud=False)
+        if dlg.result():
             sel = dlg.selection()
             if sel is None:
                 return
+            self._refresh_chat_history_panel()
             self._settings.ollama_base_url = sel.ollama_base_url
             self._settings.ollama_model = sel.ollama_model
             self._settings.hermes_command = sel.hermes_command
@@ -6983,6 +7430,8 @@ class MainWindow(QMainWindow):
                 self._request_stt_warmup()
                 if getattr(self._voice_prefs, "mic_listen_preferred", False):
                     QTimer.singleShot(300, self._maybe_restore_mic_listen)
+            self._pcm_player.set_volume(self._voice_prefs.tts_volume)
+            self._media_audio_out.setVolume(self._voice_prefs.tts_volume)
             self._pcm_player.set_voice_pitch(self._voice_prefs.tts_pitch_semitones)
             self._apply_alert_voice_prefs()
             self._pcm_player.set_voice_effect(
@@ -7019,14 +7468,27 @@ class MainWindow(QMainWindow):
                     )
 
     def _toggle_maximize(self) -> None:
+        # 스냅 히트테스트와 Qt 클릭이 같은 누름에서 둘 다 오면 최대화·복원이 상쇄된다.
+        now = time.monotonic()
+        if now - getattr(self, "_max_toggle_at", 0.0) < 0.05:
+            return
+        self._max_toggle_at = now
         if self.isMaximized():
             self.showNormal()
         else:
             self.showMaximized()
 
+    def nativeEvent(self, eventType, message):  # noqa: N802
+        reply = windows_snap_native_reply(self, message)
+        if reply is not None:
+            return reply
+        return False, 0
+
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         suppress_native_window_border(self)
+        enable_windows_snap_caption(self)
+        QTimer.singleShot(0, lambda: refresh_snap_button_rect(self))
         self._arm_file_drops(self)
         if sys.platform == "win32":
             QTimer.singleShot(0, self._arm_win_shell_drop)
@@ -7070,6 +7532,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        refresh_snap_button_rect(self)
         self._viz.request_sync_orb_anchor("main_window_resize")
         if self._ui_mode == "ide_hero":
             self._sync_ide_hero_geometry()
@@ -7079,6 +7542,7 @@ class MainWindow(QMainWindow):
 
     def moveEvent(self, event) -> None:  # noqa: N802
         super().moveEvent(event)
+        refresh_snap_button_rect(self)
         if self._iris_ide_unified and self._ui_mode == "ide_companion":
             self._sync_docked_iris_ide_geometry()
 

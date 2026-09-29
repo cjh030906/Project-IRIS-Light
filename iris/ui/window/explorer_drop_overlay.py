@@ -49,29 +49,6 @@ def _qt_modal_blocking() -> bool:
     return app.activeModalWidget() is not None or QGuiApplication.modalWindow() is not None
 
 
-def _cursor_root_hwnd() -> int:
-    """커서가 실제로 올라간 탑레벨 HWND."""
-    if sys.platform != "win32":
-        return 0
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class POINT(ctypes.Structure):
-            _fields_ = (("x", wintypes.LONG), ("y", wintypes.LONG))
-
-        pt = POINT()
-        user32 = ctypes.windll.user32
-        if not user32.GetCursorPos(ctypes.byref(pt)):
-            return 0
-        hwnd = int(user32.WindowFromPoint(pt) or 0)
-        if not hwnd:
-            return 0
-        return int(user32.GetAncestor(wintypes.HWND(hwnd), 2) or hwnd)  # GA_ROOT
-    except Exception:
-        return 0
-
-
 def _iris_ide_root_hwnd(host: QWidget) -> int:
     win = getattr(host, "_iris_ide_window", None)
     if win is None or not win.isVisible():
@@ -112,6 +89,106 @@ def drop_target_global_rect(host: QWidget) -> QRect:
         return QRect()
 
 
+def cursor_targets_iris_window(
+    root_hwnd: int,
+    *,
+    host_hwnd: int,
+    overlay_hwnd: int = 0,
+    ide_hwnd: int = 0,
+) -> bool:
+    """커서가 이미 Iris 사각형 안일 때, 그 클릭이 Iris 것인지.
+
+    root 0 = 히트 없음(드래그 고스트만). 좌표 폴백으로 True.
+    다른 앱 창이 커서 아래면 False — 뒤에 있는 Iris를 띄우면 안 된다.
+    """
+    if root_hwnd == 0:
+        return True
+    if ide_hwnd and root_hwnd == ide_hwnd:
+        return False
+    if overlay_hwnd and root_hwnd == overlay_hwnd:
+        return True
+    if host_hwnd and root_hwnd == host_hwnd:
+        return True
+    return False
+
+
+def _front_window_at_cursor() -> int:
+    """커서 아래 실제 탑레벨 HWND. 투명·드래그 고스트는 건너뛴다. 없으면 0."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class POINT(ctypes.Structure):
+            _fields_ = (("x", wintypes.LONG), ("y", wintypes.LONG))
+
+        class RECT(ctypes.Structure):
+            _fields_ = (
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            )
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.GetTopWindow.argtypes = [wintypes.HWND]
+        user32.GetTopWindow.restype = wintypes.HWND
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindow.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        get_exstyle = user32.GetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) >= 8 else user32.GetWindowLongW
+        get_exstyle.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_exstyle.restype = ctypes.c_ssize_t
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+
+        pt = POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return 0
+
+        gwl_exstyle = -20
+        ws_ex_transparent = 0x00000020
+        gw_hwndnext = 2
+        ga_root = 2
+
+        def passthrough(hwnd: int) -> bool:
+            ex = int(get_exstyle(hwnd, gwl_exstyle)) & 0xFFFFFFFF
+            if ex & ws_ex_transparent:
+                return True
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, buf, 64)
+            return (buf.value or "").lower() == "sysdragimage"
+
+        def contains(hwnd: int) -> bool:
+            rc = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                return False
+            return rc.left <= pt.x < rc.right and rc.top <= pt.y < rc.bottom
+
+        hwnd = user32.GetTopWindow(None)
+        # ponytail: 탑레벨 z-order 한 바퀴. 천장 256 — 넘으면 히트 없음으로 좌표 폴백.
+        for _ in range(256):
+            if not hwnd:
+                break
+            cur = int(hwnd)
+            nxt = user32.GetWindow(hwnd, gw_hwndnext)
+            if user32.IsWindowVisible(hwnd) and contains(cur) and not passthrough(cur):
+                root = int(user32.GetAncestor(hwnd, ga_root) or cur)
+                return root
+            hwnd = nxt
+        return 0
+    except Exception:
+        return 0
+
+
 def _cursor_on_drop_surface(host: QWidget, overlay: QWidget | None = None) -> bool:
     if _drop_guard_paused(host):
         return False
@@ -119,23 +196,22 @@ def _cursor_on_drop_surface(host: QWidget, overlay: QWidget | None = None) -> bo
     pos = QCursor.pos()
     if not rect.contains(pos):
         return False
-    ide_hwnd = _iris_ide_root_hwnd(host)
-    if ide_hwnd:
-        root = _cursor_root_hwnd()
-        if root == ide_hwnd:
-            return False
+    overlay_hwnd = 0
     if overlay is not None and overlay.isVisible():
         try:
-            if _cursor_root_hwnd() == int(overlay.winId()):
-                return True
+            overlay_hwnd = int(overlay.winId() or 0)
         except RuntimeError:
-            pass
+            overlay_hwnd = 0
     try:
-        if _cursor_root_hwnd() == int(host.winId()):
-            return True
+        host_hwnd = int(host.winId() or 0)
     except RuntimeError:
-        pass
-    return rect.contains(pos)
+        host_hwnd = 0
+    return cursor_targets_iris_window(
+        _front_window_at_cursor(),
+        host_hwnd=host_hwnd,
+        overlay_hwnd=overlay_hwnd,
+        ide_hwnd=_iris_ide_root_hwnd(host),
+    )
 
 
 class ExplorerDropOverlay(QWidget):

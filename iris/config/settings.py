@@ -60,13 +60,23 @@ def load_settings(env_path: Path | None = None) -> Settings:
         hermes_api_key = resolve_hermes_api_key(os.environ.get("IRIS_HERMES_API_KEY", ""))
     except Exception:
         hermes_api_key = os.environ.get("IRIS_HERMES_API_KEY", "").strip()
+    try:
+        from iris.infrastructure.hermes_client import normalize_hermes_openai_base_url
+
+        hermes_base = normalize_hermes_openai_base_url(
+            os.environ.get("IRIS_HERMES_BASE_URL", "http://127.0.0.1:8642/v1")
+        )
+    except Exception:
+        hermes_base = (
+            os.environ.get("IRIS_HERMES_BASE_URL", "http://127.0.0.1:8642/v1").strip()
+            or "http://127.0.0.1:8642/v1"
+        )
     return Settings(
         ollama_base_url=os.environ.get("IRIS_OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip(),
         ollama_model=model,
         hermes_enabled=os.environ.get("IRIS_HERMES_ENABLED", "1").strip() not in ("0", "false", "False"),
         hermes_command=os.environ.get("IRIS_HERMES_COMMAND", "hermes").strip() or "hermes",
-        hermes_base_url=os.environ.get("IRIS_HERMES_BASE_URL", "http://127.0.0.1:8642/v1").strip()
-        or "http://127.0.0.1:8642/v1",
+        hermes_base_url=hermes_base,
         hermes_api_key=hermes_api_key,
         data_go_kr_service_key=os.environ.get("IRIS_DATA_GO_KR_SERVICE_KEY", "").strip(),
         model_name=model or "(unset)",

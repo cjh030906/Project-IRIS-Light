@@ -1,4 +1,4 @@
-"""IMAP/SMTP 이메일 클라이언트 — Gmail·Naver 자동 설정."""
+"""IMAP/SMTP 이메일 클라이언트 — Gmail·Naver·Daum·Yahoo·iCloud 자동 설정."""
 
 from __future__ import annotations
 
@@ -52,13 +52,37 @@ def detect_mail_server(address: str) -> MailServerConfig:
             smtp_port=587,
             smtp_starttls=True,
         )
-    if domain in ("naver.com", "hanmail.net"):
+    if domain == "naver.com":
         return MailServerConfig(
             imap_host="imap.naver.com",
             imap_port=993,
             smtp_host="smtp.naver.com",
             smtp_port=465,
             smtp_starttls=False,
+        )
+    if domain in ("daum.net", "hanmail.net"):
+        return MailServerConfig(
+            imap_host="imap.daum.net",
+            imap_port=993,
+            smtp_host="smtp.daum.net",
+            smtp_port=465,
+            smtp_starttls=False,
+        )
+    if domain in ("yahoo.com", "ymail.com"):
+        return MailServerConfig(
+            imap_host="imap.mail.yahoo.com",
+            imap_port=993,
+            smtp_host="smtp.mail.yahoo.com",
+            smtp_port=587,
+            smtp_starttls=True,
+        )
+    if domain in ("icloud.com", "me.com", "mac.com"):
+        return MailServerConfig(
+            imap_host="imap.mail.me.com",
+            imap_port=993,
+            smtp_host="smtp.mail.me.com",
+            smtp_port=587,
+            smtp_starttls=True,
         )
     return MailServerConfig(
         imap_host=f"imap.{domain}",
@@ -473,6 +497,11 @@ def filter_summaries_since(
 if __name__ == "__main__":
     assert detect_mail_server("a@gmail.com").imap_host == "imap.gmail.com"
     assert detect_mail_server("b@naver.com").smtp_port == 465
+    assert detect_mail_server("c@hanmail.net").imap_host == "imap.daum.net"
+    assert detect_mail_server("d@daum.net").smtp_host == "smtp.daum.net"
+    assert detect_mail_server("e@yahoo.com").imap_host == "imap.mail.yahoo.com"
+    assert detect_mail_server("f@icloud.com").imap_host == "imap.mail.me.com"
+    assert detect_mail_server("g@me.com").smtp_host == "smtp.mail.me.com"
 
     ctx_empty = build_agent_context("me@gmail.com", None)
     assert "me@gmail.com" in ctx_empty

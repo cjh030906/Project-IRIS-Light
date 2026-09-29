@@ -5,6 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QRect
 
 from iris.system.ide_tiler import compute_tile_rects, tiles_are_flush
+from iris.ui.window.frameless_chrome import FramelessShell
 from iris.ui.workspaces.iris_ide_window import IRIS_IDE_TITLE, IrisIdeWindow
 
 
@@ -23,6 +24,18 @@ def main() -> None:
     assert tiles_are_flush(tiles.ide, tiles.iris)
     w = IrisIdeWindow()
     assert w.windowFlags() & Qt.WindowType.FramelessWindowHint
+    shell = w.centralWidget()
+    assert isinstance(shell, FramelessShell)
+    assert len(shell._grips) == 8
+    w.resize(800, 600)
+    w.show()
+    app.processEvents()
+    body = shell._content
+    assert body is not None
+    assert body.geometry().x() == shell._margin and body.geometry().y() == shell._margin
+    assert not body.geometry().intersects(shell._grips[4].geometry())
+    assert w._caption.isVisible()
+    assert w.maximize_button_global_rect().width() == 34
     w.show_loading()
     assert w.is_opening()
     assert not w.is_theia_loaded()

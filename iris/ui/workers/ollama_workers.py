@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -78,6 +79,52 @@ class OllamaModelListWorker(QThread):
                 self.failed.emit(f"모델 목록 시간 초과: {e}")
                 return
         self.failed.emit("모델 목록 조회 시간 초과")
+
+
+class OllamaModelsVerifyWorker(QThread):
+    """로컬+클라우드 모델을 실측해 사용 불가 모델을 가린다. API 「모델 정리」와 같은 역할."""
+
+    verified_one = pyqtSignal(str, str, str)  # model, state, tool_support
+    progress = pyqtSignal(int, int, int)  # done, total, usable
+    finished_all = pyqtSignal(object, int, int, bool)  # models, usable, total, complete
+
+    def __init__(self, base_url: str, parent=None) -> None:
+        super().__init__(parent)
+        self._base_url = base_url
+
+    def run(self) -> None:
+        # ponytail: 클라우드 카탈로그가 크면 순차 25초×N은 너무 김. 6병렬.
+        # 천장: 동시 6건. 더 필요하면 워커 수만 올린다.
+        client = OllamaClient(self._base_url)
+        try:
+            models = client.list_chat_models(probe_cloud=False)
+        except Exception:
+            self.finished_all.emit([], 0, 0, False)
+            return
+        usable = 0
+        done = 0
+        total = len(models)
+        if not models:
+            self.finished_all.emit([], 0, 0, True)
+            return
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {}
+            for model in models:
+                if self.isInterruptionRequested():
+                    break
+                futures[pool.submit(client.classify_model, model.name)] = model.name
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    state, tool = fut.result()
+                except Exception:
+                    state, tool = "unverified", "unknown"
+                if state != "unavailable":
+                    usable += 1
+                done += 1
+                self.verified_one.emit(name, state, tool)
+                self.progress.emit(done, total, usable)
+        self.finished_all.emit(models, usable, total, done == total)
 
 
 class OllamaChatWorker(QThread):

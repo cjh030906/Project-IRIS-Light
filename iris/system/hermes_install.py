@@ -40,6 +40,11 @@ _PIP_FALLBACK_LIMIT = (
 _ERROR_LINE = re.compile(
     r"(?i)\b(error|exception|traceback|failed|winerror|timeout|permissionerror)\b"
 )
+_LAST_BYPASS_LOG: str = ""
+# trash/staging 잔존 상한 (오래된 것부터 삭제)
+_MAX_TRASH_KEEP = 3
+_NEEDS_USER_MSG_LIMIT = 800
+_NEEDS_USER_MSG_LINES = 12
 
 _UV_MOUNT_MARKERS = (
     "os error 448",
@@ -144,6 +149,12 @@ def find_bootstrap_python() -> Path | None:
         found = shutil.which(name)
         if found and is_supported_hermes_python(Path(found)):
             return Path(found)
+    for cand in (
+        root / ".venv" / "Scripts" / "python.exe",
+        root / ".venv" / "bin" / "python",
+    ):
+        if cand.is_file() and is_supported_hermes_python(cand):
+            return cand
     if sys.executable:
         p = Path(sys.executable)
         if p.is_file() and is_supported_hermes_python(p):
@@ -238,8 +249,15 @@ def _kill_hermes_tree_holders(agent: Path) -> None:
     time.sleep(0.4)
 
 
-def force_retire_hermes_agent(*, command: str = "hermes") -> str:
-    """잠긴 hermes-agent / .broken-* 를 rename 으로 치우고 삭제 시도."""
+def force_retire_hermes_agent(
+    *,
+    command: str = "hermes",
+    keep_staging: str | None = None,
+) -> str:
+    """잠긴 hermes-agent / .broken-* / staging-* 를 rename 으로 치우고 삭제 시도.
+
+    keep_staging: 진행 중 clone 디렉터리명(예: hermes-agent.staging-…)만 보존.
+    """
     home = gw.hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     try:
@@ -259,6 +277,10 @@ def force_retire_hermes_agent(*, command: str = "hermes") -> str:
                 and (
                     p.name.startswith("hermes-agent.broken-")
                     or p.name.startswith("hermes-agent.trash-")
+                    or (
+                        p.name.startswith("hermes-agent.staging-")
+                        and p.name != (keep_staging or "")
+                    )
                 )
             )
         )
@@ -315,13 +337,20 @@ def force_retire_hermes_agent(*, command: str = "hermes") -> str:
         else:
             notes.append(f"삭제:{path.name}")
 
-    # 오래된 trash 최대 3개만 남기고 정리 시도
+    # 오래된 trash 최대 N개 · 남은 staging(보존분 제외) 전부 삭제
     try:
         trashes = sorted(
             p for p in home.iterdir() if p.is_dir() and p.name.startswith("hermes-agent.trash-")
         )
-        for old in trashes[:-3]:
+        for old in trashes[:-_MAX_TRASH_KEEP]:
             shutil.rmtree(old, ignore_errors=True)
+        for st in home.iterdir():
+            if (
+                st.is_dir()
+                and st.name.startswith("hermes-agent.staging-")
+                and st.name != (keep_staging or "")
+            ):
+                shutil.rmtree(st, ignore_errors=True)
     except OSError:
         pass
     return "; ".join(notes) if notes else "정리할 hermes-agent 없음"
@@ -693,6 +722,162 @@ def _finish_staged_install(
     return InstallResult(True, f"우회 설치 성공 ({runtime_detail})", "ok")
 
 
+def combined_install_log_tail(*parts: str, limit: int = 1200) -> str:
+    blob = "\n".join(p for p in parts if p)
+    if len(blob) <= limit:
+        return blob
+    return blob[-limit:]
+
+
+def last_bypass_log_path() -> str:
+    return _LAST_BYPASS_LOG
+
+
+def new_bypass_pip_log_path() -> Path:
+    logs = gw.hermes_home() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return logs / f"iris-bypass-pip-{stamp}.log"
+
+
+def write_bypass_pip_log(stdout: str, stderr: str, *, path: Path | None = None) -> Path:
+    global _LAST_BYPASS_LOG
+    log_path = path or new_bypass_pip_log_path()
+    blob = "\n".join(p for p in (stderr or "", stdout or "") if p)
+    log_path.write_text(blob, encoding="utf-8", errors="replace")
+    _LAST_BYPASS_LOG = str(log_path)
+    return log_path
+
+
+def format_pip_failure(stdout: str, stderr: str, *, log_path: Path | str) -> str:
+    """pip 실패 메시지 — 앞(Obtaining…)이 아니라 꼬리 + 전체 로그 경로."""
+    tail = combined_install_log_tail(stderr or "", stdout or "", limit=1200)
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    short = "\n".join(lines[-_NEEDS_USER_MSG_LINES:]) if lines else "(로그 없음)"
+    return f"pip 설치 실패 (로그: {log_path})\n{short}"
+
+
+def format_runtime_failure(detail: str, *, log_path: Path | str) -> str:
+    """우회 설치 후 probe/import 실패 — pip 실패와 동일하게 로그 경로 + 꼬리."""
+    tail = combined_install_log_tail(detail or "", limit=1200)
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    short = "\n".join(lines[-_NEEDS_USER_MSG_LINES:]) if lines else "(로그 없음)"
+    return f"우회 설치 후 런타임 실패 (로그: {log_path})\n{short}"
+
+
+def clip_needs_user_message(msg: str, *, limit: int = _NEEDS_USER_MSG_LIMIT) -> str:
+    """NeedsUser 카드용 — 마지막 N줄·전체 limit자(꼬리). 전체 로그는 파일에만."""
+    text = (msg or "").strip()
+    if not text:
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    short = "\n".join(lines[-_NEEDS_USER_MSG_LINES:]) if lines else text
+    if len(short) <= limit:
+        return short
+    return short[-limit:]
+
+
+def should_skip_official_installer(
+    *,
+    prefer_bypass: bool,
+    last_error: object = None,
+) -> bool:
+    """R1(a): 세션 prefer_bypass 또는 직전 last_error가 bypass/448이면 공식 생략."""
+    if prefer_bypass:
+        return True
+    if isinstance(last_error, dict):
+        kind = str(last_error.get("kind") or "").lower()
+        if kind.startswith("bypass") or "448" in kind:
+            return True
+        if looks_like_uv_python_mount_failure(str(last_error.get("tail") or "")):
+            return True
+    return False
+
+
+def _run_pkg_install(
+    cmd: list[str],
+    *,
+    cwd: str,
+    run_streamed: Callable[..., subprocess.CompletedProcess[str]] | None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """pip/uv 단계 — quiet 구간 idle 오탐 방지(hard만, idle 없음)."""
+    if run_streamed is not None:
+        return run_streamed(
+            cmd,
+            cwd=cwd,
+            env=env,
+            timeout=None,
+            hard_timeout=3600.0,
+            hidden=True,
+        )
+    return _run(cmd, cwd=cwd, env=env, timeout=3600.0)
+
+
+def _try_uv_sync(
+    agent: Path,
+    venv_py: Path,
+    venv_dir: Path,
+    *,
+    on_stream: StreamFn | None,
+    run_streamed: Callable[..., subprocess.CompletedProcess[str]] | None,
+) -> subprocess.CompletedProcess[str] | None:
+    """uv.lock 있으면 uv sync --frozen (Hermes `venv/` 경로 유지). 없으면 None."""
+    if not (agent / "uv.lock").is_file():
+        return None
+    uv = shutil.which("uv")
+    if not uv:
+        return None
+    if on_stream:
+        on_stream("uv sync --frozen (lock)…")
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(venv_dir)
+    env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+    cmd = [
+        uv,
+        "sync",
+        "--frozen",
+        "--active",
+        "--python",
+        str(venv_py),
+        "--extra",
+        "homeassistant",
+        "--extra",
+        "mcp",
+    ]
+    try:
+        return _run_pkg_install(cmd, cwd=str(agent), run_streamed=run_streamed, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+
+
+def _guard_installed_agent(agent: Path) -> None:
+    """우회 설치로 hermes-agent 트리가 생긴 직후 options 가드 1회. 실패해도 설치는 성공."""
+    try:
+        from iris.system.hermes_ollama_guard import apply_ollama_options_guard
+
+        apply_ollama_options_guard(agent)
+    except Exception:
+        return
+
+
+def _swap_staging_into_place(home: Path, staging: Path, agent: Path) -> str | None:
+    """staging → hermes-agent rename. 실패 시 메시지."""
+    if agent.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        trash = home / f"hermes-agent.trash-{stamp}-swap"
+        try:
+            agent.rename(trash)
+            shutil.rmtree(trash, ignore_errors=True)
+        except OSError as exc:
+            return f"기존 hermes-agent 교체 실패: {exc}"
+    try:
+        staging.rename(agent)
+    except OSError as exc:
+        return f"staging rename 실패: {exc}"
+    return None
+
+
 def install_hermes_with_system_python(
     *,
     command: str = "hermes",
@@ -762,14 +947,6 @@ def install_hermes_with_system_python(
     except InstallBusy as exc:
         return _fail("lock", "설치 잠금", str(exc))
 
-_OUT_TAIL_RE = re.compile(r".{0,200}$", re.DOTALL)
-
-
-def combined_install_log_tail(*parts: str, limit: int = 1200) -> str:
-    blob = "\n".join(p for p in parts if p)
-    if len(blob) <= limit:
-        return blob
-    return blob[-limit:]
 
 
 if __name__ == "__main__":
@@ -782,4 +959,19 @@ if __name__ == "__main__":
     sample = "Obtaining file:///x\n" + ("n\n" * 20) + "ERROR: boom\n"
     assert "ERROR:" in error_log_tail(sample)
     assert "Obtaining" not in error_log_tail(sample)
+    head = "Obtaining file:///tmp/hermes-agent\nInstalling build dependencies...\n"
+    err = "ERROR: Could not find a version that satisfies the requirement missing-pkg\n"
+    msg = format_pip_failure(head + ("...\n" * 80) + err, "", log_path="iris-bypass-pip-test.log")
+    assert "ERROR:" in msg and "iris-bypass-pip" in msg
+    assert not msg.strip().endswith("Obtaining file:///tmp/hermes-agent")
+    assert should_skip_official_installer(
+        prefer_bypass=False,
+        last_error={"kind": "bypass_pip", "tail": "x"},
+    )
+    assert should_skip_official_installer(prefer_bypass=True, last_error=None)
+    assert not should_skip_official_installer(prefer_bypass=False, last_error=None)
+    rt = format_runtime_failure("probe timeout", log_path="iris-bypass-pip-rt.log")
+    assert "런타임 실패" in rt and "iris-bypass-pip-rt" in rt
+    clipped = clip_needs_user_message("line\n" * 40 + ("x" * 900))
+    assert len(clipped) <= _NEEDS_USER_MSG_LIMIT
     print("hermes_install helpers ok", find_bootstrap_python())

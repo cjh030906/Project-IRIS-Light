@@ -88,6 +88,7 @@ def main() -> None:
     check_finish_keeps_pending_outside()
     check_win_shell_drop_arm()
     check_explorer_overlay_drop()
+    check_occluded_click_stays_on_front_window()
     check_no_win32_drop_hooks()
     # ponytail: 소스가 OK여도 구식 bundle.js면 실행에 안 뜸 — 번들 마커 필수
     for label, bundle in (
@@ -188,6 +189,17 @@ def check_finish_keeps_pending_outside() -> None:
     inst._attach_os_drop_paths.assert_called_with([r"C:\proj\tab.py"])
 
 
+def check_occluded_click_stays_on_front_window() -> None:
+    """Iris가 뒤에 있을 때 사각형이 겹쳐도 앞 페이지 클릭을 가로채지 않는다."""
+    from iris.ui.window.explorer_drop_overlay import cursor_targets_iris_window
+
+    assert cursor_targets_iris_window(50, host_hwnd=1, overlay_hwnd=2) is False
+    assert cursor_targets_iris_window(1, host_hwnd=1, overlay_hwnd=2) is True
+    assert cursor_targets_iris_window(2, host_hwnd=1, overlay_hwnd=2) is True
+    assert cursor_targets_iris_window(9, host_hwnd=1, ide_hwnd=9) is False
+    assert cursor_targets_iris_window(0, host_hwnd=1) is True
+
+
 def check_no_win32_drop_hooks() -> None:
     """탐색기 드롭 우회가 nativeEvent/WNDPROC 훅을 다시 넣지 않았는지."""
     root = Path(__file__).resolve().parents[3]
@@ -206,8 +218,13 @@ def check_no_win32_drop_hooks() -> None:
     assert "_drop_guard_paused" in text
     assert "drop_target_global_rect" in text
     main = (root / "iris/ui/window/main_window.py").read_text(encoding="utf-8")
-    assert "def nativeEvent" not in main
+    # 스냅 레이아웃용 nativeEvent 만 허용. 드롭 훅은 기동 즉사라 금지.
+    assert "windows_snap_native_reply" in main
+    assert "WM_DROPFILES" not in main
     assert "QAbstractNativeEventFilter" not in main
+    chrome = (root / "iris/ui/window/frameless_chrome.py").read_text(encoding="utf-8")
+    for token in ("WM_DROPFILES", "SetWindowLongPtr", "CallWindowProc", "QAbstractNativeEventFilter"):
+        assert token not in chrome, token
 
 
 def check_explorer_overlay_drop() -> None:

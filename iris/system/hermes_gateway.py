@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from iris.infrastructure.hermes_client import HermesClient, HealthProbeResult
+from iris.infrastructure.hermes_client import (
+    GatewayReadyResult,
+    HermesClient,
+    HealthProbeResult,
+)
 from iris.infrastructure.hermes_credentials import (
     hermes_home,
     load_hermes_dotenv,
@@ -33,6 +37,7 @@ CODE_HEALTH_BAD_BODY = "HEALTH_BAD_BODY"  # G7
 CODE_HEALTH_REFUSED = "HEALTH_REFUSED"
 CODE_SECURITY_BLOCK = "SECURITY_BLOCK_SUSPECTED"  # G8
 CODE_API_KEY_SEPARATE = "API_KEY_NOT_HEALTH"  # G10 (안내 전용)
+CODE_MODELS_404 = "MODELS_404"  # /health OK · /v1/models 404
 CODE_START_FAILED = "START_FAILED"
 
 _POLLUTION_ENV_KEYS = (
@@ -75,6 +80,9 @@ class GatewayDiagnosis:
     hermes_home: str = ""
     api_server_enabled: str = ""
     has_api_key: bool = False
+    models_ok: bool | None = None
+    chat_auth: str = ""
+    ready_detail: str = ""
     timestamp: str = ""
 
     def user_message(self) -> str:
@@ -120,23 +128,54 @@ def clear_last_gateway_diagnosis() -> None:
 
 
 def mark_gateway_already_running(base_url: str) -> GatewayDiagnosis:
-    """이미 /health OK인 gateway — 진단을 OK로 덮어써 잔상 TIMEOUT을 막는다."""
+    """이미 /health OK인 gateway — ready(/v1/models)·chat_auth 까지 스냅샷."""
     health = probe_gateway_health(base_url, timeout_sec=2.0)
+    key = resolve_hermes_api_key()
+    client = HermesClient(base_url, api_key=key)
+    ready = client.probe_gateway_ready(timeout_sec=3.0)
+    chat = ""
+    if ready.ok:
+        try:
+            chat = client.probe_chat_auth()
+        except Exception:
+            chat = "error"
+    fail_code = CODE_OK
+    if not ready.ok:
+        if ready.code == "models_404" or ready.http_status == 404:
+            fail_code = CODE_MODELS_404
+        else:
+            fail_code = CODE_API_KEY_SEPARATE
     return _set_diagnosis(
         GatewayDiagnosis(
-            code=CODE_OK,
-            ok=True,
-            message="gateway 이미 실행 중",
+            code=fail_code if not ready.ok else CODE_OK,
+            ok=bool(ready.ok),
+            message=(
+                "gateway 이미 실행 중 (ready OK)"
+                if ready.ok
+                else "gateway /health OK · ready 실패"
+            ),
+            detail=ready.detail,
             health={
                 "code": health.code,
                 "url": health.url,
                 "summary": health.body_summary,
             },
-            has_api_key=bool(resolve_hermes_api_key()),
+            has_api_key=bool(key),
             api_server_enabled=load_hermes_dotenv().get("API_SERVER_ENABLED", "true"),
             port=gateway_port_from_base_url(base_url),
+            models_ok=ready.models_ok,
+            chat_auth=chat,
+            ready_detail=ready.detail,
         )
     )
+
+
+def probe_gateway_ready(
+    base_url: str, *, api_key: str = "", timeout_sec: float = 5.0
+) -> GatewayReadyResult:
+    return HermesClient(
+        base_url, api_key=resolve_hermes_api_key(api_key)
+    ).probe_gateway_ready(timeout_sec=timeout_sec)
 
 
 def gateway_diagnosis_path() -> Path:
@@ -922,6 +961,54 @@ def _windows_gateway_procs_alive() -> bool:
     return bool(_gateway_process_pids())
 
 
+def prune_orphan_gateway_procs(base_url: str = "") -> int:
+    """포트 LISTEN 소유자가 아닌 gateway run 좀비를 종료. 반환=종료 시도 수.
+
+    health OK인데 venv/runtime 이중 기동이 남아 있으면 재시작·키 교체 시 혼선.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return 0
+    port = gateway_port_from_base_url(base_url)
+    owners: set[int] = set()
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if not c.laddr or int(getattr(c.laddr, "port", 0) or 0) != port:
+                continue
+            if str(c.status).upper() != "LISTEN":
+                continue
+            if c.pid:
+                owners.add(int(c.pid))
+    except (psutil.Error, OSError, AttributeError):
+        return 0
+    if not owners:
+        return 0
+    me = os.getpid()
+    killed = 0
+    for pid in _gateway_process_pids():
+        if pid == me or pid in owners:
+            continue
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                    creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                )
+            else:
+                import signal
+
+                os.kill(pid, signal.SIGTERM)
+            killed += 1
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return killed
+
+
 def _force_kill_windows_gateway_procs() -> None:
     me = os.getpid()
     if sys.platform != "win32":
@@ -982,11 +1069,19 @@ def _wait_until_healthy(
     wait_sec: float,
     should_abort: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    require_ready: bool = True,
+    api_key: str = "",
 ) -> bool:
-    """짧은 간격 → backoff 폴링. 자식이 죽으면 즉시 실패 (G1/G4)."""
+    """짧은 간격 → backoff 폴링. 자식이 죽으면 즉시 실패 (G1/G4).
+
+    require_ready=True(기본): /health OK 후에도 /v1/models 까지 본다.
+    health만 통과시키고 models 404인 좀비를 '기동 성공'으로 두지 않는다.
+    """
     deadline = time.monotonic() + max(5.0, wait_sec)
     delay = 0.25
     last_health: HealthProbeResult | None = None
+    last_ready: GatewayReadyResult | None = None
+    key = resolve_hermes_api_key(api_key)
     while time.monotonic() < deadline:
         if should_abort and should_abort():
             return False
@@ -1008,39 +1103,136 @@ def _wait_until_healthy(
                     stdout_log=out_log,
                     stderr_log=err_log,
                     detail=err_tail[:1500],
-                    has_api_key=bool(resolve_hermes_api_key()),
+                    has_api_key=bool(key),
                 )
             )
             return False
         health = probe_gateway_health(base_url, timeout_sec=min(2.0, delay + 1.0))
         last_health = health
         if health.ok:
-            _set_diagnosis(
-                GatewayDiagnosis(
-                    code=CODE_OK,
-                    ok=True,
-                    message="gateway /health OK",
-                    health={
-                        "code": health.code,
-                        "url": health.url,
-                        "summary": health.body_summary,
-                    },
-                    log_dir=str(_gateway_log_dir()),
-                    stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
-                    stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
-                    has_api_key=bool(resolve_hermes_api_key()),
-                    api_server_enabled=load_hermes_dotenv().get(
-                        "API_SERVER_ENABLED", "true"
-                    ),
+            if not require_ready:
+                _set_diagnosis(
+                    GatewayDiagnosis(
+                        code=CODE_OK,
+                        ok=True,
+                        message="gateway /health OK",
+                        health={
+                            "code": health.code,
+                            "url": health.url,
+                            "summary": health.body_summary,
+                        },
+                        log_dir=str(_gateway_log_dir()),
+                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                        has_api_key=bool(key),
+                        api_server_enabled=load_hermes_dotenv().get(
+                            "API_SERVER_ENABLED", "true"
+                        ),
+                    )
                 )
+                return True
+            ready = probe_gateway_ready(
+                base_url, api_key=key, timeout_sec=min(3.0, delay + 1.5)
             )
-            return True
-        if on_progress:
+            last_ready = ready
+            if ready.ok:
+                _set_diagnosis(
+                    GatewayDiagnosis(
+                        code=CODE_OK,
+                        ok=True,
+                        message="gateway /health·/v1/models OK",
+                        health={
+                            "code": health.code,
+                            "url": health.url,
+                            "summary": health.body_summary,
+                        },
+                        log_dir=str(_gateway_log_dir()),
+                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                        has_api_key=bool(key),
+                        api_server_enabled=load_hermes_dotenv().get(
+                            "API_SERVER_ENABLED", "true"
+                        ),
+                        models_ok=True,
+                        ready_detail=ready.detail,
+                    )
+                )
+                return True
+            # 401/no_key는 시간이 지나도 안 살아남 — wait_sec 끝까지 끌지 않음
+            if ready.code in ("no_key",) or ready.http_status in (401, 403):
+                code = CODE_API_KEY_SEPARATE
+                _set_diagnosis(
+                    GatewayDiagnosis(
+                        code=code,
+                        ok=False,
+                        message=(
+                            f"gateway /health OK 이지만 ready 실패 ({ready.code})."
+                        ),
+                        action="API 키 정합 후 gateway를 재기동하세요.",
+                        detail=ready.detail,
+                        log_dir=str(_gateway_log_dir()),
+                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                        health={
+                            "code": health.code,
+                            "url": health.url,
+                            "summary": health.body_summary,
+                        },
+                        port=gateway_port_from_base_url(base_url),
+                        has_api_key=bool(key),
+                        api_server_enabled=load_hermes_dotenv().get(
+                            "API_SERVER_ENABLED", ""
+                        ),
+                        models_ok=False,
+                        ready_detail=ready.detail,
+                    )
+                )
+                return False
+            if on_progress:
+                on_progress(f"ready 대기… ({ready.code})")
+        elif on_progress:
             on_progress(f"health 대기… ({health.code})")
         time.sleep(delay)
         delay = min(2.0, delay * 1.35)
 
     # timeout — 재시작 전 원인 스냅샷
+    if last_health and last_health.ok and last_ready and not last_ready.ok:
+        code = (
+            CODE_MODELS_404
+            if last_ready.code == "models_404" or last_ready.http_status == 404
+            else CODE_API_KEY_SEPARATE
+        )
+        action = (
+            "API 키 rotate가 아니라 gateway 완전 재기동·API_SERVER_KEY 환경 주입을 확인하세요."
+            if code == CODE_MODELS_404
+            else "API 키 정합 후 gateway를 재기동하세요."
+        )
+        _set_diagnosis(
+            GatewayDiagnosis(
+                code=code,
+                ok=False,
+                message=(
+                    f"gateway /health OK 이지만 ready 실패 ({last_ready.code})."
+                ),
+                action=action,
+                detail=last_ready.detail,
+                log_dir=str(_gateway_log_dir()),
+                stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                health={
+                    "code": last_health.code,
+                    "url": last_health.url,
+                    "summary": last_health.body_summary,
+                },
+                port=gateway_port_from_base_url(base_url),
+                has_api_key=bool(key),
+                api_server_enabled=load_hermes_dotenv().get("API_SERVER_ENABLED", ""),
+                models_ok=False,
+                ready_detail=last_ready.detail,
+            )
+        )
+        return False
+
     code = _health_to_fail_code(last_health) if last_health else CODE_TIMEOUT
     err_tail = _tail_log(_LAST_LOG_PATHS[1] if _LAST_LOG_PATHS else None)
     _set_diagnosis(
@@ -1052,7 +1244,7 @@ def _wait_until_healthy(
                 "계속 실패하면 stderr 로그와 포트 점유를 확인하세요."
                 + (
                     " (참고: API 키 문제는 /health와 무관합니다 — 채팅 단계에서 진단됩니다.)"
-                    if not resolve_hermes_api_key()
+                    if not key
                     else ""
                 )
             ),
@@ -1066,11 +1258,21 @@ def _wait_until_healthy(
             },
             detail=err_tail[:1500],
             port=gateway_port_from_base_url(base_url),
-            has_api_key=bool(resolve_hermes_api_key()),
+            has_api_key=bool(key),
             api_server_enabled=load_hermes_dotenv().get("API_SERVER_ENABLED", ""),
         )
     )
     return False
+
+
+def _apply_ollama_options_guard_now() -> bool:
+    """설치본 options 가드. True 면 이번에 디스크가 바뀌었다."""
+    try:
+        from iris.system.hermes_ollama_guard import apply_ollama_options_guard
+
+        return bool(apply_ollama_options_guard(_hermes_agent_dir()))
+    except Exception:
+        return False
 
 
 def ensure_hermes_gateway_running(
@@ -1082,8 +1284,9 @@ def ensure_hermes_gateway_running(
     should_abort: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> bool:
-    """켜져 있으면 즉시 True. 아니면 기동 후 /health 준비까지 대기."""
+    """켜져 있으면 즉시 True. 아니면 기동 후 /health·/v1/models 준비까지 대기."""
     key = resolve_hermes_api_key(api_key)
+    guard_changed = _apply_ollama_options_guard_now()
 
     def _note(msg: str) -> None:
         if on_progress:
@@ -1092,23 +1295,50 @@ def ensure_hermes_gateway_running(
     def _aborted() -> bool:
         return bool(should_abort and should_abort())
 
-    # 이미 Hermes health OK
+    # 이미 Hermes ready OK
     health = probe_gateway_health(base_url, timeout_sec=2.0)
-    if health.ok:
-        _set_diagnosis(
-            GatewayDiagnosis(
-                code=CODE_OK,
-                ok=True,
-                message="gateway 이미 실행 중",
-                health={
-                    "code": health.code,
-                    "url": health.url,
-                    "summary": health.body_summary,
-                },
-                has_api_key=bool(key),
-            )
+    if health.ok and guard_changed:
+        _note("Ollama options 가드 반영 — gateway 1회 재시작")
+        return restart_hermes_gateway(
+            base_url,
+            api_key=key,
+            command=command,
+            wait_sec=wait_sec,
+            should_abort=should_abort,
+            on_progress=on_progress,
         )
-        return True
+    if health.ok:
+        n = prune_orphan_gateway_procs(base_url)
+        if n:
+            _note(f"orphan gateway {n}개 정리")
+        ready = probe_gateway_ready(base_url, api_key=key, timeout_sec=3.0)
+        if ready.ok:
+            _set_diagnosis(
+                GatewayDiagnosis(
+                    code=CODE_OK,
+                    ok=True,
+                    message="gateway 이미 실행 중 (ready OK)",
+                    health={
+                        "code": health.code,
+                        "url": health.url,
+                        "summary": health.body_summary,
+                    },
+                    has_api_key=bool(key),
+                    models_ok=True,
+                    ready_detail=ready.detail,
+                )
+            )
+            return True
+        # health만 OK · models 실패 — 키/라우트 불일치 좀비. 재기동으로 이어감
+        _note(f"gateway /health OK · ready 실패 ({ready.code}) — 재기동…")
+        stop_hermes_gateway(
+            command,
+            wait_sec=min(12.0, wait_sec / 2),
+            should_abort=should_abort,
+        )
+        if _aborted():
+            return False
+        # stop 후 아래 start 경로로 계속
     if _aborted():
         return False
 
@@ -1141,7 +1371,8 @@ def ensure_hermes_gateway_running(
             wait_sec=min(12.0, wait_sec / 2),
             should_abort=should_abort,
         )
-        if probe_gateway_health(base_url, timeout_sec=2.0).ok:
+        ready_now = probe_gateway_ready(base_url, api_key=key, timeout_sec=2.0)
+        if ready_now.ok:
             return True
     if _aborted():
         return False
@@ -1168,6 +1399,17 @@ def ensure_hermes_gateway_running(
             )
         )
         return False
+    if not env.get("API_SERVER_KEY", "").strip():
+        _set_diagnosis(
+            GatewayDiagnosis(
+                code=CODE_ENV_POLLUTION,
+                message="API_SERVER_KEY가 없어 api_server(/v1/models)가 기동되지 않습니다.",
+                action="시작 프로토콜 hermes_env 단계에서 키를 동기화하세요.",
+                api_server_enabled=env.get("API_SERVER_ENABLED", ""),
+                has_api_key=False,
+            )
+        )
+        return False
 
     _note("Hermes gateway 기동…")
     if not start_hermes_gateway(command):
@@ -1177,6 +1419,8 @@ def ensure_hermes_gateway_running(
         wait_sec=wait_sec,
         should_abort=should_abort,
         on_progress=on_progress,
+        require_ready=True,
+        api_key=key,
     )
 
 
@@ -1241,6 +1485,8 @@ def restart_hermes_gateway(
         wait_sec=wait_sec,
         should_abort=should_abort,
         on_progress=on_progress,
+        require_ready=True,
+        api_key=key,
     )
     if not ok and _LAST_DIAGNOSIS is not None:
         # 이전 health 정보를 detail에 보강

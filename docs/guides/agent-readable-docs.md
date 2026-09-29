@@ -63,7 +63,17 @@ Agent-readable:
 
 | 층 | 산출물 | 독자 |
 |----|--------|------|
-| 도메인 | `domain.md`, `IA.md` | 인간·에이전트 |
-| 확장 | `guides/extending-iris.md` | 기여자 |
+| 도메인 | `domain.md`, `IA.md`, `IRIS_개발문서.md` | 인간·에이전트 |
+| 확장·수정 위치 | `guides/extending-iris.md` §3–§4 | 기여자 |
 | 검증 | `검증/*`, `_check_*.py` | 검증관·CI |
-| 모듈 | Agent-readable 헤더 | 패치 단위 AI |
+| 패키지 pydoc | 모든 `iris/**/__init__.py` 의 Agent-readable | `pydoc` · 패치 단위 AI |
+| 경계 클래스 | `UserTurnDispatcher`, `ActionRegistry` | 턴 큐 · 액션 인터페이스 |
+
+확인:
+
+```powershell
+.venv\Scripts\python.exe -m iris.system._check_agent_readable_headers
+.venv\Scripts\python.exe -m pydoc iris.runtime
+```
+
+공개 함수마다 한 줄 주석을 채우지는 않는다. AI와 기여자는 패키지 헤더로 경계를 읽고, 그다음 해당 파일을 연다.

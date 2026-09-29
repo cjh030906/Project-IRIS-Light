@@ -242,6 +242,11 @@ export class IrisIdeBridgePoller implements FrontendApplicationContribution {
         return { command: body, queued: true, via: 'theia_terminal', cwd, shell, delivered: true };
     }
 
+    /** 편집기 탭 실행 버튼 — 브리지 큐와 같은 셸 맞춤 전송. */
+    runArgv(argv: string[], cwd: string): Promise<Record<string, unknown>> {
+        return this.runInTerminal({ argv, cwd });
+    }
+
     /** 기존 터미널 재사용 — newTerminal+start 가 Windows ConPTY에서 자주 멈춘다. */
     protected async ensureTerminal(cwd: string): Promise<TerminalWidget> {
         const reuse = this.terminalService.currentTerminal || this.terminalService.lastUsedTerminal;
