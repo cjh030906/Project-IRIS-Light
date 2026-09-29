@@ -1,6 +1,7 @@
 """검색·캘린더 외부 API 키 — Hermes/Iris .env 읽기·저장 + 발급 링크.
 
-검색은 프리셋 하나 + 키. Hermes가 아는 백엔드는 config.yaml web.search_backend 에도 반영.
+검색은 프리셋 여러 개 + 키. Hermes가 아는 백엔드는 그중 마지막 Hermes 연동 항목을
+config.yaml web.search_backend 에 반영한다.
 캘린더: data.go.kr 특일정보 (IRIS_DATA_GO_KR_SERVICE_KEY)
 """
 
@@ -14,6 +15,7 @@ from iris.config.settings import default_env_path
 from iris.infrastructure.hermes_credentials import hermes_home, load_hermes_dotenv
 
 SEARCH_PRESET_ENV = "IRIS_SEARCH_PRESET"
+SEARCH_ENTRIES_ENV = "IRIS_SEARCH_ENTRIES"
 
 
 @dataclass(frozen=True)
@@ -208,6 +210,29 @@ def search_preset_by_id(preset_id: str) -> SearchPreset:
     return _PRESET_BY_ID.get(preset_id or "", SEARCH_PRESETS[0])
 
 
+def parse_search_entry_ids(raw: str) -> list[str]:
+    ids: list[str] = []
+    for part in (raw or "").split(","):
+        pid = part.strip()
+        if pid in _PRESET_BY_ID and pid != "none" and pid not in ids:
+            ids.append(pid)
+    return ids
+
+
+def active_search_preset_id(entry_ids: list[str]) -> str:
+    """Hermes 웹검색은 백엔드가 하나다. 목록에서 Hermes 연동인 마지막 항목을 쓴다."""
+    last_hermes = ""
+    last_any = "none"
+    for pid in entry_ids:
+        preset = search_preset_by_id(pid)
+        if preset.id == "none":
+            continue
+        last_any = preset.id
+        if preset.hermes_backend:
+            last_hermes = preset.id
+    return last_hermes or last_any
+
+
 def search_env_keys() -> tuple[str, ...]:
     keys: list[str] = []
     for preset in SEARCH_PRESETS:
@@ -264,7 +289,32 @@ def load_search_preset_id() -> str:
     return "none"
 
 
-def save_search_api_keys(values: dict[str, str], *, preset_id: str = "") -> Path:
+def load_search_entries() -> list[str]:
+    """등록된 검색 프리셋 id. 목록 키가 없으면 기존 단일 프리셋·저장된 키로 옮긴다."""
+    env = load_hermes_dotenv()
+    if SEARCH_ENTRIES_ENV in env or SEARCH_ENTRIES_ENV in os.environ:
+        raw = (env.get(SEARCH_ENTRIES_ENV) or os.environ.get(SEARCH_ENTRIES_ENV) or "")
+        return parse_search_entry_ids(raw)
+    saved = load_search_api_keys()
+    active = load_search_preset_id()
+    ids: list[str] = []
+    for preset in SEARCH_PRESETS:
+        if preset.id == "none":
+            continue
+        has_key = bool(preset.env_key and saved.get(preset.env_key))
+        if has_key or (preset.key_optional and preset.id == active):
+            ids.append(preset.id)
+    if not ids and active != "none":
+        ids.append(active)
+    return ids
+
+
+def save_search_api_keys(
+    values: dict[str, str],
+    *,
+    preset_id: str = "",
+    entry_ids: list[str] | None = None,
+) -> Path:
     """검색 키와 선택 프리셋을 Hermes .env에 저장하고 프로세스 환경에도 반영."""
     existing = load_hermes_dotenv()
     updates: dict[str, str] = {}
@@ -277,6 +327,9 @@ def save_search_api_keys(values: dict[str, str], *, preset_id: str = "") -> Path
     pid = (preset_id or values.get(SEARCH_PRESET_ENV) or "").strip()
     if pid in _PRESET_BY_ID:
         updates[SEARCH_PRESET_ENV] = pid
+    if entry_ids is not None:
+        ids = parse_search_entry_ids(",".join(entry_ids))
+        updates[SEARCH_ENTRIES_ENV] = ",".join(ids)
     path = hermes_home() / ".env"
     if updates:
         upsert_dotenv(path, updates)
@@ -389,5 +442,9 @@ if __name__ == "__main__":
     assert search_preset_by_id("ddgs").key_optional and not search_preset_by_id("ddgs").signup_url
     assert "data.go.kr" in CALENDAR_API_FIELD.signup_url
     assert "SERPAPI_API_KEY" in search_env_keys()
+    assert parse_search_entry_ids("serpapi, brave, nope, serpapi") == ["serpapi", "brave"]
+    assert active_search_preset_id(["serpapi", "brave", "tavily"]) == "tavily"
+    assert active_search_preset_id(["brave", "serpapi"]) == "brave"
+    assert active_search_preset_id([]) == "none"
     _check_backend_splice()
     print("external_api_keys ok", len(SEARCH_PRESETS))

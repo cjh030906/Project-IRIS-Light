@@ -50,6 +50,49 @@ def probe_status_from_http_detail(detail: str) -> str:
     return "unavailable"
 
 
+def cleanup_verdict(
+    status: str,
+    *,
+    transient: bool,
+    capabilities: list[str] | None,
+    show_ok: bool,
+) -> tuple[str, str]:
+    """모델 정리 판정 — (state, tool_support).
+
+    state: ok | unverified | unavailable. tool: yes | no | unknown.
+    타임아웃·429·5xx는 unverified라 목록에 남긴다. 구독 전용·대화 거부는 제외.
+    """
+    if transient:
+        return "unverified", "unknown"
+    if status != "ok":
+        return "unavailable", "unknown"
+    if not show_ok:
+        return "ok", "unknown"
+    return "ok", ("yes" if supports_tools_capability(capabilities) else "no")
+
+
+def apply_ollama_cleanup(
+    model: OllamaModelInfo, record: dict[str, str] | None
+) -> OllamaModelInfo | None:
+    """저장된 정리 결과. unavailable이면 None(피커에서 제외)."""
+    if not record:
+        return model
+    if record.get("state") == "unavailable":
+        return None
+    tool = str(record.get("tool") or "")
+    if tool not in ("yes", "no", "unknown"):
+        return model
+    return OllamaModelInfo(
+        name=model.name,
+        catalog_name=model.catalog_name,
+        size=model.size,
+        digest=model.digest,
+        supports_tools=tool != "no",
+        requires_subscription=model.requires_subscription,
+        tool_support=tool,
+    )
+
+
 def display_name_from_runtime(runtime_name: str) -> str:
     """UI용 짧은 모델명.
 
@@ -252,8 +295,10 @@ class OllamaClient:
         return supports_tools_capability(data.get("capabilities"))
 
 
-    def probe_model_status(self, runtime_name: str, *, timeout_sec: float = 25.0) -> str:
-        """'ok' | 'subscription' | 'unavailable'."""
+    def probe_model_outcome(
+        self, runtime_name: str, *, timeout_sec: float = 25.0
+    ) -> tuple[str, bool]:
+        """(status, transient). transient면 네트워크·과부하 — 모델 탓으로 빼지 않음."""
         payload = {
             "model": runtime_name,
             "messages": [{"role": "user", "content": "ping"}],
@@ -268,12 +313,36 @@ class OllamaClient:
         try:
             with urlopen(req, timeout=timeout_sec) as resp:
                 json.loads(resp.read().decode("utf-8"))
-            return "ok"
+            return "ok", False
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            return probe_status_from_http_detail(detail)
+            status = probe_status_from_http_detail(detail)
+            code = int(e.code)
+            if status == "subscription":
+                return status, False
+            if code in (401, 429) or code >= 500:
+                return "unavailable", True
+            return status, False
         except (URLError, TimeoutError, json.JSONDecodeError, OSError):
-            return "unavailable"
+            return "unavailable", True
+
+    def probe_model_status(self, runtime_name: str, *, timeout_sec: float = 25.0) -> str:
+        """'ok' | 'subscription' | 'unavailable'."""
+        status, _transient = self.probe_model_outcome(runtime_name, timeout_sec=timeout_sec)
+        return status
+
+    def classify_model(self, runtime_name: str, *, timeout_sec: float = 25.0) -> tuple[str, str]:
+        """모델 정리 1건 — (state, tool_support)."""
+        status, transient = self.probe_model_outcome(runtime_name, timeout_sec=timeout_sec)
+        if transient or status != "ok":
+            return cleanup_verdict(
+                status, transient=transient, capabilities=None, show_ok=False
+            )
+        data = self.show_model(runtime_name)
+        caps = data.get("capabilities") if isinstance(data.get("capabilities"), list) else None
+        return cleanup_verdict(
+            status, transient=False, capabilities=caps, show_ok=bool(data)
+        )
 
     def probe_model_available(self, runtime_name: str, *, timeout_sec: float = 25.0) -> bool:
         """구독 없이 호출 가능하면 True (무료 tier 포함)."""
@@ -423,6 +492,25 @@ if __name__ == "__main__":
     assert probe_status_from_http_detail("requires a subscription to use") == "subscription"
     assert probe_status_from_http_detail("please upgrade your plan") == "subscription"
     assert probe_status_from_http_detail("model not found") == "unavailable"
+    assert cleanup_verdict("ok", transient=True, capabilities=["tools"], show_ok=True) == (
+        "unverified",
+        "unknown",
+    )
+    assert cleanup_verdict("subscription", transient=False, capabilities=None, show_ok=False) == (
+        "unavailable",
+        "unknown",
+    )
+    assert cleanup_verdict("ok", transient=False, capabilities=["tools"], show_ok=True) == (
+        "ok",
+        "yes",
+    )
+    assert cleanup_verdict("ok", transient=False, capabilities=["completion"], show_ok=True) == (
+        "ok",
+        "no",
+    )
+    kept = apply_ollama_cleanup(OllamaModelInfo(name="a"), {"state": "ok", "tool": "no"})
+    assert kept is not None and kept.supports_tools is False and kept.tool_support == "no"
+    assert apply_ollama_cleanup(OllamaModelInfo(name="dead"), {"state": "unavailable"}) is None
     m = OllamaModelInfo(name="x:cloud", supports_tools=False, requires_subscription=True)
     assert m.supports_tools is False and m.requires_subscription is True
     assert display_name_from_runtime("gemma4:31b-cloud") == "gemma4:31b"

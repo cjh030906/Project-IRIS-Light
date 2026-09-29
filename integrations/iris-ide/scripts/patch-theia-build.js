@@ -105,10 +105,14 @@ if (fs.existsSync(iconIco)) {
 const bundlePath = path.join(frontendDir, 'bundle.js');
 const bundleText = fs.existsSync(bundlePath) ? fs.readFileSync(bundlePath, 'utf8') : '';
 const bundleHasIris = bundleText.includes('iris-ide-frontend-module');
-// ponytail: 예전엔 module 문자열만 보면 스킵 → Open Folder/DnD 없는 구번들 고착
+// ponytail: module 문자열만 보면 스킵되어 구번들이 남는다.
+// 시작 화면(showStartScreen)과 셸 맞춤 실행(IRIS_EXIT:)이 없으면 다시 묶는다.
 const bundleHasCurrentExt =
     bundleText.includes('iris.ide.openFolder') &&
-    bundleText.includes('ide.pick_open_folder');
+    bundleText.includes('ide.pick_open_folder') &&
+    bundleText.includes('iris.ide.showStartScreen') &&
+    bundleText.includes('iris.ide.runFile') &&
+    bundleText.includes('IRIS_EXIT:');
 if (rebundle || !bundleHasIris || !bundleHasCurrentExt) {
     console.log('patch-theia-build: rebundling frontend (iris extension)...');
     execSync('node esbuild.mjs', { cwd: root, stdio: 'inherit' });

@@ -281,15 +281,100 @@ def is_run_request(text: str) -> bool:
     return any(w in s for w in ("실행", "출력", "돌려", "run", "execute", "print"))
 
 
-def extract_first_code_block(text: str) -> dict | None:
-    match = re.search(r"```([^\n`]*)\n(.*?)```", text or "", flags=re.DOTALL)
-    if not match:
+_FENCE_LANGS = tuple(
+    sorted(
+        {
+            "python", "py", "javascript", "js", "typescript", "ts", "tsx", "jsx",
+            "bash", "sh", "shell", "json", "html", "css", "cpp", "c", "java",
+            "go", "rust", "rs", "ruby", "rb", "php", "sql", "markdown", "md",
+            "yaml", "yml", "xml", "text", "plaintext", "kotlin", "swift", "lua",
+            "csharp", "cs",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _fence_header(line: str) -> tuple[str, str] | None:
+    """펜스 첫 줄 → (lang, 같은 줄에 붙은 코드).
+
+    None 이면 언어 태그가 아직 덜 옴(다음 청크를 기다린다).
+    인라인 코드가 비면 본문은 다음 줄부터다.
+    """
+    raw = line or ""
+    s = raw.strip()
+    if not s:
+        return "", ""
+    low = s.lower()
+    if any(lang.startswith(low) and lang != low for lang in _FENCE_LANGS):
         return None
-    info = (match.group(1) or "").strip()
-    code = (match.group(2) or "").strip("\n")
+    for lang in _FENCE_LANGS:
+        if (
+            low == lang
+            or low.startswith(lang + " ")
+            or low.startswith(lang + "\t")
+            or low.startswith(lang + ":")
+        ):
+            return lang, ""
+        if not low.startswith(lang):
+            continue
+        if any(other.startswith(low) and len(other) > len(lang) for other in _FENCE_LANGS):
+            continue
+        rest = s[len(lang) :]
+        if rest[:1].isalnum() or rest[:1] == "_":
+            return lang, rest
+    token = s.split()[0]
+    if re.fullmatch(r"[A-Za-z0-9_+#.\-]{1,32}", token) and (
+        " " in s or ":" in s or token == s
+    ):
+        return token.lower(), ""
+    return "", s
+
+
+def code_fence_body_start(raw: str) -> tuple[str, int] | None:
+    """첫 펜스가 열렸으면 (lang, 코드 시작 인덱스). 없거나 헤더가 덜 오면 None."""
+    text = raw or ""
+    idx = text.find("```")
+    if idx < 0:
+        return None
+    after = idx + 3
+    rest = text[after:]
+    nl = rest.find("\n")
+    close = rest.find("```")
+    if nl < 0 or (close >= 0 and close < nl):
+        chunk = rest[:close] if close >= 0 else rest
+        parts = _fence_header(chunk)
+        if parts is None:
+            return None
+        lang, inline = parts
+        if not inline.strip():
+            return None
+        lead = len(chunk) - len(chunk.lstrip())
+        return lang, after + lead + (len(chunk.strip()) - len(inline))
+    line = rest[:nl]
+    parts = _fence_header(line)
+    if parts is None:
+        return None
+    lang, inline = parts
+    if inline:
+        lead = len(line) - len(line.lstrip())
+        return lang, after + lead + (len(line.strip()) - len(inline))
+    return lang, after + nl + 1
+
+
+def extract_first_code_block(text: str) -> dict | None:
+    opened = code_fence_body_start(text or "")
+    if opened is None:
+        return None
+    lang, start = opened
+    tail = (text or "")[start:]
+    end = tail.find("```")
+    if end < 0:
+        return None
+    code = tail[:end].strip("\n")
     if not code.strip():
         return None
-    lang = (info.split() or [""])[0].lower()
     return {"lang": lang, "code": code}
 
 

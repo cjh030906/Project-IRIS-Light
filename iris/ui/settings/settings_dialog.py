@@ -46,12 +46,15 @@ from iris.infrastructure.external_api_keys import (
     CALENDAR_API_FIELD,
     SEARCH_PRESETS,
     SearchPreset,
+    active_search_preset_id,
     apply_hermes_search_backend,
     load_calendar_api_key,
     load_search_api_keys,
-    load_search_preset_id,
+    load_search_entries,
     save_calendar_api_key,
     save_search_api_keys,
+    search_env_keys,
+    search_preset_by_id,
 )
 from iris.knowledge.iris_wiki import IrisWiki
 from iris.storage.database import Database
@@ -73,6 +76,8 @@ from iris.storage.learning_prefs import (
 )
 from iris.storage.api_providers import (
     BASE_URL_PRESETS,
+    FreeLlmOffer,
+    preset_index_for_base_url,
     ApiProvider,
     delete_api_provider,
     load_api_providers,
@@ -90,6 +95,8 @@ from iris.ui.workers.email_workers import EmailVerifyWorker
 from iris.ui.widgets.ide_icons import ide_icon_for, show_ide_not_installed_dialog
 from iris.ui.widgets.mic_input_meter import MicThresholdBar
 from iris.ui.settings import settings_service
+from iris.ui.settings.email_connect_guide import build_email_connect_panel
+from iris.ui.settings.free_llm_list import build_free_llm_list
 from iris.ui.settings.hud_dialog import (
     build_chat_title_box,
     configure_form,
@@ -373,6 +380,9 @@ class SettingsDialog(QDialog):
         if db is not None:
             self._sync_ide_selection_ui_quick()
             self._reload_account_list()
+        # 첫 Show 전에 흰 클라이언트가 한 프레임 보인다. 레이아웃 다음 틱에 드러낸다.
+        self._settings_revealed = False
+        self.setWindowOpacity(0.0)
 
     @staticmethod
     def _open_signup_url(url: str) -> None:
@@ -384,23 +394,33 @@ class SettingsDialog(QDialog):
         lay.setSpacing(TOKENS.spacing_sm)
         lay.addWidget(
             make_hint(
-                "검색·캘린더·LLM을 한곳에서 넣습니다. 검색 프리셋을 고르면 옆 「발급」이 "
-                "그 서비스의 키 발급 페이지를 엽니다. 키는 그 아래 칸에 넣고 저장하세요."
+                "검색·캘린더·LLM을 같은 형식으로 나눠 둡니다. "
+                "검색은 프리셋과 키를 넣은 뒤 「추가」로 여러 개 등록합니다."
             )
         )
-        form = QFormLayout()
-        configure_form(form)
-        self._search_form = form
-        self._install_search_preset_rows(form)
-        self._install_calendar_key_row(form)
-        lay.addLayout(form)
+        lay.addWidget(self._build_search_api_box())
+        lay.addWidget(self._build_calendar_api_box())
         if self._db is not None:
             lay.addWidget(self._build_api_providers_box())
         return box
 
-    def _install_search_preset_rows(self, form: QFormLayout) -> None:
+    def _build_search_api_box(self) -> QGroupBox:
+        box = QGroupBox("검색")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(TOKENS.spacing_sm)
+        lay.addWidget(
+            make_hint(
+                "프리셋과 API Key를 채운 뒤 「추가」를 누르세요. 옆 「발급」은 그 서비스의 "
+                "키 페이지를 엽니다. 여러 개를 등록할 수 있고, Hermes 웹검색은 그중 "
+                "Hermes에 연결되는 마지막 항목을 사용합니다."
+            )
+        )
         self._search_draft = load_search_api_keys()
+        self._search_entries: list[str] = load_search_entries()
         self._search_preset_obj: SearchPreset | None = None
+        form = QFormLayout()
+        configure_form(form)
+        self._search_form = form
         self._search_preset = QComboBox()
         for preset in SEARCH_PRESETS:
             label = preset.label + (" ★" if preset.recommended else "")
@@ -427,30 +447,63 @@ class SettingsDialog(QDialog):
         form.addRow(make_form_label("API Key"), self._search_api_key)
         form.addRow(self._search_extra_label, self._search_extra_key)
         self._search_extra_row = form.rowCount() - 1
-        initial = self._search_preset.findData(load_search_preset_id())
-        self._search_preset.blockSignals(True)
-        self._search_preset.setCurrentIndex(initial if initial >= 0 else 0)
-        self._search_preset.blockSignals(False)
-        self._apply_search_preset(self._search_preset.currentIndex())
+        lay.addLayout(form)
+        self._apply_search_preset(0)
 
-    def _install_calendar_key_row(self, form: QFormLayout) -> None:
+        row = QHBoxLayout()
+        btn_add = QPushButton("추가")
+        btn_add.clicked.connect(self._on_search_add)
+        row.addWidget(btn_add)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self._search_status = QLabel("")
+        self._search_status.setWordWrap(True)
+        self._search_status.setObjectName("HudHint")
+        lay.addWidget(self._search_status)
+
+        lay.addWidget(make_hint("등록된 검색 API"))
+        self._search_list_host = QVBoxLayout()
+        self._search_list_host.setSpacing(6)
+        lay.addLayout(self._search_list_host)
+        self._reload_search_rows()
+        return box
+
+    def _build_calendar_api_box(self) -> QGroupBox:
+        box = QGroupBox("캘린더")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(TOKENS.spacing_sm)
         field = CALENDAR_API_FIELD
+        lay.addWidget(
+            make_hint(
+                f"{field.label}. {field.hint} "
+                "「발급」으로 키 페이지를 연 뒤 아래에 넣고 저장하세요."
+            )
+        )
+        form = QFormLayout()
+        configure_form(form)
+        provider = QLabel(field.label + (" ★" if field.recommended else ""))
+        provider.setObjectName("HudMetricName")
+        provider.setWordWrap(True)
         initial = load_calendar_api_key() or self._settings.data_go_kr_service_key
         self._calendar_api_key = QLineEdit(initial)
         self._calendar_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._calendar_api_key.setMinimumHeight(32)
         self._calendar_api_key.setPlaceholderText(field.hint)
         self._calendar_api_key.setToolTip(field.hint)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-        row.addWidget(self._calendar_api_key, 1)
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(8)
+        key_row.addWidget(self._calendar_api_key, 1)
         btn = QPushButton("발급")
         btn.setFixedWidth(56)
         btn.setToolTip("공공데이터포털 특일정보 API 발급 페이지 열기")
         btn.clicked.connect(lambda: self._open_signup_url(field.signup_url))
-        row.addWidget(btn, 0)
-        form.addRow(make_form_label("캘린더 API Key"), row)
+        key_row.addWidget(btn, 0)
+        form.addRow(make_form_label("제공자"), provider)
+        form.addRow(make_form_label("API Key"), key_row)
+        lay.addLayout(form)
+        return box
 
     def _on_search_preset_changed(self, index: int) -> None:
         self._stash_search_preset_fields()
@@ -506,16 +559,134 @@ class SettingsDialog(QDialog):
         if preset is not None and preset.signup_url:
             self._open_signup_url(preset.signup_url)
 
+    def _flush_search_form(self, *, silent: bool) -> bool:
+        """입력란이 갖춰져 있으면 등록 목록에 넣는다. 같은 프리셋은 키만 갱신."""
+        preset = self._search_preset_obj
+        if preset is None or preset.id == "none":
+            if not silent:
+                QMessageBox.warning(self, "검색 API 추가", "프리셋을 고르세요.")
+            return False
+        self._stash_search_preset_fields()
+        key = self._search_api_key.text().strip()
+        extra = self._search_extra_key.text().strip()
+        needs_key = bool(preset.env_key) and not preset.key_optional
+        if needs_key and not key:
+            if not silent:
+                QMessageBox.warning(self, "검색 API 추가", "API Key를 입력하세요.")
+            return False
+        if preset.extra_env and not extra:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "검색 API 추가",
+                    f"{preset.extra_label or '추가 키'}를 입력하세요.",
+                )
+            return False
+        if preset.id not in self._search_entries:
+            self._search_entries.append(preset.id)
+        return True
+
+    def _reset_search_form(self) -> None:
+        self._search_preset.blockSignals(True)
+        self._search_preset.setCurrentIndex(0)
+        self._search_preset.blockSignals(False)
+        self._apply_search_preset(0)
+
+    def _on_search_add(self) -> None:
+        if not self._flush_search_form(silent=False):
+            return
+        label = self._search_preset_obj.label if self._search_preset_obj else ""
+        self._search_status.setText(f"추가됨: {label}")
+        self._reset_search_form()
+        self._reload_search_rows()
+
+    def _on_search_delete(self, preset_id: str) -> None:
+        preset = search_preset_by_id(preset_id)
+        self._search_entries = [pid for pid in self._search_entries if pid != preset_id]
+        if preset.env_key:
+            self._search_draft[preset.env_key] = ""
+        if preset.extra_env:
+            self._search_draft[preset.extra_env] = ""
+        self._search_status.setText("삭제됨")
+        self._reload_search_rows()
+
+    def _search_row_secret(self, preset: SearchPreset) -> str:
+        parts: list[str] = []
+        if preset.env_key:
+            parts.append(mask_api_key(self._search_draft.get(preset.env_key, "")))
+        if preset.extra_env:
+            parts.append(mask_api_key(self._search_draft.get(preset.extra_env, "")))
+        return " · ".join(parts) if parts else "키 없음"
+
+    def _reload_search_rows(self) -> None:
+        while self._search_list_host.count():
+            item = self._search_list_host.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not self._search_entries:
+            empty = QLabel("등록된 검색 API 없음 — 위에서 추가하세요")
+            empty.setObjectName("HudHint")
+            self._search_list_host.addWidget(empty)
+            return
+        active = active_search_preset_id(self._search_entries)
+        for pid in self._search_entries:
+            preset = search_preset_by_id(pid)
+            row_w = QWidget()
+            row = QHBoxLayout(row_w)
+            row.setContentsMargins(0, 4, 0, 4)
+            row.setSpacing(10)
+            name = preset.label
+            if preset.hermes_backend and pid == active:
+                name = f"{name} · Hermes"
+            name_lbl = QLabel(name)
+            name_lbl.setObjectName("HudMetricName")
+            name_lbl.setMinimumWidth(120)
+            row.addWidget(name_lbl, 0)
+            key_lbl = QLabel(self._search_row_secret(preset))
+            key_lbl.setObjectName("HudHint")
+            key_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            key_lbl.setToolTip(preset.hint)
+            row.addWidget(key_lbl, 1)
+            if preset.signup_url:
+                btn_issue = QPushButton("발급")
+                btn_issue.setFixedWidth(56)
+                btn_issue.clicked.connect(
+                    lambda _=False, url=preset.signup_url: self._open_signup_url(url)
+                )
+                row.addWidget(btn_issue)
+            btn_del = QPushButton("삭제")
+            btn_del.setFixedWidth(52)
+            btn_del.clicked.connect(lambda _=False, rid=pid: self._on_search_delete(rid))
+            row.addWidget(btn_del)
+            self._search_list_host.addWidget(row_w)
+
+    def _search_draft_for_save(self) -> dict[str, str]:
+        keep: set[str] = set()
+        for pid in self._search_entries:
+            preset = search_preset_by_id(pid)
+            if preset.env_key:
+                keep.add(preset.env_key)
+            if preset.extra_env:
+                keep.add(preset.extra_env)
+        out = dict(self._search_draft)
+        for key in search_env_keys():
+            if key not in keep:
+                out[key] = ""
+        return out
+
     def _persist_search_calendar_api_keys(self) -> None:
         if hasattr(self, "_search_draft"):
-            self._stash_search_preset_fields()
-            preset = self._search_preset_obj
+            self._flush_search_form(silent=True)
+            active = active_search_preset_id(self._search_entries)
             save_search_api_keys(
-                self._search_draft,
-                preset_id=preset.id if preset is not None else "none",
+                self._search_draft_for_save(),
+                preset_id=active,
+                entry_ids=self._search_entries,
             )
-            if preset is not None and preset.hermes_backend:
-                apply_hermes_search_backend(preset.hermes_backend)
+            backend = search_preset_by_id(active).hermes_backend
+            if backend:
+                apply_hermes_search_backend(backend)
         if hasattr(self, "_calendar_api_key"):
             key = self._calendar_api_key.text().strip()
             save_calendar_api_key(key)
@@ -532,6 +703,7 @@ class SettingsDialog(QDialog):
                 "초록=정상(채팅 모델에 표시), 주황=목록만 성공·대화 실패, 빨강=실패, 회색=미검사."
             )
         )
+        lay.addWidget(build_free_llm_list(self._on_free_llm_picked))
 
         form = QFormLayout()
         configure_form(form)
@@ -622,8 +794,9 @@ class SettingsDialog(QDialog):
             btn_verify = QPushButton("모델 정리")
             btn_verify.setFixedWidth(74)
             btn_verify.setToolTip(
-                "등록된 모델을 하나씩 호출해 사용 가능 여부와 도구 지원을 확인하고, "
-                "쓸 수 없는 모델을 목록에서 제외합니다."
+                "등록된 모델을 하나씩 호출해 사용 가능 여부와 도구 지원을 확인합니다. "
+                "제공자가 모델 없음·비채팅이라고 한 경우만 목록에서 뺍니다. "
+                "요청 형식 오류나 시간 초과로는 빼지 않습니다."
             )
             btn_verify.clicked.connect(lambda _=False, pid=p.id: self._on_api_verify_models(pid))
             btn_del = QPushButton("삭제")
@@ -640,6 +813,19 @@ class SettingsDialog(QDialog):
         # 폼에 남은 입력도 저장 전에 반영
         self._flush_api_form_to_providers(silent=True)
         save_api_providers(self._db, self._api_providers)
+
+    def _on_free_llm_picked(self, offer: FreeLlmOffer) -> None:
+        """무료 AI를 고르면 발급 페이지를 열고, 이름·프리셋·Base URL을 그 브랜드로 채운다."""
+        self._api_name.setText(offer.name)
+        index = preset_index_for_base_url(offer.base_url)
+        self._api_preset.blockSignals(True)
+        self._api_preset.setCurrentIndex(index)
+        self._api_preset.blockSignals(False)
+        url = str(self._api_preset.itemData(index) or offer.base_url)
+        if url:
+            self._api_base.setText(url)
+        self._api_status.setText(f"{offer.name} — 이름과 프리셋을 넣었습니다. 키를 붙여 넣으세요.")
+        self._open_signup_url(offer.signup_url)
 
     def _on_api_preset_changed(self, index: int) -> None:
         """프리셋은 Base URL 입력란을 채워줄 뿐 — 확정은 테스트 프로브가 함."""
@@ -733,7 +919,11 @@ class SettingsDialog(QDialog):
         if provider is None:
             return
         self._api_status.setText(f"추가됨: {provider.name} — 연결 테스트 중…")
+        self._verify_after_add_id = provider.id
         self._on_api_test(provider.id)
+        worker = self._api_probe_worker
+        if worker is None or not worker.isRunning():
+            self._verify_after_add_id = ""
 
     def _on_api_delete(self, provider_id: str) -> None:
         if self._db is None:
@@ -839,7 +1029,26 @@ class SettingsDialog(QDialog):
         self._api_providers = load_api_providers(self._db)
         self._reload_api_provider_rows()
         label = {"ok": "정상", "partial": "부분 성공", "error": "실패"}.get(status, status)
-        self._api_status.setText(f"{label}: {detail[:200]}")
+        verify_after_add = getattr(self, "_verify_after_add_id", "")
+        self._verify_after_add_id = ""
+        if status == "ok":
+            from iris.system.hermes_ollama_guard import note_after_provider_direct_ok
+
+            head = f"제공자 직접 연결 정상: {detail[:160]}"
+            pnow = next((x for x in self._api_providers if x.id == provider_id), None)
+            extra = ""
+            if pnow is not None:
+                extra = note_after_provider_direct_ok(
+                    pnow,
+                    db=self._db,
+                    hermes_enabled=bool(self._settings.hermes_enabled),
+                    hermes_base_url=self._settings.hermes_base_url,
+                )
+            self._api_status.setText(head if not extra else f"{head}\n{extra}")
+        else:
+            self._api_status.setText(f"{label}: {detail[:200]}")
+        if verify_after_add == provider_id and status in ("ok", "partial"):
+            self._on_api_verify_models(provider_id)
 
     def _build_permission_box(self) -> QGroupBox:
         box = QGroupBox("권한 (업무 학습 · Computer-Use)")
@@ -1079,6 +1288,7 @@ class SettingsDialog(QDialog):
                 "IMAP/SMTP로 직접 연결합니다. 일반 로그인 비밀번호 대신 앱 비밀번호를 입력하세요."
             )
         )
+        email_lay.addWidget(build_email_connect_panel())
         self._account_list = QListWidget()
         self._account_list.setMinimumHeight(100)
         self._account_list.setMaximumHeight(140)
@@ -2118,6 +2328,8 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        if not self._settings_revealed:
+            QTimer.singleShot(0, self._reveal_settings_window)
         if not self._deferred_status_started:
             self._deferred_status_started = True
             QTimer.singleShot(0, self._start_deferred_status_loads)
@@ -2125,6 +2337,12 @@ class SettingsDialog(QDialog):
             self._voice_runtime_status.start_watching()
         self._connect_mic_meter()
         QTimer.singleShot(0, self._sync_mic_meter)
+
+    def _reveal_settings_window(self) -> None:
+        if self._settings_revealed:
+            return
+        self._settings_revealed = True
+        self.setWindowOpacity(1.0)
 
     def hideEvent(self, event) -> None:  # noqa: N802
         if hasattr(self, "_voice_runtime_status"):

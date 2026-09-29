@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -209,6 +210,25 @@ def hud_dialog_qss() -> str:
     """
 
 
+class _DeferDarkTitlebar(QObject):
+    """Show 때 다크 타이틀바. 생성 중 winId()는 Windows가 빈 흰 클라이언트를 먼저 그린다."""
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() == QEvent.Type.Show:
+            force_dark_titlebar(watched)
+        return False
+
+
+def _seal_dialog_background(dialog: QDialog) -> None:
+    """스타일시트가 첫 프레임보다 늦어도 지우기 색이 흰색이 아니게."""
+    bg = QColor(TOKENS.space_deep)
+    pal = dialog.palette()
+    pal.setColor(QPalette.ColorRole.Window, bg)
+    pal.setColor(QPalette.ColorRole.Base, bg)
+    dialog.setPalette(pal)
+    dialog.setAutoFillBackground(True)
+
+
 def configure_hud_dialog(
     dialog: QDialog,
     *,
@@ -230,8 +250,11 @@ def configure_hud_dialog(
     dialog.resize(default_w, default_h)
     dialog.setSizeGripEnabled(True)
     dialog.setStyleSheet(hud_dialog_qss())
-    # 네이티브 타이틀바가 OS 라이트모드/강조색에 끌려가지 않도록 앱 다크 테마로 고정
-    force_dark_titlebar(dialog)
+    _seal_dialog_background(dialog)
+    # ponytail: winId()를 여기서 부르면 HWND가 위젯 트리보다 먼저 생겨 흰 화면이 한 박자 뜬다.
+    filt = _DeferDarkTitlebar(dialog)
+    dialog.installEventFilter(filt)
+    dialog._hud_title_filter = filt  # type: ignore[attr-defined]
 
 
 def make_title(text: str) -> QLabel:
@@ -258,8 +281,8 @@ def make_form_label(text: str) -> QLabel:
     return lab
 
 
-def make_collapsible(box: QGroupBox, *, expanded: bool = False) -> QWidget:
-    """설정 항목. 기본은 접힘. 헤더를 누르면 본문이 열린다."""
+def make_collapsible(box: QGroupBox, *, expanded: bool = True) -> QWidget:
+    """설정 항목. 기본은 펼침. 헤더를 누르면 본문이 접힌다."""
     title = box.title() or "항목"
     box.setTitle("")
     box.setProperty("sectionBody", True)

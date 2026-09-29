@@ -231,6 +231,17 @@ def check_tool_support_probe() -> None:
     assert verify_model_with(lambda *_a: (400, '{"error":"input must be text embedding"}'), root)[
         :2
     ] == ("unavailable", "unknown")
+    # 요청 형식 400(options 등)은 모델이 죽은 게 아님 — 목록에 남김
+    assert verify_model_with(
+        lambda *_a: (400, '{"error":"Unsupported parameter(s): options"}'), root
+    )[:2] == ("unverified", "unknown")
+
+    def tools_shape_only(_url: str, _style: str, body):  # noqa: ANN001
+        if body and body.get("tools"):
+            return 400, '{"error":"bad request"}'
+        return 200, ok_reply
+
+    assert verify_model_with(tools_shape_only, root)[:2] == ("ok", "unknown")
 
 
 def verify_model_with(handler, root: str):

@@ -305,8 +305,19 @@ class IrisIdeRuntimeManager:
         if not bundle.is_file():
             return False, "설치본 bundle.js 없음"
         text = bundle.read_text(encoding="utf-8", errors="ignore")
-        if "iris.ide.openFolder" not in text or "ide.pick_open_folder" not in text:
-            return False, "번들에 Open Folder 확장 미포함 — rebundle 실패"
+        missing = [
+            marker
+            for marker in (
+                "iris.ide.openFolder",
+                "ide.pick_open_folder",
+                "iris.ide.showStartScreen",
+                "iris.ide.runFile",
+                "IRIS_EXIT:",
+            )
+            if marker not in text
+        ]
+        if missing:
+            return False, "번들에 IDE 확장 미포함 — rebundle 실패: " + ", ".join(missing)
         return True, "workspace build synced to install"
 
     def start(self, project_root_path: str = "") -> tuple[bool, str]:

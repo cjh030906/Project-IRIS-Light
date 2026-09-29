@@ -403,6 +403,19 @@ def is_core_ready() -> bool:
     return bool(load_setup_state().get("core_ready"))
 
 
+def ollama_model_cleanup_pending() -> bool:
+    """실행 프로토콜이 끝난 뒤 올라마 모델 정리가 아직 안 돌았으면 True."""
+    return bool(load_setup_state().get("ollama_model_cleanup_pending"))
+
+
+def clear_ollama_model_cleanup_pending() -> None:
+    state = load_setup_state()
+    if not state.get("ollama_model_cleanup_pending"):
+        return
+    state["ollama_model_cleanup_pending"] = False
+    save_setup_state(state)
+
+
 def needs_setup_wizard(*, hermes_command: str = "hermes") -> bool:
     """시작 프로토콜 위저드가 필요한지 — 미설치 또는 한 번도 Core 완료 안 함."""
     if not ollama_executable() or not hermes_executable(hermes_command):
@@ -680,6 +693,16 @@ def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
 
 # Hermes 업스트림 MINIMUM_CONTEXT_LENGTH — metadata 32K여도 config 오버라이드로 통과
 HERMES_MIN_OLLAMA_NUM_CTX = 64000
+
+
+def _guard_fresh_hermes_tree() -> None:
+    """공식 설치가 hermes-agent 트리를 만든 직후 options 가드 1회."""
+    try:
+        from iris.system.hermes_ollama_guard import apply_ollama_options_guard
+
+        apply_ollama_options_guard(hermes_home() / "hermes-agent")
+    except Exception:
+        return
 
 
 def _ollama_provider_model(
@@ -1400,6 +1423,7 @@ class SetupProtocol:
         self._state["core_ready"] = True
         self._state["completed_at"] = _utc_now()
         self._state["last_error"] = ""
+        self._state["ollama_model_cleanup_pending"] = True
         self._save_state()
         return True
 
@@ -2547,6 +2571,7 @@ class SetupProtocol:
             refresh_process_path()
             ok_after, detail_after = probe_hermes_runtime(command=self.hermes_command)
             if ok_after:
+                _guard_fresh_hermes_tree()
                 return self._record_step(
                     "hermes_install",
                     "done",
@@ -2557,6 +2582,7 @@ class SetupProtocol:
         refresh_process_path()
         ok_after, detail_after = probe_hermes_runtime(command=self.hermes_command)
         if ok_after:
+            _guard_fresh_hermes_tree()
             self._hermes_prefer_bypass = False
             return self._record_step(
                 "hermes_install", "done", f"Hermes 설치됨 ({detail_after})"

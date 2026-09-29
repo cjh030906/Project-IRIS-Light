@@ -330,6 +330,10 @@ def _first_class_ide_trigger(
     def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
         result = action(args)
         if result.get("ok"):
+            inner = result.get("result") if isinstance(result.get("result"), dict) else {}
+            path = str(inner.get("path") or "")
+            if path and Path(path).is_file():
+                window._turn_write_path = path
             window._note_tool_file_write()
         return result
 

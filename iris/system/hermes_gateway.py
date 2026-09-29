@@ -1265,6 +1265,16 @@ def _wait_until_healthy(
     return False
 
 
+def _apply_ollama_options_guard_now() -> bool:
+    """설치본 options 가드. True 면 이번에 디스크가 바뀌었다."""
+    try:
+        from iris.system.hermes_ollama_guard import apply_ollama_options_guard
+
+        return bool(apply_ollama_options_guard(_hermes_agent_dir()))
+    except Exception:
+        return False
+
+
 def ensure_hermes_gateway_running(
     base_url: str,
     *,
@@ -1276,6 +1286,7 @@ def ensure_hermes_gateway_running(
 ) -> bool:
     """켜져 있으면 즉시 True. 아니면 기동 후 /health·/v1/models 준비까지 대기."""
     key = resolve_hermes_api_key(api_key)
+    guard_changed = _apply_ollama_options_guard_now()
 
     def _note(msg: str) -> None:
         if on_progress:
@@ -1286,6 +1297,16 @@ def ensure_hermes_gateway_running(
 
     # 이미 Hermes ready OK
     health = probe_gateway_health(base_url, timeout_sec=2.0)
+    if health.ok and guard_changed:
+        _note("Ollama options 가드 반영 — gateway 1회 재시작")
+        return restart_hermes_gateway(
+            base_url,
+            api_key=key,
+            command=command,
+            wait_sec=wait_sec,
+            should_abort=should_abort,
+            on_progress=on_progress,
+        )
     if health.ok:
         n = prune_orphan_gateway_procs(base_url)
         if n:
