@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -525,16 +526,30 @@ class HermesClient:
             if not (base_url or "").strip():
                 base_url = "http://127.0.0.1:11434/v1"
         errors: list[str] = []
+        used_url = (base_url or "").strip()
         if self._set_model_via_api(
             model, provider, errors, base_url=base_url, api_key=api_key
         ):
+            self._sync_ollama_num_ctx(used_url)
             return
         if self._set_model_via_cli(
             model, provider, errors, base_url=base_url, api_key=api_key
         ):
+            self._sync_ollama_num_ctx(used_url)
             return
         if errors:
             raise RuntimeError(errors[-1])
+
+    def _sync_ollama_num_ctx(self, base_url: str) -> None:
+        """모델 전환 성공 뒤 config 의 ollama_num_ctx 를 base_url 에 맞춘다. 실패해도 전환은 유지."""
+        if not (base_url or "").strip():
+            return
+        try:
+            from iris.system.hermes_ollama_guard import sync_model_ollama_num_ctx
+
+            sync_model_ollama_num_ctx(base_url)
+        except Exception:
+            logging.getLogger(__name__).warning("ollama_num_ctx sync failed")
 
     def _set_model_via_api(
         self,

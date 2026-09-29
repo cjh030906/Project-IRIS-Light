@@ -64,8 +64,7 @@ try { $rev = (git -C $Root rev-parse --short HEAD).Trim() } catch { }
 $notes = @(
     "IRIS Light Setup $ver",
     "",
-    "- Fix: Core gateway_ready vs /health contract (restart when models fail)",
-    "- Fix: .venv Access Denied on -Recreate (stop lockers, rename trash)",
+    "- Current workspace snapshot as the official Windows installer",
     "- ProductVersion $ver",
     "",
     "Corresponding source: https://github.com/kwakminoo/Project-IRIS-Light",

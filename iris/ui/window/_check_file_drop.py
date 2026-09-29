@@ -218,8 +218,13 @@ def check_no_win32_drop_hooks() -> None:
     assert "_drop_guard_paused" in text
     assert "drop_target_global_rect" in text
     main = (root / "iris/ui/window/main_window.py").read_text(encoding="utf-8")
-    assert "def nativeEvent" not in main
+    # 스냅 레이아웃용 nativeEvent 만 허용. 드롭 훅은 기동 즉사라 금지.
+    assert "windows_snap_native_reply" in main
+    assert "WM_DROPFILES" not in main
     assert "QAbstractNativeEventFilter" not in main
+    chrome = (root / "iris/ui/window/frameless_chrome.py").read_text(encoding="utf-8")
+    for token in ("WM_DROPFILES", "SetWindowLongPtr", "CallWindowProc", "QAbstractNativeEventFilter"):
+        assert token not in chrome, token
 
 
 def check_explorer_overlay_drop() -> None:

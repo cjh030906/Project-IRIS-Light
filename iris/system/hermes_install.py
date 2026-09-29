@@ -480,6 +480,16 @@ def _try_uv_sync(
         return subprocess.CompletedProcess(cmd, 1, "", str(exc))
 
 
+def _guard_installed_agent(agent: Path) -> None:
+    """우회 설치로 hermes-agent 트리가 생긴 직후 options 가드 1회. 실패해도 설치는 성공."""
+    try:
+        from iris.system.hermes_ollama_guard import apply_ollama_options_guard
+
+        apply_ollama_options_guard(agent)
+    except Exception:
+        return
+
+
 def _swap_staging_into_place(home: Path, staging: Path, agent: Path) -> str | None:
     """staging → hermes-agent rename. 실패 시 메시지."""
     if agent.exists():
@@ -707,6 +717,7 @@ def install_hermes_with_system_python(
 
     ok, detail = gw.probe_hermes_runtime(command=command, timeout_sec=30.0)
     if ok:
+        _guard_installed_agent(agent)
         return True, f"우회 설치 성공 ({detail})"
     if venv_py.is_file():
         check = _run(
@@ -714,6 +725,7 @@ def install_hermes_with_system_python(
             timeout=60.0,
         )
         if check.returncode == 0 and "ok" in (check.stdout or ""):
+            _guard_installed_agent(agent)
             return True, f"우회 설치 성공 (venv import ok; probe={detail})"
     write_bypass_pip_log(
         install_out or "",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -376,6 +376,13 @@ class DragTab(QWidget):
         empty.setFixedHeight(0)
         empty.hide()
         self.place_status_rows(widget, empty)
+
+    def maximize_button_global_rect(self) -> QRect:
+        """□/❐ 버튼의 화면 좌표. 윈도우 스냅 레이아웃 히트테스트용."""
+        btn = self._btn_max
+        if not btn.isVisible():
+            return QRect()
+        return QRect(btn.mapToGlobal(QPoint(0, 0)), btn.size())
 
     def set_maximized(self, maximized: bool) -> None:
         """Update maximize/restore button state."""
