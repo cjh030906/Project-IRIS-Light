@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from iris.infrastructure.ollama_usage import poll_ollama_cloud_signed_in
+
 from iris.infrastructure.ollama_client import OllamaClient, OllamaModelInfo, host_label_for_model
 from iris.ui.workers.chat_attempt import ChatAttempt, decide_fallback, normalize_attempts
 from iris.system.ollama_server import ensure_ollama_running, is_ollama_running
@@ -80,6 +82,54 @@ class OllamaModelListWorker(QThread):
                 self.failed.emit(f"모델 목록 시간 초과: {e}")
                 return
         self.failed.emit("모델 목록 조회 시간 초과")
+
+
+class OllamaLoginWatchWorker(QThread):
+    """로그인 클릭 뒤 데몬 /api/me 가 켜질 때까지 백그라운드에서 기다린다."""
+
+    signed_in = pyqtSignal()
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        timeout_sec: float = 180.0,
+        interval_sec: float = 2.0,
+    ) -> None:
+        super().__init__(parent)
+        self._timeout_sec = float(timeout_sec)
+        self._interval_sec = float(interval_sec)
+
+    def run(self) -> None:
+        ok = poll_ollama_cloud_signed_in(
+            timeout_sec=self._timeout_sec,
+            interval_sec=self._interval_sec,
+            stop=self.isInterruptionRequested,
+        )
+        if ok and not self.isInterruptionRequested():
+            self.signed_in.emit()
+
+
+def start_ollama_login_watch(parent, on_signed_in) -> OllamaLoginWatchWorker:
+    """같은 parent의 이전 감시를 끊고 새로 시작한다."""
+    stop_ollama_login_watch(parent)
+    worker = OllamaLoginWatchWorker(parent)
+    worker.signed_in.connect(on_signed_in)
+    parent._ollama_login_watch = worker
+    worker.start()
+    return worker
+
+
+def stop_ollama_login_watch(parent) -> None:
+    worker = getattr(parent, "_ollama_login_watch", None)
+    if worker is not None:
+        try:
+            worker.signed_in.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        if worker.isRunning():
+            worker.requestInterruption()
+    parent._ollama_login_watch = None
 
 
 class OllamaModelsVerifyWorker(QThread):
@@ -244,5 +294,8 @@ class OllamaChatWorker(QThread):
 __all__ = [
     "ChatAttempt",
     "OllamaChatWorker",
+    "OllamaLoginWatchWorker",
     "OllamaModelListWorker",
+    "start_ollama_login_watch",
+    "stop_ollama_login_watch",
 ]

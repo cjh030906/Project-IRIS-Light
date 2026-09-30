@@ -362,11 +362,15 @@ class MainWindow(QMainWindow):
         self._runtime_boot_started = False
         self._control_surface = None
         self._saved_model = load_selected_model(self._db) or self._settings.ollama_model.strip()
-        # 미로그인 클라우드를 초기 선택으로 두지 않음 — 목록 로드 후 로컬로 확정
+        self._ollama_login_watch = None
+        self._cloud_model_pending_login = ""
+        # 미로그인 클라우드를 초기 선택으로 두지 않음 — 목록 로드 후 로컬로 확정.
+        # 로그인 확인 시 이 이름으로 되돌린다.
         try:
             from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
 
             if cloud_model_blocked_without_login(self._saved_model):
+                self._cloud_model_pending_login = self._saved_model
                 self._saved_model = ""
                 self._settings.ollama_model = ""
                 self._settings.model_name = ""
@@ -1088,12 +1092,19 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_app_update_apply_failed)
         worker.start()
 
-    def _on_ollama_cloud_login_clicked(self) -> None:
-        """채팅 [로그인] — Ollama 데스크톱 앱 UI에서 로그인하도록 앱만 연다."""
-        from iris.system.ollama_server import ensure_ollama_running, open_ollama_app
+    def _remember_blocked_cloud_model(self, model: str) -> None:
+        from iris.infrastructure.hermes_errors import is_cloud_runtime_name
 
-        ok, detail = open_ollama_app()
-        ensure_ollama_running(self._settings.ollama_base_url, wait_sec=2.0)
+        name = (model or "").strip()
+        if name and is_cloud_runtime_name(name):
+            self._cloud_model_pending_login = name
+
+    def _on_ollama_cloud_login_clicked(self) -> None:
+        """채팅 [로그인] — UI 스레드에서는 앱만 띄우고 바로 돌아온다."""
+        from iris.system.ollama_server import begin_ollama_cloud_login
+        from iris.ui.workers.ollama_workers import start_ollama_login_watch
+
+        ok, detail = begin_ollama_cloud_login()
         if ok:
             self._live_activity.append_instant_line(f"Ollama 앱 열기 ({detail[:80]})")
             self._chat.append_message_instant(
@@ -1101,15 +1112,63 @@ class MainWindow(QMainWindow):
                 "Ollama 앱을 열었습니다. "
                 "작업 표시줄/트레이의 Ollama 아이콘을 클릭해 창을 연 뒤, "
                 "앱 안에서 ollama.com 계정으로 로그인하세요. "
+                "로그인이 확인되면 Iris에 바로 반영합니다. "
                 "(웹사이트만 로그인하면 Iris에는 반영되지 않습니다.)",
             )
-            self._maybe_refresh_ollama_quota(force=True)
+            start_ollama_login_watch(self, self._apply_confirmed_ollama_login)
+            return
+        if detail.startswith("missing"):
+            self._live_activity.append_instant_line("Ollama 앱 없음 — 브라우저 로그인")
+            self._chat.append_message_instant(
+                "Iris",
+                "Ollama 앱을 찾지 못해 브라우저 로그인 페이지를 열었습니다. "
+                "앱에서 로그인해야 Iris에 반영됩니다.",
+            )
             return
         self._live_activity.append_instant_line(f"Ollama 앱 실행 실패: {detail[:120]}")
         self._chat.append_message_instant(
             "Iris",
             f"Ollama 앱을 열지 못했습니다: {detail[:160]}. "
             "시작 메뉴에서 Ollama를 직접 연 뒤 앱에서 로그인하세요.",
+        )
+
+    def _apply_confirmed_ollama_login(self) -> None:
+        """데몬 /api/me 가 로그인을 보면 할당량과 막혀 있던 클라우드 모델을 반영한다.
+
+        이 확인은 이미 백그라운드에서 끝났다. 여기서 다시 조회하면 UI가 멈춘다.
+        /api/me 가 참이면 클라우드 가드가 바로 열리므로 재시작은 필요 없다.
+        모델을 되돌렸는데도 선택이 클라우드로 남지 않을 때만 재시작 안내를 낸다.
+        """
+        from iris.infrastructure.ollama_usage import ollama_login_status_message
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
+        pending = (getattr(self, "_cloud_model_pending_login", "") or "").strip()
+        applied = True
+        self._ollama_login_applying = True
+        try:
+            if pending:
+                self._saved_model = pending
+                self._settings.ollama_model = pending
+                self._settings.model_name = pending
+                self._cloud_model_pending_login = ""
+                if self._db is not None:
+                    save_selected_model(self._db, pending)
+                if self._chat.select_model_silent(pending):
+                    self._apply_selected_model(pending, persist=True)
+                    applied = (self._settings.ollama_model or "").strip() == pending
+                elif getattr(self, "_listed_models", None):
+                    self._login_model_restore = pending
+                    self._refresh_models(probe_cloud=True)
+                else:
+                    self._login_model_restore = pending
+            if applied:
+                self._maybe_refresh_ollama_quota(force=True)
+        finally:
+            self._ollama_login_applying = False
+        self._chat.append_message_instant(
+            "Iris",
+            ollama_login_status_message(applied=applied),
         )
 
     def _on_app_update_applied(self, message: str) -> None:
@@ -1187,7 +1246,10 @@ class MainWindow(QMainWindow):
             return
         from iris.infrastructure.hermes_errors import cloud_model_blocked_without_login
 
-        if cloud_model_blocked_without_login(model):
+        if not getattr(self, "_ollama_login_applying", False) and cloud_model_blocked_without_login(
+            model
+        ):
+            self._remember_blocked_cloud_model(model)
             local = self._first_local_picker_model()
             self._live_activity.append_instant_line(
                 f"Hermes model sync skip (클라우드 미로그인): {model}"
@@ -1304,7 +1366,10 @@ class MainWindow(QMainWindow):
 
     def _publish_model_list(self, items: list[OllamaModelInfo], *, boot: bool) -> None:
         visible = self._visible_models(items)
-        preferred = (
+        forced = (getattr(self, "_login_model_restore", "") or "").strip()
+        if forced:
+            self._login_model_restore = ""
+        preferred = forced or (
             self._chat.current_model()
             or self._saved_model
             or self._settings.ollama_model
@@ -1507,8 +1572,11 @@ class MainWindow(QMainWindow):
             cloud_model_blocked_without_login,
         )
 
+        if getattr(self, "_ollama_login_applying", False):
+            return model
         if not cloud_model_blocked_without_login(model):
             return model
+        self._remember_blocked_cloud_model(model)
         local = self._first_local_picker_model()
         self._live_activity.append_instant_line(
             f"클라우드 미로그인 — '{model}' 사용 불가"
@@ -2528,6 +2596,7 @@ class MainWindow(QMainWindow):
 
     def _load_conversation(self, conversation_id: int) -> None:
         """세션 전환 — 진행 중 턴은 끊고 트랜스크립트를 다시 그린다."""
+        self._drop_followthrough()
         if self._busy:
             self._cancel_current_turn(
                 reason="conversation_switch",
@@ -2543,6 +2612,7 @@ class MainWindow(QMainWindow):
 
     def reset_current_conversation(self) -> None:
         """현재 세션의 대화 내용만 비운다 (세션 자체는 유지)."""
+        self._drop_followthrough()
         if self._busy:
             self._cancel_current_turn(
                 reason="conversation_reset",
@@ -3289,6 +3359,13 @@ class MainWindow(QMainWindow):
         if not text and not turn.attachments:
             self._turn_dispatcher.finish_active_turn(turn.id)
             return
+        self._tool_ok_count = 0
+        if self._sending_followthrough:
+            self._turn_is_followthrough = True
+        else:
+            self._turn_is_followthrough = False
+            self._followthrough_goal = text
+            self._followthrough_count = 0
         self._turn_gate.begin(turn.id)
         self._active_turn_source = turn.source
         if turn.source == UserTurnSource.VOICE:
@@ -3334,6 +3411,7 @@ class MainWindow(QMainWindow):
         )
 
         if cloud_model_blocked_without_login(model):
+            self._remember_blocked_cloud_model(model)
             local = self._first_local_picker_model()
             if local and self._chat.select_model_silent(local):
                 self._apply_selected_model(local, persist=True)
@@ -3356,13 +3434,14 @@ class MainWindow(QMainWindow):
                 completed = bool(complete(text))
             if not completed:
                 self._chat.append_message_instant("You", self._format_user_turn_content(turn))
-        else:
+        elif not self._turn_is_followthrough:
             self._chat.append_message_instant("You", self._format_user_turn_content(turn))
         self._record_history("user", self._format_user_turn_content(turn))
         self._refresh_context_gauge()
         self._turn_gate.arm()
         self._stop_tts_playback()
-        self._begin_auto_tts_response()
+        if not self._turn_is_followthrough:
+            self._begin_auto_tts_response()
         self._chat.set_generating(True)
         self._sync_voice_conversation_state()
         self._turn_write_path = ""
@@ -3607,6 +3686,7 @@ class MainWindow(QMainWindow):
 
     def _cancel_current_turn(self, *, reason: str, preserve_partial_response: bool) -> None:
         """생성 중 turn을 안전하게 끊고 다음 turn이 진행되게 한다."""
+        self._drop_followthrough()
         if not self._busy:
             if self._tts_active_play or self._tts_busy() or self._tts_queue:
                 # setHtml(speaker) 전에 타이핑 확정 — 커서 무효화로 로그가 날아가는 것 방지
@@ -3644,7 +3724,61 @@ class MainWindow(QMainWindow):
         self._maybe_refresh_ollama_quota()
         self._finish_current_turn(open_followup=False)
 
+    def _drop_followthrough(self) -> None:
+        self._followthrough_gen += 1
+        self._followthrough_count = 0
+        self._followthrough_goal = ""
+        self._turn_is_followthrough = False
+        self._sending_followthrough = False
+
+    def _fire_followthrough(self) -> None:
+        if self._followthrough_token != self._followthrough_gen:
+            return
+        if self._turn_dispatcher.is_busy() or self._turn_dispatcher.pending_count():
+            return
+        from iris.runtime.turn_followthrough import FOLLOWTHROUGH_UTTERANCE
+
+        self._sending_followthrough = True
+        try:
+            self._on_user_text(FOLLOWTHROUGH_UTTERANCE)
+        finally:
+            self._sending_followthrough = False
+
+    def _maybe_followthrough(self, assistant: str) -> bool:
+        """continue 면 다음 턴을 예약한다. 반환이 True 면 음성 따라하기를 열지 않는다."""
+        from iris.runtime.turn_followthrough import (
+            CAP,
+            NOTE_CAP,
+            NOTE_CONTINUE,
+            decide_followthrough,
+        )
+
+        suppress_voice = self._turn_is_followthrough
+        goal = self._followthrough_goal
+        if not goal:
+            return suppress_voice
+        decision = decide_followthrough(
+            goal,
+            assistant,
+            self._tool_ok_count,
+            self._followthrough_count,
+        )
+        if decision == "continue":
+            self._chat.append_note(NOTE_CONTINUE)
+            self._followthrough_count += 1
+            self._followthrough_gen += 1
+            self._followthrough_token = self._followthrough_gen
+            QTimer.singleShot(0, self._fire_followthrough)
+            return True
+        if decision == "stop" and self._followthrough_count >= CAP:
+            self._chat.append_note(NOTE_CAP)
+        self._followthrough_count = 0
+        self._followthrough_goal = ""
+        self._turn_is_followthrough = False
+        return suppress_voice
+
     def _on_chat_stop(self) -> None:
+        self._drop_followthrough()
         self._cancel_current_turn(reason="user_stop", preserve_partial_response=True)
         self._live_activity.append_instant_line("Stopped.")
 
@@ -3702,6 +3836,10 @@ class MainWindow(QMainWindow):
             return
         text = (message or "").strip()
         if text:
+            from iris.runtime.turn_followthrough import counts_as_tool_ok
+
+            if counts_as_tool_ok(text):
+                self._tool_ok_count += 1
             self._live_activity.append_instant_line(f"[Hermes tool] {text}")
 
     def _on_chat_connecting(self, model: str, host: str) -> None:
@@ -3856,7 +3994,8 @@ class MainWindow(QMainWindow):
                 else:
                     status = "idle"
                 self._chat.set_speaker_status(self._tts_active_msg_id, status)
-        self._finish_current_turn(open_followup=True)
+        suppress_voice = self._maybe_followthrough(shown or text)
+        self._finish_current_turn(open_followup=not suppress_voice)
 
     def _note_tool_file_write(self) -> None:
         """project.write_file 성공 = 이번 턴의 1급 IDE 개방 트리거.
@@ -5335,6 +5474,7 @@ class MainWindow(QMainWindow):
         self._chat.fallback_typing_if_waiting_for_tts()
 
     def _on_chat_failed(self, err: str) -> None:
+        self._drop_followthrough()
         if self._turn_gate.consume_ignored():
             self._chat_worker = None
             self._stop_tts_playback()
@@ -5349,14 +5489,17 @@ class MainWindow(QMainWindow):
         # 실패한 user turn은 히스토리에서 제거 (재시도 깔끔하게)
         self._drop_last_user_history()
         self._refresh_context_gauge()
-        self._live_activity.append_instant_line(f"Error: {err}")
-        from iris.infrastructure.hermes_errors import is_cloud_auth_user_message
+        from iris.infrastructure.hermes_errors import (
+            explain_chat_error,
+            is_cloud_auth_user_message,
+        )
 
-        label = self._backend_label()
+        shown = explain_chat_error(err)
+        self._live_activity.append_instant_line(shown)
         if is_cloud_auth_user_message(err):
-            self._chat.append_ollama_cloud_login_prompt(f"{label} 오류: {err}")
+            self._chat.append_ollama_cloud_login_prompt(shown)
         else:
-            self._chat.append_message_instant("Iris", f"{label} 오류: {err}")
+            self._chat.append_message_instant("Iris", shown)
         self._chat_worker = None
         self._maybe_refresh_ollama_quota()
         self._finish_current_turn(open_followup=False)
@@ -6255,7 +6398,10 @@ class MainWindow(QMainWindow):
             "Iris shows those images in the chat; users can click to enlarge. "
             "업무 학습(화면 조작 녹화 시작/종료): learning.start / learning.stop. 이미 배운 업무 실행: learning.run. "
             "위키에 저장 / Iris Wiki에 남기기: PDF·URL·파일은 iris_invoke wiki.import_content "
-            "(source=path or https URL). 수동 요약만 쓸 때 wiki.write_user_note "
+            "(source=path or https URL). 여러 페이지·사이트 전체는 wiki.import_pages "
+            "(source 또는 sources, discover=true). 페이지마다 import_content 를 반복하지 말 것. "
+            "저장 성공은 반환의 saved 건수로만 말한다. "
+            "수동 요약만 쓸 때 wiki.write_user_note "
             "(title + content, optional source_url). Default path user/inbox/{slug}.md. "
             "Never claim a wiki save succeeded without that tool returning ok. "
             "메일/이메일 화면: iris_invoke workspace.open_email. "
@@ -8275,6 +8421,9 @@ class MainWindow(QMainWindow):
             self._sync_docked_iris_ide_geometry()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
         guard = getattr(self, "_explorer_drop_guard", None)
         if guard is not None:
             try:

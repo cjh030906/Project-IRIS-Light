@@ -73,6 +73,81 @@ def format_hermes_http_401() -> str:
     return GATEWAY_AUTH_USER_MSG
 
 
+def explain_chat_error(err: str) -> str:
+    """채팅에 보일 안내. 원문 로그는 그대로 두고 화면만 바꾼다.
+
+    할당량 전환(`status_for_error`)은 이 함수 이전의 원문을 본다.
+    """
+    raw = (err or "").strip()
+    if not raw:
+        return "모델이 응답하지 않았습니다. 다시 시도하세요."
+    if CLOUD_AUTH_ERROR_PREFIX in raw or GATEWAY_AUTH_ERROR_PREFIX in raw:
+        return raw
+    if raw.startswith("이 모델은 도구"):
+        return raw
+    if raw.startswith("[") and "http" not in raw.lower()[:80]:
+        return raw
+
+    from iris.runtime.model_failover import status_for_error
+
+    low = raw.lower()
+    status = status_for_error(raw)
+
+    if any(h in low for h in ("연결 실패", "connection refused", "unreachable")):
+        return (
+            "모델 서버에 연결하지 못했습니다. "
+            "Hermes 또는 Ollama가 켜져 있는지 확인한 뒤 다시 시도하세요."
+        )
+    if any(h in low for h in ("timed out", "timeout", "시간 초과")) or status == 408:
+        return "응답 대기 시간이 초과됐습니다. 잠시 후 다시 시도하세요."
+    if looks_like_no_tools_error(raw):
+        return "이 모델은 도구 호출을 지원하지 않습니다. 도구를 지원하는 모델을 선택하세요."
+    if status == 429 or any(
+        h in low for h in ("quota", "exceeded your current", "rate limit", "resource_exhausted")
+    ):
+        if any(k in low for k in ("gemini", "generativelanguage", "ai.google", "googleapis")):
+            return (
+                "Gemini API 사용 한도를 초과했습니다. "
+                "요금제와 할당량을 확인하거나, 다른 모델로 바꾼 뒤 다시 요청하세요."
+            )
+        if "ollama" in low:
+            return (
+                "Ollama 클라우드 사용 한도입니다. "
+                "잠시 기다리거나 로컬 모델로 바꾸세요."
+            )
+        return (
+            "모델 API 사용 한도를 초과했습니다. "
+            "잠시 후 다시 시도하거나 다른 모델로 바꾸세요."
+        )
+    if status == 413 or any(
+        h in low
+        for h in (
+            "context length",
+            "context_length",
+            "maximum context",
+            "too many tokens",
+            "prompt is too long",
+        )
+    ):
+        return "대화가 모델이 한 번에 받을 수 있는 길이를 넘었습니다. 새 채팅을 시작하세요."
+    if status == 404 or "model not found" in low or ("not found" in low and "model" in low):
+        return "선택한 모델을 서버에서 찾지 못했습니다. 다른 모델을 고르세요."
+    if status in (401, 403):
+        return "인증에 실패했습니다. API 키 또는 로그인을 확인하세요."
+    if status in (400, 422):
+        if "options" in low:
+            return (
+                "이 모델이 요청의 options 항목을 거부했습니다. "
+                "API 키와 모델 등록은 유지됩니다. 다른 모델을 고르거나 다시 시도하세요."
+            )
+        return "모델이 이번 요청 형식을 거부했습니다. 다른 모델을 고르거나 다시 시도하세요."
+    if status in (500, 502, 503, 504) or "overloaded" in low:
+        return "모델 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도하세요."
+    if raw in ("모델 응답 실패", "(빈 응답)"):
+        return "모델이 답을 만들지 못했습니다. 다시 시도하세요."
+    return "요청을 처리하지 못했습니다. 잠시 후 다시 시도하세요."
+
+
 def is_cloud_auth_user_message(err: str) -> bool:
     return CLOUD_AUTH_ERROR_PREFIX in (err or "")
 
@@ -130,6 +205,19 @@ if __name__ == "__main__":
     assert "도구" in format_hermes_sse_error(
         "registry.ollama.ai/library/exaone3.5:2.4b does not support tools"
     )
+    quota = (
+        'Hermes: HTTP 429: [{"error":{"code":429,"message":'
+        '"You exceeded your current quota, please check your plan and billing details. '
+        'https://ai.google.dev/gemini-api/docs/rate-limits"}}]'
+    )
+    assert "Gemini API 사용 한도" in explain_chat_error(quota)
+    assert "options" in explain_chat_error(
+        "Hermes: HTTP 400 Unsupported parameter(s): options"
+    )
+    assert explain_chat_error(CLOUD_AUTH_USER_MSG) == CLOUD_AUTH_USER_MSG
+    assert "연결하지 못했습니다" in explain_chat_error("Hermes 연결 실패: refused")
+    assert "한도" in explain_chat_error("Ollama HTTP 429: rate limit")
+    assert "답을 만들지 못했습니다" in explain_chat_error("모델 응답 실패")
     from unittest.mock import patch
 
     with patch(

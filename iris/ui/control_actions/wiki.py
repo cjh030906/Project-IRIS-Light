@@ -2,10 +2,101 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+from urllib.request import Request, urlopen
+
 from iris.system.control_surface import (
     ActionRegistry,
 )
 from iris.ui.control_actions.hosts import WikiHost
+
+_PAGE_CAP = 80
+
+
+def _page_limit(raw: object) -> int:
+    try:
+        n = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _PAGE_CAP
+    if n < 1:
+        return _PAGE_CAP
+    return min(n, _PAGE_CAP)
+
+
+def _truthy(raw: object) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dedupe_sources(items: list[str]) -> list[str]:
+    from urllib.parse import urldefrag
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = item.strip()
+        if not text:
+            continue
+        key = text
+        if text.lower().startswith(("http://", "https://")):
+            key = urldefrag(text)[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _page_sources(args: dict[str, Any]) -> list[str]:
+    raw = args.get("sources")
+    items: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw if str(x).strip()]
+    elif isinstance(raw, str) and raw.strip():
+        items = [raw.strip()]
+    if items:
+        return _dedupe_sources(items)
+    one = str(args.get("source") or args.get("path") or args.get("url") or "").strip()
+    return [one] if one else []
+
+
+def _fetch_html(url: str) -> tuple[str, str]:
+    req = Request(url, headers={"User-Agent": "Iris-Wiki/1.0 (+local content import)"})
+    with urlopen(req, timeout=20) as resp:
+        final = resp.geturl()
+        raw = resp.read(2_000_000)
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+    charset = "utf-8"
+    marker = "charset="
+    if marker in ctype:
+        charset = ctype.split(marker, 1)[1].split(";", 1)[0].strip(" \"'")
+    return final, raw.decode(charset, errors="replace")
+
+
+def _merge_discovered(
+    sources: list[str],
+    args: dict[str, Any],
+    limit: int,
+    fetch_html: Callable[[str], tuple[str, str]],
+) -> tuple[list[str], bool]:
+    from iris.knowledge.wiki_import_ops import collect_same_origin_links
+
+    merged = list(sources)
+    if _truthy(args.get("discover")):
+        root = next(
+            (item for item in sources if item.lower().startswith(("http://", "https://"))),
+            "",
+        )
+        if root:
+            try:
+                final, html = fetch_html(root)
+            except (OSError, TimeoutError, ValueError):
+                final, html = "", ""
+            if html:
+                extra = collect_same_origin_links(final or root, html, limit=limit)
+                merged = _dedupe_sources([*sources, *extra])
+    return merged[:limit], len(merged) > limit
 
 def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     from iris.ui.control_bindings import (
@@ -180,6 +271,56 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
         result = {**result, "opened": open_note}
         return ok_result("wiki.import_content", result)
 
+    def wiki_import_pages(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.wiki_import_ops import import_pages
+        from iris.knowledge.wiki_summarize import summarize_for_wiki
+
+        sources = _page_sources(args)
+        if not sources:
+            return err_result("wiki.import_pages", "sources or source required")
+        mode = str(args.get("mode") or "raw").strip().lower()
+        if mode not in ("raw", "summarize"):
+            mode = "raw"
+        summarize_fn = None
+        if mode == "summarize":
+            model = str(
+                args.get("model")
+                or window._chat.current_model()
+                or getattr(window, "_saved_model", "")
+                or window._settings.ollama_model
+                or ""
+            ).strip()
+            if not model:
+                return err_result("wiki.import_pages", "model required for summarize mode")
+            base = (window._settings.ollama_base_url or "http://127.0.0.1:11434/v1").strip()
+
+            def _sum(text: str) -> str:
+                return summarize_for_wiki(text, model=model, ollama_base_url=base)
+
+            summarize_fn = _sum
+        limit = _page_limit(args.get("limit"))
+        merged, truncated = _merge_discovered(sources, args, limit, _fetch_html)
+        data = import_pages(
+            window._iris_wiki,
+            merged,
+            mode=mode,
+            summarize_fn=summarize_fn,
+        )
+        data["truncated"] = truncated
+        last = next(
+            (str(item["rel_path"]) for item in reversed(data["items"]) if item.get("ok")),
+            "",
+        )
+        if data["saved"] and last:
+            window._on_obsidian_icon()
+            window._obsidian_page.show_note(last)
+        _log(
+            window,
+            f"wiki.import_pages saved={data['saved']} failed={data['failed']}",
+            True,
+        )
+        return ok_result("wiki.import_pages", data)
+
     reg.register("wiki.list_notes", wiki_list, summary="List Iris Wiki note paths")
 
     reg.register(
@@ -208,5 +349,12 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
         "wiki.import_content",
         wiki_import_content,
         summary="Extract PDF/URL/file text and save to Iris Wiki inbox, then open in UI (mode=raw|summarize)",
+        risk="medium",
+    )
+
+    reg.register(
+        "wiki.import_pages",
+        wiki_import_pages,
+        summary="Save many pages to Iris Wiki in one call (sources or source, discover=true, limit<=80). Do not loop import_content per page.",
         risk="medium",
     )

@@ -3264,7 +3264,7 @@ class SetupProtocol:
         )
 
     def _opt_emulator(self) -> SetupStepResult:
-        from iris.system.android_emulator import ensure_avd, is_emulator_available
+        from iris.system.android_emulator import ensure_avd, is_emulator_available, sdk_package_ids
 
         ok, detail = is_emulator_available()
         if ok:
@@ -3286,34 +3286,74 @@ class SetupProtocol:
         return SetupStepResult(
             step_id="emulator",
             status="needs_user",
-            message=f"{detail}. 「설치」를 누르면 Android Studio(winget) 설치를 시도합니다.",
+            message=(
+                f"{detail}. 「설치」를 누르면 sdkmanager로 "
+                f"{', '.join(sdk_package_ids())} 를 받습니다."
+            ),
             action_url=ANDROID_STUDIO_URL,
-            action_hint="용량이 큽니다. 이미 Studio가 있으면 SDK만 맞춘 뒤 「완료했어요」. 「나중에」 가능.",
+            action_hint="용량이 큽니다. 실패해도 「설치」로 다시 시도할 수 있습니다. 「나중에」 가능.",
             label="Android 에뮬레이터",
             can_install=True,
         )
 
     def _install_emulator(self) -> SetupStepResult:
-        from iris.system.android_emulator import ensure_avd, is_emulator_available
+        from iris.system.android_emulator import (
+            ensure_avd,
+            ensure_sdk,
+            is_emulator_available,
+            sdk_package_ids,
+        )
 
-        ok, detail = is_emulator_available()
-        if ok:
+        packages = ", ".join(sdk_package_ids())
+        label = "Android 에뮬레이터"
+        hint = (
+            "「설치」로 다시 시도할 수 있습니다. "
+            "WHPX가 꺼져 있으면 패키지가 있어도 부팅은 실패합니다."
+        )
+
+        def _avd_done(detail: str) -> SetupStepResult:
             try:
                 ensure_avd()
-                return SetupStepResult(
-                    "emulator", "done", detail, label="Android 에뮬레이터"
-                )
             except Exception as exc:  # noqa: BLE001
                 return SetupStepResult(
                     step_id="emulator",
                     status="needs_user",
                     message=f"AVD 생성 실패: {exc}",
                     action_url=ANDROID_STUDIO_URL,
-                    action_hint="Studio에서 SDK·AVD를 만든 뒤 「완료했어요」.",
-                    label="Android 에뮬레이터",
+                    action_hint="「설치」로 다시 시도하거나 Studio에서 AVD를 만든 뒤 「완료했어요」.",
+                    label=label,
                     can_install=True,
                 )
+            return SetupStepResult("emulator", "done", detail, label=label)
 
+        def _needs(message: str) -> SetupStepResult:
+            text = message if packages in message else f"{message} 필요 패키지: {packages}"
+            return SetupStepResult(
+                step_id="emulator",
+                status="needs_user",
+                message=text.strip(),
+                action_url=ANDROID_STUDIO_URL,
+                action_hint=hint,
+                label=label,
+                can_install=True,
+            )
+
+        ok, detail = is_emulator_available()
+        if ok:
+            return _avd_done(detail)
+
+        def _progress(line: str) -> None:
+            self._emit_stream(line, None, replace=False)
+
+        sdk_ok, sdk_msg = ensure_sdk(
+            _progress, idle_sec=_INSTALL_IDLE_SEC, hard_sec=_INSTALL_HARD_SEC
+        )
+        if sdk_ok:
+            ok2, detail2 = is_emulator_available()
+            if ok2:
+                return _avd_done(detail2 or sdk_msg)
+
+        winget_note = ""
         if sys.platform == "win32":
             winget = _winget_exe()
             if winget:
@@ -3334,70 +3374,18 @@ class SetupProtocol:
                         hidden=False,
                     )
                 except (OSError, subprocess.TimeoutExpired) as exc:
-                    ok2, detail2 = is_emulator_available()
-                    if ok2:
-                        try:
-                            ensure_avd()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        return SetupStepResult(
-                            "emulator",
-                            "done",
-                            detail2 or "시간 초과 후 에뮬레이터 확인됨",
-                            label="Android 에뮬레이터",
-                        )
-                    return SetupStepResult(
-                        step_id="emulator",
-                        status="needs_user",
-                        message=f"Android Studio 설치 확인 시간이 지났습니다: {exc}",
-                        action_url=ANDROID_STUDIO_URL,
-                        action_hint="「열기」로 수동 설치 후 SDK·AVD를 준비하세요.",
-                        label="Android 에뮬레이터",
-                        can_install=True,
-                    )
-                if proc.returncode == 0:
-                    ok2, detail2 = is_emulator_available()
-                    if ok2:
-                        try:
-                            ensure_avd()
-                        except Exception as exc:  # noqa: BLE001
-                            return SetupStepResult(
-                                step_id="emulator",
-                                status="needs_user",
-                                message=f"AVD 생성 실패: {exc}",
-                                action_url=ANDROID_STUDIO_URL,
-                                action_hint="Studio에서 SDK·AVD를 만든 뒤 「완료했어요」.",
-                                label="Android 에뮬레이터",
-                                can_install=True,
-                            )
-                        return SetupStepResult(
-                            "emulator",
-                            "done",
-                            detail2 or "Android Studio 설치됨",
-                            label="Android 에뮬레이터",
-                        )
-                    return SetupStepResult(
-                        step_id="emulator",
-                        status="needs_user",
-                        message=(
-                            "Android Studio는 설치됐습니다. Studio를 열어 SDK Platform-Tools·"
-                            "Emulator를 받은 뒤 「완료했어요」를 누르세요."
-                        ),
-                        action_url=ANDROID_STUDIO_URL,
-                        action_hint="SDK 준비 후 「완료했어요」, 아니면 「나중에」.",
-                        label="Android 에뮬레이터",
-                        can_install=False,
-                    )
+                    return _needs(f"Android Studio 설치 확인 시간이 지났습니다: {exc}")
+                winget_note = f"winget 종료 코드 {proc.returncode}. "
+                _sdk_ok, sdk_msg = ensure_sdk(
+                    _progress, idle_sec=_INSTALL_IDLE_SEC, hard_sec=_INSTALL_HARD_SEC
+                )
+                ok3, detail3 = is_emulator_available()
+                if ok3:
+                    return _avd_done(detail3 or sdk_msg)
+            else:
+                winget_note = "winget 없음. "
 
-        return SetupStepResult(
-            step_id="emulator",
-            status="needs_user",
-            message="자동 설치를 할 수 없습니다. 「열기」로 Android Studio를 설치하세요.",
-            action_url=ANDROID_STUDIO_URL,
-            action_hint="SDK·AVD 준비 후 「완료했어요」.",
-            label="Android 에뮬레이터",
-            can_install=False,
-        )
+        return _needs(f"{winget_note}{sdk_msg}")
 
     def _opt_mobile_mcp(self) -> SetupStepResult:
         label = OPTIONAL_LABELS["mobile_mcp"]
@@ -3758,8 +3746,6 @@ def _self_check() -> None:
 
     def _fake_on_user(result: SetupStepResult) -> str:
         seen_messages.append(result.message)
-        if len(seen_messages) == 1:
-            return "install"
         return "abort"
 
     proto_flow._step_state_init = _fake_state_init  # type: ignore[method-assign]
@@ -3767,7 +3753,8 @@ def _self_check() -> None:
     ok_flow = proto_flow.run_core(on_user=_fake_on_user)
     assert ok_flow is False
     assert dispatch_calls["n"] == 1, "설치 재시도 없이 abort했으면 dispatch는 한 번만 불려야 함"
-    assert seen_messages == ["최초 설치 필요", "설치했지만 여전히 확인 필요"], seen_messages
+    # can_install 이면 클릭 없이 설치한다. 그 다음 needs_user만 사용자에게 간다.
+    assert seen_messages == ["설치했지만 여전히 확인 필요"], seen_messages
 
     # --- 8) AVD 생성 실패는 무시되지 않고 needs_user로 보고돼야 한다 ---
     if sys.platform == "win32":
@@ -3776,6 +3763,7 @@ def _self_check() -> None:
         orig_winget_exe = globals()["_winget_exe"]
         orig_is_avail = android_emulator_mod.is_emulator_available
         orig_ensure_avd = android_emulator_mod.ensure_avd
+        orig_ensure_sdk = android_emulator_mod.ensure_sdk
         avail_calls = {"n": 0}
 
         def _fake_is_avail():
@@ -3796,13 +3784,38 @@ def _self_check() -> None:
             globals()["_winget_exe"] = lambda: "C:\\fake\\winget.exe"
             android_emulator_mod.is_emulator_available = _fake_is_avail
             android_emulator_mod.ensure_avd = _fake_ensure_avd
+            android_emulator_mod.ensure_sdk = lambda *_a, **_k: (False, "sdk skip")
             emu_result = emu_proto._install_emulator()
         finally:
             globals()["_winget_exe"] = orig_winget_exe
             android_emulator_mod.is_emulator_available = orig_is_avail
             android_emulator_mod.ensure_avd = orig_ensure_avd
+            android_emulator_mod.ensure_sdk = orig_ensure_sdk
         assert emu_result.status == "needs_user", emu_result
         assert "AVD" in emu_result.message, emu_result.message
+
+        def _always_missing():
+            return (False, "missing")
+
+        def _winget_nonzero(cmd, **kwargs):
+            # winget "이미 설치됨" (0x8A15002B) 도 재시도를 끄면 안 된다.
+            return subprocess.CompletedProcess(cmd, -1978335189, "", "")
+
+        bad = SetupProtocol(simulate=False, dry_run=False)
+        bad._run_streamed = _winget_nonzero  # type: ignore[method-assign]
+        try:
+            globals()["_winget_exe"] = lambda: "C:\\fake\\winget.exe"
+            android_emulator_mod.is_emulator_available = _always_missing
+            android_emulator_mod.ensure_sdk = lambda *_a, **_k: (False, "sdk skip")
+            retry = bad._install_emulator()
+        finally:
+            globals()["_winget_exe"] = orig_winget_exe
+            android_emulator_mod.is_emulator_available = orig_is_avail
+            android_emulator_mod.ensure_avd = orig_ensure_avd
+            android_emulator_mod.ensure_sdk = orig_ensure_sdk
+        assert retry.status == "needs_user", retry
+        assert retry.can_install is True, retry
+        assert android_emulator_mod._SYSTEM_IMAGE in retry.message, retry.message
 
     # --- 10) 스트림/상태 메시지에 시크릿 값이 그대로 남지 않는다 ---
     assert redact_secrets("") == ""

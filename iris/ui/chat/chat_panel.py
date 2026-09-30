@@ -1547,13 +1547,10 @@ class ChatPanel(QWidget):
         extra = (detail or "").strip()
         if extra:
             text = f"{text} ({extra})"
-        btn_style = (
-            "color:#e2e8f0;background:#0f172a;border:1px solid #38bdf8;"
-            "border-radius:4px;padding:2px 10px;text-decoration:none;margin-left:6px;"
-        )
+        link = 'style="color:#38bdf8;text-decoration:none;"'
         buttons = (
-            f' <a href="iris-update://apply" style="{btn_style}">Update</a>'
-            f' <a href="iris-update://later" style="{btn_style}">Late</a>'
+            f' <a href="iris-update://apply" {link}>[Update]</a>'
+            f' <a href="iris-update://later" {link}>[Late]</a>'
         )
         cursor = self._begin_chat_message_cursor()
         cursor.insertHtml(f"<b>Iris</b>: {html.escape(text)}{buttons}")

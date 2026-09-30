@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from xml.etree import ElementTree
 
+from iris.system.android_sdk_install import ensure_sdk, sdk_package_ids
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ANDROID_EMU_DIR = PROJECT_ROOT / "android-emulator"
 AVD_HOME = ANDROID_EMU_DIR / "avd"
@@ -1609,6 +1611,9 @@ if __name__ == "__main__":
         raise AssertionError("non-ascii input_text should fail")
     except AdbError as exc:
         assert "non-ASCII" in str(exc) or "IME" in str(exc)
+    from iris.system.android_sdk_install import _self_check_ensure_sdk
+
+    _self_check_ensure_sdk()
     if not adb_exe().is_file():
         print("android_emulator ok (adb missing — skip device checks)")
         raise SystemExit(0)

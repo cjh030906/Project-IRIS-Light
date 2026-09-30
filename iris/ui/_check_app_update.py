@@ -21,6 +21,7 @@ def _main() -> None:
     html = panel._log.toHtml()
     assert "iris-update://apply" in html
     assert "iris-update://later" in html
+    assert "[Update]" in html and "[Late]" in html
     assert "업데이트가 가능합니다" in html
     panel.dismiss_update_prompt("미룸")
     html2 = panel._log.toHtml()

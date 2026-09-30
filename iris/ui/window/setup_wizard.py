@@ -342,24 +342,27 @@ class _NeedsUserCard(QFrame):
     def _open_url(self) -> None:
         if self._open_app == "ollama":
             try:
-                from iris.system.ollama_server import ensure_ollama_running, open_ollama_app
+                from iris.system.ollama_server import begin_ollama_cloud_login
 
-                ok, detail = open_ollama_app()
-                ensure_ollama_running("http://127.0.0.1:11434/v1", wait_sec=8.0)
+                ok, detail = begin_ollama_cloud_login()
                 if ok:
                     self._hint.setText(
-                        "Ollama 앱을 열었습니다. 앱에서 클라우드 로그인한 뒤 "
-                        "「완료했어요」를 누르면 연결을 다시 확인합니다."
+                        "Ollama 앱을 열었습니다. 앱에서 로그인하면 "
+                        "확인되는 대로 연결을 다시 검사합니다. "
+                        "바로 넘어가지 않으면 「완료했어요」를 누르세요."
+                    )
+                    self._hint.show()
+                    from iris.ui.workers.ollama_workers import start_ollama_login_watch
+
+                    wizard = self.window()
+                    start_ollama_login_watch(wizard, wizard._on_ollama_app_signed_in)
+                elif detail.startswith("missing"):
+                    self._hint.setText(
+                        "Ollama 앱을 찾지 못해 브라우저 로그인 페이지를 열었습니다."
                     )
                     self._hint.show()
                 else:
-                    # 앱을 못 열면 브라우저 로그인으로 폴백
-                    if self._url:
-                        QDesktopServices.openUrl(QUrl(self._url))
-                    self._hint.setText(
-                        f"Ollama 앱을 열지 못했습니다 ({detail}). "
-                        "브라우저 로그인 페이지를 열었습니다."
-                    )
+                    self._hint.setText(f"Ollama 앱을 열지 못했습니다 ({detail}).")
                     self._hint.show()
                 return
             except Exception as exc:  # noqa: BLE001
@@ -727,12 +730,18 @@ class SetupWizard(QDialog):
             self._card.append_hint("오래 기다리셨다면 버튼을 눌러 주세요.")
 
     def _on_user_done(self, _paste: str) -> None:
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
         self._needs_user_idle.stop()
         self._card.hide()
         if self._worker is not None:
             self._worker.resume_user("done")
 
     def _on_user_later(self) -> None:
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
         self._needs_user_idle.stop()
         self._card.hide()
         if self._worker is not None:
@@ -841,21 +850,55 @@ class SetupWizard(QDialog):
         return not stay
 
     def abort_and_close(self) -> None:
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
         self._force_close = True
         self._abort_worker()
         self.reject()
 
+    def _on_ollama_app_signed_in(self) -> None:
+        """앱 로그인이 데몬에 보이면 채팅 쪽에 반영하고, 대기 중이면 단계를 넘긴다."""
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
+        stop_ollama_login_watch(self)
+        parent = self.parent()
+        apply = getattr(parent, "_apply_confirmed_ollama_login", None)
+        if not callable(apply):
+            from PyQt6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            for widget in app.topLevelWidgets() if app is not None else ():
+                apply = getattr(widget, "_apply_confirmed_ollama_login", None)
+                if callable(apply):
+                    break
+            else:
+                apply = None
+        if callable(apply):
+            apply()
+        card = self._card
+        if not card.isVisible() or card._open_app != "ollama" or card.is_installing():
+            return
+        card.append_hint("로그인이 확인되어 연결을 다시 확인합니다.")
+        card.done_clicked.emit(card._paste.text())
+
     def reject(self) -> None:
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
         if not self.allow_close():
             return
+        stop_ollama_login_watch(self)
         self._abort_worker()
         # ponytail: mark_core_ready_if_healthy 를 UI 스레드에서 돌리면
         # Ollama/Hermes warm 으로 응답없음이 난다 — 닫기 경로에서는 생략.
         super().reject()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        from iris.ui.workers.ollama_workers import stop_ollama_login_watch
+
         if not self.allow_close():
             event.ignore()
             return
+        stop_ollama_login_watch(self)
         self._abort_worker()
         super().closeEvent(event)
