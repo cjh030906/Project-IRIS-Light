@@ -378,6 +378,7 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
     from iris.ui.control_actions.profile import register_profile_actions
     from iris.ui.control_actions.project import register_project_actions
     from iris.ui.control_actions.session import register_session_actions
+    from iris.ui.control_actions.routine import register_routine_actions
     from iris.ui.control_actions.settings import register_settings_actions
     from iris.ui.control_actions.wiki import register_wiki_actions
     from iris.ui.control_actions.workspace import register_workspace_actions
@@ -390,6 +391,7 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
     register_workspace_actions(window, reg)
     register_emulator_actions(window, reg)
     register_learning_actions(window, reg)
+    register_routine_actions(window, reg)
     register_settings_actions(window, reg)
     register_email_actions(window, reg)
     register_wiki_actions(window, reg)

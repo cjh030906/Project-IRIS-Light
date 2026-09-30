@@ -13,6 +13,8 @@ WIKI_NAME = "Iris Wiki"
 DOCS_PREFIX = "docs/"
 USER_PREFIX = "user/"
 INBOX_DIR = "inbox"
+HISTORY_DIR = "history"
+IRIS_DIR = "IRIS"
 
 
 def default_user_wiki_root() -> Path:
@@ -58,6 +60,10 @@ class IrisWiki:
         (self.user_root / "integrations").mkdir(parents=True, exist_ok=True)
         (self.user_root / "learning").mkdir(parents=True, exist_ok=True)
         (self.user_root / INBOX_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / HISTORY_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / HISTORY_DIR / "episodes").mkdir(parents=True, exist_ok=True)
+        (self.user_root / IRIS_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / IRIS_DIR / "routines").mkdir(parents=True, exist_ok=True)
 
     def list_notes(self) -> list[IrisWikiNote]:
         notes: list[IrisWikiNote] = []
@@ -288,6 +294,67 @@ class IrisWiki:
                 lines.append(f"- **`{name}`** — {d}")
         lines.append("")
         self.write_user_note("integrations/mcp.md", "\n".join(lines))
+
+    def sync_history_index(
+        self,
+        *,
+        counts: dict[str, int] | None = None,
+        embed_model: str = "",
+        recent_days: list[str] | None = None,
+    ) -> None:
+        """History 칸 표지 — `history/index.md`.
+
+        일별 기록은 `history/YYYY-MM/YYYY-MM-DD.md`, 요약은 `history/episodes/`에
+        쌓인다. 여기서는 무엇이 얼마나 쌓였는지와 검색이 어떤 모드로 도는지만 알린다.
+        """
+        labels = {
+            "chat": "대화",
+            "action": "수행",
+            "artifact": "생성물",
+            "input": "입력",
+            "episode": "요약",
+        }
+        lines = [
+            "# History",
+            "",
+            "> 아이리스와 나눈 대화, 아이리스가 수행한 일, 만들어낸 것, 들어온 데이터가",
+            "> 여기 쌓입니다. 모델을 바꿔도 이 기록에서 맥락을 되찾습니다.",
+            "",
+            "## 검색 방식",
+            "",
+        ]
+        if embed_model:
+            lines.append(f"- 키워드(FTS5) + 의미 검색 — 임베딩 모델 `{embed_model}`")
+        else:
+            lines.append("- 키워드(FTS5)만 — Ollama 임베딩 모델을 설치하면 의미 검색도 켜집니다")
+            lines.append("  (`ollama pull bge-m3` 권장 — 한국어 품질이 가장 낫습니다)")
+        lines.append("")
+        lines.append("## 쌓인 기록")
+        lines.append("")
+        total = sum((counts or {}).values())
+        if not total:
+            lines.append("_아직 기록 없음_")
+        else:
+            for key, label in labels.items():
+                n = int((counts or {}).get(key, 0))
+                if n:
+                    lines.append(f"- {label}: {n}건")
+            lines.append(f"- **합계: {total}건**")
+        lines.append("")
+        lines.append("## 최근 날짜")
+        lines.append("")
+        if recent_days:
+            for day in recent_days[:14]:
+                lines.append(f"- [[{day}]] — `{HISTORY_DIR}/{day[:7]}/{day}.md`")
+        else:
+            lines.append("_없음_")
+        lines.append("")
+        lines.append("## 지우고 싶다면")
+        lines.append("")
+        lines.append("날짜 파일을 지우면 위키에서는 사라지지만 검색 색인은 남습니다.")
+        lines.append("완전히 지우려면 설정 → History에서 삭제하세요.")
+        lines.append("")
+        self.write_user_note(f"{HISTORY_DIR}/index.md", "\n".join(lines))
 
     def sync_learned_workflows(
         self,

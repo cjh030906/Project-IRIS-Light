@@ -13,6 +13,10 @@ CHAT_TITLE_BASIS_KEY = "chat_title_basis"
 TITLE_BASIS_LAST = "last"
 TITLE_BASIS_FIRST = "first"
 DEFAULT_TITLE = "새 채팅"
+# 답변 도중 다른 대화로 옮기면 끊긴 답변 뒤에 붙여 저장하는 안내문. 다시 열었을 때
+# 중단됐다는 걸 알리는 용도라 저장은 하되, 제목을 만들 때는 뺀다 — 안 빼면 답이
+# 비어 있던 대화의 제목이 이 문장이 되고, 멀쩡하던 제목도 덮어써진다.
+INTERRUPTED_NOTE = "대화 전환으로 응답을 중단했습니다."
 _TITLE_LIMIT = 36
 _USER_TITLE_LIMIT = 48
 
@@ -111,7 +115,8 @@ def suggest_title(
         body = content.strip()
         if role == "user" and body:
             seen_user = True
-        elif role == "assistant" and body:
+        elif role == "assistant" and body.replace(INTERRUPTED_NOTE, "").strip():
+            body = body.replace(INTERRUPTED_NOTE, "").strip()
             last_reply = body
             if seen_user and not replies_after_user:
                 replies_after_user.append(body)
@@ -160,6 +165,11 @@ def ensure_chat_schema(db: Database) -> None:
             "ALTER TABLE chat_conversations "
             "ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0"
         )
+    # 예전 버전이 중단 안내문으로 붙여 둔 제목을 기본 제목으로 되돌린다(직접 붙인 제목 제외).
+    db._execute(
+        "UPDATE chat_conversations SET title = ? WHERE title = ? AND title_locked = 0",
+        (DEFAULT_TITLE, summarize_reply(INTERRUPTED_NOTE)),
+    )
     db._commit()
 
 

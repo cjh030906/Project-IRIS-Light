@@ -1061,6 +1061,8 @@ class ChatPanel(QWidget):
     speaker_clicked = pyqtSignal(str)
     update_action_clicked = pyqtSignal(str)
     ollama_login_clicked = pyqtSignal()
+    # 입력창에 뭔가 쓰기 시작했다 — 보내기 전에 준비할 일(임베딩 모델 깨우기)용
+    composing = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -2157,6 +2159,26 @@ class ChatPanel(QWidget):
         self._append_trailing_blank_line()
         self._scroll_log_to_bottom()
 
+    def append_note(self, text: str) -> None:
+        """앱이 붙이는 작은 안내 줄(참고한 이전 대화, 모델 전환 등).
+
+        Iris 답변이 아니다 — 화자 이름·[재생] 링크를 달지 않고 TTS 본문으로도
+        등록하지 않는다(등록하면 '마지막 답변 읽기'가 이 줄을 읽는다).
+        """
+        body = " ".join((text or "").split())
+        if not body:
+            return
+        self.finish_typing()
+        self._typing_anchor_y = None
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(
+            f'<span style="color:{TOKENS.text_secondary};font-size:12px;">'
+            f"{html.escape(body)}</span>"
+        )
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
     def insert_tool_block(
         self,
         *,
@@ -2549,6 +2571,8 @@ class ChatPanel(QWidget):
     def _on_input_changed(self) -> None:
         self._input_area.sync_height_to_contents()
         self._input_area.input_bar.send_button.setEnabled(self._composer_can_send())
+        if self._input.toPlainText().strip():
+            self.composing.emit()
 
     def set_generating(self, active: bool) -> None:
         """생성 중이면 전송 화살표 → 정지 네모. 클릭 시 stop_clicked."""

@@ -151,6 +151,39 @@ def _native_base(openai_or_native: str) -> str:
     return raw or "http://127.0.0.1:11434"
 
 
+# 임베딩 전용 모델 — Ollama는 용도를 알려주는 API가 없어 이름으로 가른다.
+# 앞일수록 한국어 품질이 좋아 우선 선택된다.
+EMBEDDING_MODEL_PREFERENCE: tuple[str, ...] = (
+    "bge-m3",
+    "qwen3-embedding",
+    "multilingual-e5",
+    "mxbai-embed-large",
+    "snowflake-arctic-embed2",
+    "nomic-embed-text",
+    "all-minilm",
+)
+_EMBEDDING_NAME_HINTS = ("embed", "bge-", "e5-", "gte-")
+
+
+def is_embedding_model_name(name: str) -> bool:
+    """`bge-m3:latest`·`nomic-embed-text` 처럼 임베딩 전용인지 이름으로 판별."""
+    base = (name or "").strip().lower().split(":")[0]
+    if not base:
+        return False
+    if any(base == p or base.startswith(f"{p}-") or base.startswith(f"{p}:") for p in EMBEDDING_MODEL_PREFERENCE):
+        return True
+    return any(hint in base for hint in _EMBEDDING_NAME_HINTS)
+
+
+def embedding_model_rank(name: str) -> tuple[int, str]:
+    """선호 목록 순서 → 정렬 키. 목록에 없으면 뒤로."""
+    base = (name or "").strip().lower().split(":")[0]
+    for idx, pref in enumerate(EMBEDDING_MODEL_PREFERENCE):
+        if base == pref or base.startswith(f"{pref}-"):
+            return (idx, base)
+    return (len(EMBEDDING_MODEL_PREFERENCE), base)
+
+
 def host_label_for_model(model: str, base_url: str) -> str:
     """터미널 Connecting 메시지용 호스트 라벨."""
     if OllamaModelInfo(name=model).is_cloud:
@@ -369,6 +402,69 @@ class OllamaClient:
             seen.add(m.name)
             out.append(m)
         return out
+    def list_embedding_models(self) -> list[str]:
+        """로컬에 설치된 임베딩 모델만 — 이름으로 판별(별도 API 없음)."""
+        try:
+            local = self.list_models()
+        except Exception:
+            return []
+        return [m.name for m in local if is_embedding_model_name(m.name)]
+
+    def pick_embedding_model(self, preferred: str = "") -> str:
+        """선호 모델 → 설치된 것 중 품질순. 없으면 빈 문자열(키워드 검색만 씀)."""
+        installed = self.list_embedding_models()
+        if not installed:
+            return ""
+        want = (preferred or "").strip()
+        if want:
+            for name in installed:
+                if name == want or name.split(":")[0] == want.split(":")[0]:
+                    return name
+        ranked = sorted(installed, key=embedding_model_rank)
+        return ranked[0]
+
+    def embed(
+        self,
+        model: str,
+        texts: list[str],
+        *,
+        timeout_sec: float = 120.0,
+        keep_alive: str | None = None,
+    ) -> list[list[float]]:
+        """텍스트 배치 → 벡터. 신형 /api/embed, 실패 시 구형 /api/embeddings 폴백.
+
+        `keep_alive` — 모델을 메모리에 붙잡아 둘 시간("30m"). Ollama는 요청마다
+        만료 시각을 그 요청 값(기본 5분)으로 다시 잡으므로 일관되게 넘겨야 한다.
+        """
+        items = [str(t or "") for t in texts]
+        if not items or not (model or "").strip():
+            return []
+        extra = {"keep_alive": keep_alive} if keep_alive else {}
+        try:
+            data = self._post_json(
+                "/api/embed",
+                {"model": model, "input": items, **extra},
+                timeout_sec=timeout_sec,
+            )
+            vectors = data.get("embeddings")
+            if isinstance(vectors, list) and len(vectors) == len(items):
+                return [[float(x) for x in vec] for vec in vectors]
+        except RuntimeError:
+            pass
+        # 구형 데몬 — 한 건씩만 받는다
+        out: list[list[float]] = []
+        for text in items:
+            data = self._post_json(
+                "/api/embeddings",
+                {"model": model, "prompt": text, **extra},
+                timeout_sec=timeout_sec,
+            )
+            vec = data.get("embedding")
+            if not isinstance(vec, list):
+                raise RuntimeError(f"Ollama 임베딩 응답 형식 오류: {model}")
+            out.append([float(x) for x in vec])
+        return out
+
     def stream_chat(
         self,
         model: str,
@@ -465,6 +561,31 @@ class OllamaClient:
         msg = obj.get("message") or {}
         return str(msg.get("content") or "") if isinstance(msg, dict) else ""
 
+    def _post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_sec: float = 60.0,
+    ) -> dict[str, Any]:
+        req = Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with urlopen(req, timeout=min(timeout_sec, self.timeout_sec)) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:400]
+            raise RuntimeError(f"Ollama HTTP {e.code}: {detail or e.reason}") from e
+        except URLError as e:
+            raise RuntimeError(f"Ollama 연결 실패: {e.reason}") from e
+
     def _get_json(self, path: str) -> dict[str, Any]:
         return self._get_json_url(f"{self.base_url}{path}")
 
@@ -518,4 +639,12 @@ if __name__ == "__main__":
     assert display_name_from_runtime("api:nv:google/gemma-2-9b-it") == "gemma 2 9b it"
     assert display_name_from_runtime("api:x:meta/llama-3.1-8b-instruct") == "llama 3.1 8b instruct"
     assert display_name_from_runtime("nvidia/nemotron-3-nano") == "nemotron 3 nano"
+    assert is_embedding_model_name("bge-m3:latest") is True
+    assert is_embedding_model_name("nomic-embed-text") is True
+    assert is_embedding_model_name("mxbai-embed-large:335m") is True
+    assert is_embedding_model_name("qwen3:8b") is False
+    assert is_embedding_model_name("gemma4:31b-cloud") is False
+    assert is_embedding_model_name("") is False
+    assert embedding_model_rank("bge-m3:latest") < embedding_model_rank("nomic-embed-text")
+    assert embedding_model_rank("nomic-embed-text") < embedding_model_rank("weird-vec")
     print("ollama_client self-check ok")

@@ -10,6 +10,19 @@ from typing import Optional
 
 from iris.config.settings import Settings
 
+# win32ui 는 여기서(모듈을 import 하는 메인 스레드에서) 미리 올린다.
+# 캡처 스레드 안에서 처음 import 하면 DLL 초기화가 Windows 로더 잠금을 쥔 채
+# GIL을 기다리는데, 그동안 메인 스레드는 GIL을 쥔 채 Qt 페인트 보조 스레드를
+# 기다리고(보조 스레드 생성엔 로더 잠금이 필요) — 서로 영원히 기다려 창이 굳는다.
+# 2026-09-29 py-spy 로 두 번 재현: screen_capture.py 의 지연 import 와
+# cyberspace_background.paintEvent 가 같이 멈춰 있었다.
+if sys.platform == "win32":
+    try:
+        import win32gui  # type: ignore  # noqa: F401
+        import win32ui  # type: ignore  # noqa: F401
+    except Exception:
+        pass
+
 
 @dataclass
 class CaptureResult:

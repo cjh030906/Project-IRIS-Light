@@ -462,6 +462,42 @@
     "confirm_required": false
   },
   {
+    "name": "routine.create",
+    "summary": "Register a recurring task the user asked for (task = user's sentence verbatim; kind=daily|weekly|interval|once, time_of_day=HH:MM, weekdays=mon,fri, interval_minutes=N, at=ISO, deliver=chat,notify,voice,wiki, model=pin a model, wake_when_closed=true, search=web query run before the model for live facts, search_engine=google_news|google|…)",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "routine.delete",
+    "summary": "Delete a routine by id or name",
+    "risk": "high",
+    "confirm_required": true
+  },
+  {
+    "name": "routine.get",
+    "summary": "Get one routine by id or name",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "routine.list",
+    "summary": "List registered routines",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "routine.run",
+    "summary": "Run a routine right now without waiting for its schedule",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "routine.update",
+    "summary": "Change a routine by id or name (schedule, task, deliver, enabled, model, search, wake_when_closed)",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "settings.get",
     "summary": "Get Ollama/Hermes connection settings (no secret values)",
     "risk": "low",
