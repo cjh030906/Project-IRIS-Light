@@ -15,7 +15,20 @@ from urllib.request import Request, urlopen
 
 _MAX_CHARS = 80_000
 _TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".csv", ".json", ".log"}
+_CODE_SUFFIXES = {
+    ".py", ".pyw", ".html", ".htm", ".css", ".js", ".mjs", ".cjs",
+    ".ts", ".tsx", ".jsx", ".xml", ".yaml", ".yml", ".toml", ".ini",
+    ".cfg", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".go",
+    ".rs", ".rb", ".php", ".sql", ".sh", ".ps1", ".bat", ".vue", ".svelte",
+    ".mdx",
+}
 _PDF_SUFFIXES = {".pdf"}
+_OFFICE_SUFFIXES = {".docx", ".pptx", ".xlsx"}
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_HWP_SUFFIXES = {".hwp", ".hwpx"}
+_LAYER_MIN = 40
+_OCR_KEEP = 8
+VISION_PAGE_CAP = 4
 _TESSDATA_LANGS = ("eng", "osd", "kor")
 _TESSDATA_URL = "https://github.com/tesseract-ocr/tessdata/raw/main/{lang}.traineddata"
 _WIN_TESSERACT_CANDIDATES = (
@@ -24,10 +37,14 @@ _WIN_TESSERACT_CANDIDATES = (
 )
 _tesseract_ready = False
 _tessdata_dir: Path | None = None
+_ocr_unavailable = ""
 
 # 웹 Setup 다운로드 오류와 분리 — 도움말: https://iris-light-site.vercel.app/#install
 _SETUP_HELP = "https://iris-light-site.vercel.app/#install"
-_SUPPORTED_ATTACH = "PDF, Markdown, TXT, CSV, JSON, LOG, http(s) URL"
+_SUPPORTED_ATTACH = (
+    "PDF, Markdown, TXT, CSV, JSON, LOG, 소스코드, HTML, DOCX, PPTX, XLSX, "
+    "PNG/JPG 등 이미지, http(s) URL"
+)
 
 
 class UnsupportedAttachmentTypeError(ValueError):
@@ -92,6 +109,16 @@ def _truncate(text: str, *, limit: int = _MAX_CHARS) -> tuple[str, bool]:
         return text, False
     cut = text[:limit].rsplit("\n", 1)[0].strip() or text[:limit]
     return cut + f"\n\n… (truncated at {limit} chars)", True
+
+
+def readable_suffix(suffix: str) -> bool:
+    """폴더 발췌에 넣을 글자 파일. 이미지는 쪽이 아니라 첨부일 때만."""
+    low = (suffix or "").lower()
+    return low in _TEXT_SUFFIXES or low in _CODE_SUFFIXES or low in _PDF_SUFFIXES or low in _OFFICE_SUFFIXES
+
+
+def _letters(text: str) -> int:
+    return len(re.findall(r"[0-9A-Za-z가-힣]", text or ""))
 
 
 def _looks_like_url(source: str) -> bool:
@@ -208,44 +235,120 @@ def _ensure_tesseract() -> None:
         ) from exc
 
 
-def _extract_pdf_text_ocr(path: Path) -> str:
-    """ponytail: pymupdf render + pytesseract; needs system Tesseract with kor."""
+def _page_png(page: object, *, dpi: int = 130) -> bytes:
+    pix = page.get_pixmap(dpi=dpi)  # type: ignore[attr-defined]
+    return pix.tobytes("png")
+
+
+def _ocr_png_bytes(png: bytes) -> tuple[str, str]:
+    """(text, error). Tesseract가 없어도 예외를 올리지 않는다."""
+    global _ocr_unavailable
+    if _ocr_unavailable:
+        return "", _ocr_unavailable
     import io
 
-    _ensure_tesseract()
+    try:
+        _ensure_tesseract()
+        import pytesseract
+        from PIL import Image
+    except (RuntimeError, ImportError) as exc:
+        _ocr_unavailable = str(exc)
+        return "", _ocr_unavailable
+    tess_cfg = f"--tessdata-dir {_tessdata_dir.as_posix()}" if _tessdata_dir else ""
+    try:
+        image = Image.open(io.BytesIO(png))
+        text = pytesseract.image_to_string(image, lang="kor+eng", config=tess_cfg).strip()
+    except Exception as exc:  # noqa: BLE001
+        return "", str(exc)
+    return text, ""
+
+
+def read_pdf_pages(
+    path: Path,
+    *,
+    page_limit: int | None = None,
+    vision_reader=None,
+) -> dict[str, str | bool]:
+    """쪽마다 글자 층 → OCR → (있으면) 비전. 본문이 없으면 ValueError."""
     try:
         import pymupdf
     except ImportError as exc:
-        raise RuntimeError("PDF OCR에 pymupdf가 필요합니다 — pip install pymupdf") from exc
-    import pytesseract
-    from PIL import Image
+        raise RuntimeError("PDF에 pymupdf가 필요합니다 — pip install pymupdf") from exc
 
-    parts: list[str] = []
-    tess_cfg = f"--tessdata-dir {_tessdata_dir.as_posix()}" if _tessdata_dir else ""
+    page_texts: list[str] = []
+    try:
+        from pypdf import PdfReader
+
+        page_texts = [(page.extract_text() or "") for page in PdfReader(str(path)).pages]
+    except Exception as exc:
+        low = str(exc).lower()
+        if "password" in low or "encrypted" in low:
+            raise ValueError("암호가 걸린 PDF는 읽지 못했습니다.") from exc
+        page_texts = []
+
     doc = pymupdf.open(str(path))
     try:
-        for page in doc:
-            pix = page.get_pixmap(dpi=150)
-            im = Image.open(io.BytesIO(pix.tobytes("png")))
-            chunk = pytesseract.image_to_string(im, lang="kor+eng", config=tess_cfg).strip()
-            if chunk:
-                parts.append(chunk)
+        total = int(doc.page_count)
+        limit = total if not page_limit else min(total, int(page_limit))
+        parts: list[str] = []
+        vision: list[bytes] = []
+        vision_indexes: list[int] = []
+        ocr_used = False
+        ocr_error = ""
+        for index in range(limit):
+            raw = page_texts[index] if index < len(page_texts) else ""
+            if _letters(raw) >= _LAYER_MIN:
+                parts.append(f"[쪽 {index + 1}]\n{raw.strip()}")
+                continue
+            png = _page_png(doc[index])
+            ocr_text, err = _ocr_png_bytes(png)
+            if err:
+                ocr_error = ocr_error or err
+            if _letters(ocr_text) >= _OCR_KEEP:
+                ocr_used = True
+                parts.append(f"[쪽 {index + 1}]\n{ocr_text.strip()}")
+                continue
+            if len(vision) < VISION_PAGE_CAP:
+                vision.append(png)
+                vision_indexes.append(index + 1)
+        vision_used = False
+        if vision and vision_reader is not None:
+            try:
+                transcribed = str(vision_reader(vision) or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                transcribed = ""
+                ocr_error = ocr_error or str(exc)
+            if transcribed:
+                vision_used = True
+                label = ", ".join(str(number) for number in vision_indexes)
+                parts.append(f"[쪽 {label} 이미지]\n{transcribed}")
+        text = "\n\n".join(part for part in parts if part.strip()).strip()
+        notes: list[str] = []
+        if page_limit and total > limit:
+            notes.append(f"앞 {limit}쪽만 읽었습니다. 전체 {total}쪽.")
+        if vision and not vision_used and vision_reader is None:
+            notes.append("글자가 없는 이미지 쪽은 OCR이 비어 있고, 비전 읽기가 없습니다.")
+        if not text:
+            reason = ocr_error or "이미지로만 된 PDF에서 글자를 읽지 못했습니다."
+            if notes:
+                reason = f"{reason} {' '.join(notes)}"
+            raise ValueError(reason)
+        return {
+            "text": text,
+            "ocr_used": ocr_used,
+            "vision_used": vision_used,
+            "note": " ".join(notes),
+        }
     finally:
         doc.close()
-    text = "\n\n".join(parts)
-    if not text.strip():
-        raise ValueError(
-            "OCR로 텍스트를 추출하지 못했습니다 (pdf-ocr). "
-            "Tesseract에 kor 언어 팩이 설치되어 있는지 확인하세요."
-        )
-    return text
 
 
 def extract_pdf_text(path: Path) -> str:
-    text = _extract_pdf_text_pypdf(path)
-    if text.strip():
-        return text
-    return _extract_pdf_text_ocr(path)
+    data = read_pdf_pages(path)
+    text = str(data.get("text") or "").strip()
+    if not text:
+        raise ValueError("OCR로 텍스트를 추출하지 못했습니다 (pdf-ocr).")
+    return text
 
 
 def fetch_firecrawl_text(url: str, *, timeout: float = 45.0) -> tuple[str, str]:
@@ -360,7 +463,62 @@ def source_display_title(path: Path, *, meta: str = "", text: str = "") -> str:
     return path.name or path.stem or "untitled"
 
 
-def extract_from_source(source: str) -> dict[str, str | bool]:
+def _png_bytes(raw: bytes) -> bytes:
+    import io
+
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(raw))
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _extract_ooxml(path: Path) -> str:
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    suffix = path.suffix.lower()
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if suffix == ".docx":
+            wanted = [name for name in names if name == "word/document.xml"]
+        elif suffix == ".pptx":
+            wanted = sorted(
+                name for name in names if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            )
+        elif suffix == ".xlsx":
+            wanted = [name for name in names if name == "xl/sharedStrings.xml"]
+        else:
+            wanted = []
+        chunks: list[str] = []
+        for name in wanted:
+            root = ET.fromstring(archive.read(name))
+            bits: list[str] = []
+            for el in root.iter():
+                if not isinstance(el.tag, str):
+                    continue
+                if el.tag == "t" or el.tag.endswith("}t"):
+                    value = (el.text or "").strip()
+                    if value:
+                        bits.append(value)
+            if bits:
+                chunks.append("\n".join(bits))
+    text = "\n\n".join(chunks).strip()
+    if not text:
+        raise ValueError(f"{suffix} 파일에서 글자를 찾지 못했습니다.")
+    return text
+
+
+def extract_from_source(
+    source: str,
+    *,
+    char_limit: int = _MAX_CHARS,
+    page_limit: int | None = None,
+    vision_reader=None,
+) -> dict[str, str | bool]:
     """파일 경로 또는 http(s) URL → {kind, title, text, source, truncated}."""
     src = (source or "").strip().strip('"').strip("'")
     if not src:
@@ -368,7 +526,7 @@ def extract_from_source(source: str) -> dict[str, str | bool]:
 
     if _looks_like_url(src):
         title, text = fetch_url_text(src)
-        text, truncated = _truncate(text)
+        text, truncated = _truncate(text, limit=char_limit)
         return {
             "kind": "url",
             "title": title,
@@ -382,23 +540,59 @@ def extract_from_source(source: str) -> dict[str, str | bool]:
         raise FileNotFoundError(f"not a file: {src}")
 
     suffix = path.suffix.lower()
+    if suffix in _HWP_SUFFIXES:
+        raise ValueError("한글(HWP) 파일은 아직 본문을 읽지 못합니다.")
+
     if suffix in _PDF_SUFFIXES:
-        text_raw = _extract_pdf_text_pypdf(path)
-        ocr_used = not text_raw.strip()
-        text = _extract_pdf_text_ocr(path) if ocr_used else text_raw
-        text, truncated = _truncate(text)
+        data = read_pdf_pages(path, page_limit=page_limit, vision_reader=vision_reader)
+        text, truncated = _truncate(str(data.get("text") or ""), limit=char_limit)
+        note = str(data.get("note") or "").strip()
+        if note:
+            text = f"{note}\n\n{text}"
         return {
             "kind": "pdf",
             "title": source_display_title(path, meta=_pdf_metadata_title(path), text=text),
             "text": text,
             "source": str(path.resolve()),
             "truncated": truncated,
-            "ocr_used": ocr_used,
+            "ocr_used": bool(data.get("ocr_used")),
+            "vision_used": bool(data.get("vision_used")),
+            "note": note,
         }
 
-    if suffix in _TEXT_SUFFIXES or suffix == "":
+    if suffix in _OFFICE_SUFFIXES:
+        text, truncated = _truncate(_extract_ooxml(path), limit=char_limit)
+        return {
+            "kind": "office",
+            "title": source_display_title(path, text=text),
+            "text": text,
+            "source": str(path.resolve()),
+            "truncated": truncated,
+        }
+
+    if suffix in _IMAGE_SUFFIXES:
+        if vision_reader is None:
+            raise ValueError("이미지 파일이라 글자 층이 없습니다. 비전 읽기가 연결되어 있지 않습니다.")
+        try:
+            png = _png_bytes(path.read_bytes())
+            text = str(vision_reader([png]) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"이미지에서 내용을 읽지 못했습니다: {exc}") from exc
+        if len(text) < 8:
+            raise ValueError("이미지에서 내용을 읽지 못했습니다.")
+        text, truncated = _truncate(text, limit=char_limit)
+        return {
+            "kind": "image",
+            "title": path.name,
+            "text": text,
+            "source": str(path.resolve()),
+            "truncated": truncated,
+            "vision_used": True,
+        }
+
+    if suffix in _TEXT_SUFFIXES or suffix in _CODE_SUFFIXES or suffix == "":
         text = path.read_text(encoding="utf-8", errors="replace")
-        text, truncated = _truncate(text)
+        text, truncated = _truncate(text, limit=char_limit)
         return {
             "kind": "text",
             "title": source_display_title(path, text=text),

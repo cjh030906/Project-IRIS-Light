@@ -16,14 +16,62 @@ _AT_PATH_RE = re.compile(
 )
 
 
+def _filename_continues(current: str, candidate: str) -> bool:
+    """다음 단어를 붙인 경로가 파일이거나, 폴더 안 파일 이름이 그것으로 시작한다."""
+    cand = Path(candidate)
+    try:
+        if cand.is_file():
+            return True
+    except OSError:
+        return False
+    parent = Path(current).parent
+    name = cand.name.casefold()
+    if not name:
+        return False
+    try:
+        if not parent.is_dir():
+            return False
+        for child in parent.iterdir():
+            try:
+                if child.is_file() and child.name.casefold().startswith(name):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
+def _extend_spaced_ref(text: str, raw: str, end: int) -> str:
+    if not _looks_like_path(raw):
+        return raw
+    current = raw
+    rest = text[end:]
+    while True:
+        match = re.match(r"^[ \t]+(\S+)", rest)
+        if not match:
+            break
+        word = match.group(1).rstrip(".,;:!?)]}")
+        if not word:
+            break
+        candidate = f"{current} {word}"
+        if not _filename_continues(current, candidate):
+            break
+        current = candidate
+        rest = rest[match.end() :]
+    return current
+
+
 def extract_at_path_refs(text: str) -> list[str]:
     """@로 시작하는 경로 참조 목록 (중복 제거, 순서 유지)."""
     seen: set[str] = set()
     out: list[str] = []
-    for m in _AT_PATH_RE.finditer(text or ""):
+    body = text or ""
+    for m in _AT_PATH_RE.finditer(body):
         raw = (m.group(1) or "").strip().strip('"').strip("'")
         if not raw or raw.startswith("mcp:"):
             continue
+        raw = _extend_spaced_ref(body, raw, m.end())
         if raw not in seen:
             seen.add(raw)
             out.append(raw)

@@ -45,6 +45,8 @@ User notes live under `~/.iris-light/iris-wiki/` and appear in the UI as `user/.
 
 ## Rules
 
+- Explaining a PDF, file, folder, or link is not a wiki save. If the user message contains `[자료 본문]`, answer from that excerpt. Do not ask for page screenshots first. Do not say PDF text cannot be read.
+- Saving the chat as a PDF file is `note.export_pdf`, not this skill. Do not run PyMuPDF, reportlab, or pdf_create.py.
 - Never say “저장했습니다” without a successful `wiki.write_user_note` or `wiki.import_content` result.
 - Local Iris may handle save without MCP when user attaches a file or pastes a URL with save intent.
 - Prefer `mode=summarize` when user asks to 요약/정리; default `raw` for full capture.

@@ -3864,6 +3864,7 @@ class MainWindow(QMainWindow):
             )
             self._refresh_hermes_health()
 
+        shown = self._format_user_turn_content(turn)
         if turn.source == UserTurnSource.VOICE:
             self._stop_stt_ux_timer()
             completed = False
@@ -3871,10 +3872,116 @@ class MainWindow(QMainWindow):
             if callable(complete):
                 completed = bool(complete(text))
             if not completed:
-                self._chat.append_message_instant("You", self._format_user_turn_content(turn))
+                self._chat.append_message_instant("You", shown)
         elif not self._turn_is_followthrough:
-            self._chat.append_message_instant("You", self._format_user_turn_content(turn))
-        self._record_history("user", self._format_user_turn_content(turn))
+            self._chat.append_message_instant("You", shown)
+
+        from iris.knowledge.material_excerpt import turn_should_read_materials
+        from iris.ui.chat.file_write_claim import image_write_request
+
+        skip_images = image_write_request(text, list(turn.attachments))
+        bases = self._material_search_bases()
+        if turn_should_read_materials(
+            text,
+            list(turn.attachments),
+            bases=bases,
+            skip_image_files=skip_images,
+        ):
+            self._turn_gate.arm()
+            self._chat.set_generating(True)
+            self._start_material_read(turn, model, shown, owns, skip_images, bases)
+            return
+        self._commit_recorded_user_turn(turn, model, shown, owns)
+
+    def _material_search_bases(self) -> list[str]:
+        roots: list[str] = []
+        session = self._get_bound_ide_session(refresh=False)
+        if session is not None:
+            roots.append((session.workspace_root or "").strip())
+        try:
+            roots.append(self._current_project_root())
+        except Exception:
+            pass
+        roots.extend(self._at_path_search_roots())
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in roots:
+            key = (raw or "").strip()
+            if not key or key.casefold() in seen:
+                continue
+            seen.add(key.casefold())
+            out.append(key)
+        return out
+
+    def _material_vision_spec(self, model: str) -> dict[str, str]:
+        spec = {
+            "model": model,
+            "ollama_base_url": self._settings.ollama_base_url,
+            "api_base_url": "",
+            "api_key": "",
+            "auth_style": "bearer",
+        }
+        parsed = parse_runtime_model_id(model)
+        if parsed is None:
+            return spec
+        provider = get_api_provider(self._db, parsed[0])
+        spec["model"] = parsed[1]
+        if provider is not None and provider.base_url:
+            spec["api_base_url"] = provider.base_url
+            spec["api_key"] = provider.api_key
+            spec["auth_style"] = provider.auth_style or "bearer"
+        return spec
+
+    def _start_material_read(
+        self,
+        turn: UserTurn,
+        model: str,
+        shown: str,
+        owns: bool,
+        skip_images: bool,
+        bases: list[str],
+    ) -> None:
+        from iris.ui.workers.material_read_worker import MaterialReadWorker
+
+        self._live_activity.append_instant_line("자료를 읽는 중…")
+        worker = MaterialReadWorker(
+            turn.text or "",
+            list(turn.attachments),
+            bases=bases,
+            skip_image_files=skip_images,
+            vision_spec=self._material_vision_spec(model),
+            parent=self,
+        )
+        self._material_read_worker = worker
+        worker.finished_text.connect(
+            lambda block, tid=turn.id, mdl=model, display=shown, own=owns: self._on_material_read_done(
+                tid, mdl, display, own, block
+            )
+        )
+        worker.start()
+
+    def _on_material_read_done(
+        self,
+        turn_id: str,
+        model: str,
+        display: str,
+        owns: bool,
+        block: str,
+    ) -> None:
+        if not self._is_current_turn(turn_id):
+            return
+        turn = self._turn_dispatcher.active_turn
+        if turn is None or turn.id != turn_id:
+            return
+        from iris.knowledge.material_excerpt import compose_model_user_text
+
+        self._commit_recorded_user_turn(
+            turn, model, compose_model_user_text(display, block), owns
+        )
+
+    def _commit_recorded_user_turn(self, turn: UserTurn, model: str, content: str, owns: bool) -> None:
+        text = (turn.text or "").strip()
+        self._record_history("user", content)
         self._refresh_context_gauge()
         self._turn_gate.arm()
         self._stop_tts_playback()
@@ -6876,8 +6983,12 @@ class MainWindow(QMainWindow):
             "여러 페이지는 wiki.import_pages (source 또는 sources, discover=true). "
             "페이지마다 import_content 를 반복하지 말 것. "
             "저장 성공은 도구 ok 로만 말한다. "
-            "채팅을 PDF로 저장: note.export_pdf (content, optional path). "
-            "pdf_create.py·PyMuPDF·reportlab 을 직접 돌리지 말 것. "
+            "자료 설명: 사용자 메시지에 [자료 본문]이 있으면 그 발췌로 답한다. "
+            "PDF·폴더·파일·http 링크가 무엇인지 물어볼 때 페이지 캡처를 먼저 요구하지 않는다. "
+            "발췌가 실패 이유뿐이면 그 이유만 말한다. 한글(HWP)은 아직 읽지 못한다. "
+            "이 읽기는 위키 저장과 별개다. "
+            "채팅을 PDF 파일로 저장하거나 만드는 요청만 note.export_pdf (content, optional path) 를 쓴다. "
+            "그때 pdf_create.py·PyMuPDF·reportlab 을 직접 돌리지 말 것. "
             "GitHub MCP 또는 Skill: extension.install_github (url, kind=auto|mcp|skill). "
             "needs_input 이면 키나 디렉터리를 묻고 비밀은 만들지 말 것. "
             "사진에서 코드 파일: project.write_image_code (image=첨부 경로, rel_path). "

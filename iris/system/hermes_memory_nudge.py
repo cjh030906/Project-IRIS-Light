@@ -14,9 +14,9 @@ from iris.system.hermes_iris_control_sync import hermes_home
 
 
 
-_MARKER = "<!-- iris-control-nudge-v17 -->"
+_MARKER = "<!-- iris-control-nudge-v18 -->"
 
-_BLOCK = """<!-- iris-control-nudge-v17 -->
+_BLOCK = """<!-- iris-control-nudge-v18 -->
 
 ## Iris Light UI control
 
@@ -54,6 +54,7 @@ When the user asks to open IDE / start coding / Companion / "ide 켜줘" / open 
 15b. "PDF로 저장/만들어 줘" (위키 아님): `note.export_pdf` with `content` and optional `path`. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process.
 15c. GitHub MCP/Skill URL: `extension.install_github` (`url`, `kind=auto|mcp|skill`). If status is needs_input, ask for the missing key or directory. Do not invent secrets.
 15d. Image attachment → code file: `project.write_image_code` (`image` path, `rel_path`). If the target file is unknown, ask. Never claim the file was written without ok.
+15e. If the user message contains `[자료 본문]`, answer from that excerpt (PDF, folder, file, or link). Do not ask for page screenshots first. Do not say you cannot read PDF. HWP is unsupported. Saving a chat as a PDF file stays 15b (`note.export_pdf` only).
 
 16. Email / 메일: `workspace.open_email`, then `email.list_messages` (today=true or since=YYYY-MM-DD) / `email.read_message` / `email.open_compose` / `email.send` (skill iris-email). Never invent inbox contents.
 
@@ -131,6 +132,8 @@ def ensure_memory_nudge() -> str:
 
         and "project.write_image_code" in existing
 
+        and "[자료 본문]" in existing
+
         and "no keyword shortcut" in existing
 
         and "email.list_messages" in existing
@@ -151,7 +154,7 @@ def ensure_memory_nudge() -> str:
 
     path.write_text(text, encoding="utf-8")
 
-    return "memory nudge updated (v17)"
+    return "memory nudge updated (v18)"
 
 
 

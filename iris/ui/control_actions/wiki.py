@@ -427,7 +427,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     reg.register(
         "content.extract",
         content_extract,
-        summary="Extract text from PDF, text file, or http(s) URL",
+        summary="Extract text from PDF (scanned image pages included), Office, text, image, or http(s) URL. Chat already attaches [자료 본문] before the answer.",
         risk="low",
     )
 
