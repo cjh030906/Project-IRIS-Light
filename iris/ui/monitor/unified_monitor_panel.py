@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -97,6 +99,8 @@ class _CaptureThumbLabel(QLabel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._source: Optional[QPixmap] = None
+        self._digest: tuple | None = None
+        self._mode = ""
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFixedSize(_THUMB_W, _THUMB_H)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -104,6 +108,10 @@ class _CaptureThumbLabel(QLabel):
 
     def set_capture(self, cap: Optional[CaptureResult], minimized: bool = False) -> None:
         if cap and cap.rgb_bytes and cap.width > 0 and cap.height > 0:
+            digest = (cap.width, cap.height, hash(cap.rgb_bytes))
+            if digest == self._digest and self._mode == "image":
+                return
+            self._digest = digest
             qimg = QImage(
                 cap.rgb_bytes,
                 cap.width,
@@ -113,9 +121,16 @@ class _CaptureThumbLabel(QLabel):
             ).copy()
             self._source = QPixmap.fromImage(qimg)
             self.setText("")
-            self.setStyleSheet("background: transparent; border: none;")
+            if self._mode != "image":
+                self.setStyleSheet("background: transparent; border: none;")
+            self._mode = "image"
             self._apply_pixmap()
         else:
+            mode = "min" if minimized else "fail"
+            if self._mode == mode:
+                return
+            self._mode = mode
+            self._digest = None
             self._source = None
             self.clear()
             self.setText("최소화됨" if minimized else "캡처 불가")
@@ -165,6 +180,10 @@ class UnifiedMonitorPanel(QWidget):
         self._db: Optional["Database"] = None
         self._pins: Optional[PinStore] = None
         self._last_snaps: list[_WindowSnap] = []
+        self._card_keys: tuple = ()
+        self._thumbs: list[_CaptureThumbLabel] = []
+        self._rebuild_count = 0
+        self._thumb_update_count = 0
 
         inner = QWidget()
         inner.setObjectName("UnifiedMonitorPanelInner")
@@ -299,14 +318,32 @@ class UnifiedMonitorPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _render(self, snaps: list[_WindowSnap], monitors: dict[str, _MonitorMeta]) -> None:
-        # 기존 위젯 제거
+        rows: list[tuple[_WindowSnap, Optional[_MonitorMeta], Optional[PinnedTarget], tuple]] = []
+        for snap in snaps:
+            meta = _match_monitor(snap.info.title, monitors)
+            pin = self._pins.get(snap.info.title) if self._pins else None
+            if pin is not None and pin.last_checked_at:
+                # 이번 세션에서 분석된 창은 위의 AI 감시 위젯이 같은 내용을
+                # 더 자세히 보여 준다. DB 스냅샷은 재시작 직후처럼 아직
+                # 분석 결과가 없을 때만 쓴다.
+                meta = None
+            rows.append((snap, meta, pin, _card_key(snap, pin, meta)))
+        keys = tuple(row[3] for row in rows)
+        if keys == self._card_keys and len(self._thumbs) == len(rows):
+            self._thumb_update_count += 1
+            for thumb, (snap, _meta, _pin, _key) in zip(self._thumbs, rows):
+                thumb.set_capture(snap.cap, snap.info.minimized)
+            return
+
+        self._rebuild_count += 1
         while self._inner_lay.count():
             item = self._inner_lay.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
+        self._thumbs = []
 
-        if not snaps:
+        if not rows:
             hint = QLabel(
                 "No active screen preview\nSelect a running window to inspect."
             )
@@ -319,14 +356,7 @@ class UnifiedMonitorPanel(QWidget):
             )
             self._inner_lay.addWidget(hint)
         else:
-            for snap in snaps:
-                meta = _match_monitor(snap.info.title, monitors)
-                pin = self._pins.get(snap.info.title) if self._pins else None
-                if pin is not None and pin.last_checked_at:
-                    # 이번 세션에서 분석된 창은 위의 AI 감시 위젯이 같은 내용을
-                    # 더 자세히 보여 준다. DB 스냅샷은 재시작 직후처럼 아직
-                    # 분석 결과가 없을 때만 쓴다.
-                    meta = None
+            for snap, meta, pin, _key in rows:
                 card = _make_card(
                     snap,
                     meta,
@@ -335,8 +365,12 @@ class UnifiedMonitorPanel(QWidget):
                     pin_enabled=self._pins is not None,
                     on_toggle_pin=self._toggle_pin,
                 )
+                thumb = card.findChild(_CaptureThumbLabel)
+                if thumb is not None:
+                    self._thumbs.append(thumb)
                 self._inner_lay.addWidget(card)
 
+        self._card_keys = keys
         self._inner_lay.addStretch(1)
 
     # ------------------------------------------------------------------
@@ -395,12 +429,50 @@ class UnifiedMonitorPanel(QWidget):
 # ----------------------------------------------------------------------
 
 
+def _is_own_process_window(hwnd: int) -> bool:
+    """자기 프로세스 창은 PrintWindow 하지 않는다.
+
+    PW_RENDERFULLCONTENT로 자기 창을 4초마다 찍으면 WM_PRINT가 전체 클라이언트를
+    다시 그리게 하고, 썸네일 안에 자기 화면이 재귀로 들어간다.
+    """
+    if sys.platform != "win32" or int(hwnd) <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+    return int(pid.value) == os.getpid()
+
+
+def _card_key(
+    snap: _WindowSnap,
+    pin: Optional[PinnedTarget],
+    meta: Optional[_MonitorMeta],
+) -> tuple:
+    info = snap.info
+    if pin is None:
+        pin_key = None
+    else:
+        status = pin.status.value if hasattr(pin.status, "value") else pin.status
+        pin_key = (
+            str(status),
+            bool(pin.analyzing),
+            pin.reason,
+            pin.recommended_action,
+            pin.last_checked_at,
+        )
+    meta_key = None if meta is None else (meta.status, meta.last_event, meta.last_checked_at)
+    return (int(info.hwnd), info.title, bool(info.minimized), pin_key, meta_key)
+
+
 def _capture_all_windows(sig: _CaptureSignals) -> None:
     """데몬 스레드에서 모든 창 캡처. PrintWindow 우선, 실패 시 mss 폴백."""
     try:
         wins = list_visible_windows()
     except Exception:
         wins = []
+    wins = [w for w in wins if not _is_own_process_window(w.hwnd)]
     wins = wins[:_MAX_WINDOWS]
 
     snaps: list[_WindowSnap] = []
@@ -631,3 +703,40 @@ def _make_card(
     img_lbl.mousePressEvent = _click  # type: ignore[method-assign]
 
     return fr
+
+
+def _self_check() -> None:
+    """같은 창 목록이면 카드를 지우지 않고 썸네일만 갱신한다."""
+    import os as _os
+
+    _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    panel = UnifiedMonitorPanel()
+    panel._timer.stop()
+    info = WindowInfo("A", 0, 0, 80, 60, hwnd=7)
+    cap = CaptureResult(2, 2, bytes(range(12)))
+    snap = _WindowSnap(info, cap)
+    panel._render([snap], {})
+    thumb = panel._thumbs[0]
+    widgets = panel._inner_lay.count()
+    panel._render([snap], {})
+    assert panel._thumbs[0] is thumb, "same window rebuilt the card"
+    assert panel._inner_lay.count() == widgets
+    assert panel._rebuild_count == 1
+    assert panel._thumb_update_count == 1
+    cap2 = CaptureResult(2, 2, bytes(reversed(range(12))))
+    panel._render([_WindowSnap(info, cap2)], {})
+    assert panel._thumbs[0] is thumb
+    assert panel._rebuild_count == 1
+    renamed = WindowInfo("B", 0, 0, 80, 60, hwnd=7)
+    panel._render([_WindowSnap(renamed, cap2)], {})
+    assert panel._rebuild_count == 2
+    assert panel._thumbs[0] is not thumb
+    del app
+    print("monitor in-place ok")
+
+
+if __name__ == "__main__":
+    _self_check()

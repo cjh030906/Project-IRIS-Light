@@ -42,6 +42,23 @@ def drop_event_types():
     return (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop)
 
 
+def log_drag_line(line: str) -> None:
+    """[DragDrop] 한 줄. 실패는 `[ERROR] stage=` / `[ERROR] reason=`."""
+    try:
+        log_dir = Path.home() / ".iris-light" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if line.startswith("[ERROR]"):
+            text = f"[DragDrop]{line}"
+        elif line.startswith("[DragDrop]"):
+            text = line
+        else:
+            text = f"[DragDrop] {line}"
+        with (log_dir / "dnd.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+    except Exception:
+        pass
+
+
 def log_drop_event(phase: str, mime, *, watched: object | None = None, pos=None) -> None:
     """탐색기 DnD 진단 — ~/.iris-light/logs/dnd.log (항상 1줄, 용량 작음)."""
     try:

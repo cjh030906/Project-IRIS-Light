@@ -91,8 +91,6 @@ def parse_collapse_block_id(anchor: str) -> str | None:
 IRIS_FILE_SCHEME = "iris-file://"
 IRIS_WIKI_SCHEME = "iris-wiki://"
 
-_FILE_LOC = re.compile(r"^(.*?)(?::(\d+)(?::(\d+))?)?$")
-
 
 def file_anchor_for(rel_path: str) -> str:
     from urllib.parse import quote
@@ -130,13 +128,21 @@ def parse_file_chip_location(raw_path: str) -> tuple[str, int, int]:
     s = (raw_path or "").strip().replace("\\", "/")
     if not s:
         return "", 1, 1
-    m = _FILE_LOC.match(s)
-    if not m:
-        return s, 1, 1
-    path = (m.group(1) or "").strip()
-    line = max(1, int(m.group(2) or 1))
-    column = max(1, int(m.group(3) or 1))
-    return path, line, column
+    # 끝의 :줄:칸 또는 :줄. `C:` 드라이브는 줄 번호가 아니다.
+    for pattern, cols in (
+        (r"^(.*):(\d+):(\d+)$", 2),
+        (r"^(.*):(\d+)$", 1),
+    ):
+        m = re.match(pattern, s)
+        if not m:
+            continue
+        path = (m.group(1) or "").strip()
+        if re.fullmatch(r"[A-Za-z]", path):
+            return s, 1, 1
+        line = max(1, int(m.group(2)))
+        column = max(1, int(m.group(3))) if cols == 2 else 1
+        return path, line, column
+    return s, 1, 1
 
 
 def file_chip_to_html(rel_path: str, *, enabled: bool = True) -> str:

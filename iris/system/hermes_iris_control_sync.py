@@ -249,8 +249,24 @@ def desired_mcp_block(repo: Path) -> dict[str, Any]:
     return block
 
 
-def _hermes_mcp_tool_path() -> Path:
-    return hermes_home() / "hermes-agent" / "tools" / "mcp_tool.py"
+def _hermes_mcp_tool_candidates() -> list[Path]:
+    agent = hermes_home() / "hermes-agent"
+    found = [
+        agent / "tools" / "mcp_tool.py",
+        agent / "hermes_cli" / "tools" / "mcp_tool.py",
+    ]
+    site = agent / "venv" / "Lib" / "site-packages"
+    if site.is_dir():
+        found.extend(p for p in site.glob("*/mcp_tool.py") if p.is_file())
+        found.extend(p for p in site.glob("*/tools/mcp_tool.py") if p.is_file())
+    return found
+
+
+def _hermes_mcp_tool_path() -> Path | None:
+    for path in _hermes_mcp_tool_candidates():
+        if path.is_file():
+            return path
+    return None
 
 
 def ensure_hermes_stdio_dead_check_patch() -> str:
@@ -260,8 +276,15 @@ def ensure_hermes_stdio_dead_check_patch() -> str:
     'has exited' TimeoutError로 즉시 실패하던 회귀를 고친다.
     """
     path = _hermes_mcp_tool_path()
-    if not path.is_file():
-        return "hermes mcp_tool.py missing — skip dead-check patch"
+    if path is None:
+        agent = hermes_home() / "hermes-agent"
+        checked = "\n".join(f"  - {p}" for p in _hermes_mcp_tool_candidates())
+        if not agent.is_dir():
+            return (
+                "hermes mcp_tool.py missing — "
+                f"설치 디렉터리 없음: {agent}\n확인한 경로:\n{checked}"
+            )
+        return f"hermes mcp_tool.py missing\n확인한 경로:\n{checked}"
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:

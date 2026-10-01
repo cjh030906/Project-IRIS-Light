@@ -1941,6 +1941,23 @@ class MainWindow(QMainWindow):
         self._chat.attach_drop_paths(clean)
         return True
 
+    def _on_explorer_file_drag(self, phase: str, paths: list[str]) -> None:
+        """탐색기 OLE 드롭 — 힌트만 바꾸고, 놓으면 기존 첨부 파이프라인으로 넘긴다."""
+        if phase in ("enter", "move"):
+            self._note_chat_file_drag(True)
+            return
+        self._note_chat_file_drag(False)
+        if phase != "drop":
+            return
+        from iris.ui.window.win_ole_drop import _log
+
+        if self._attach_os_drop_paths(list(paths)):
+            _log("attach_success")
+            _log(f"normalized_paths={list(paths)}")
+        else:
+            _log("[ERROR] stage=attach")
+            _log("[ERROR] reason=chat panel missing or empty paths")
+
     def _begin_ide_companion_drag(self, paths: list[str]) -> None:
         """Theia dragstart — QWebEngine OLE DnD가 Qt로 안 넘어오므로 경로만 보관."""
         clean = [str(p).strip() for p in paths if str(p).strip()]
@@ -2028,12 +2045,15 @@ class MainWindow(QMainWindow):
             # 탭→Iris: WebEngine이 포인터를 잃어도 전역 release로 첨부.
             if self._finish_ide_companion_drag():
                 return False
+        elif et == QEvent.Type.DragLeave:
+            self._note_chat_file_drag(False)
         elif et in drop_event_types():
             from iris.ui.window.file_drop import log_drop_event
 
             pos = getattr(event, "position", lambda: None)()
             if et == QEvent.Type.Drop:
                 log_drop_event("Drop", event.mimeData(), watched=watched, pos=pos)
+                self._note_chat_file_drag(False)
                 paths = paths_from_mime(event.mimeData())
                 if not paths and self._pending_ide_drag:
                     paths = list(self._pending_ide_drag)
@@ -2046,9 +2066,20 @@ class MainWindow(QMainWindow):
                 if et == QEvent.Type.DragEnter:
                     log_drop_event("DragEnter", event.mimeData(), watched=watched, pos=pos)
                 if self._accept_file_drag(event):
+                    self._note_chat_file_drag(True)
                     # True: 자식 QWidget 기본 dragEnter가 ignore()로 수락을 뒤집지 않게.
                     return True
         return super().eventFilter(watched, event)
+
+    def _note_chat_file_drag(self, active: bool) -> None:
+        chat = getattr(self, "_chat", None)
+        note = getattr(chat, "note_file_drag", None)
+        if not callable(note):
+            return
+        try:
+            note(active)
+        except RuntimeError:
+            return
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if self._accept_file_drag(event):
@@ -7491,10 +7522,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: refresh_snap_button_rect(self))
         self._arm_file_drops(self)
         if sys.platform == "win32":
+            # 가드를 만든 뒤에 OLE 타깃을 등록한다. 오버레이를 나중에 만들면
+            # Qt가 메인 HWND의 IDropTarget을 다시 자기 것으로 바꾼다.
             QTimer.singleShot(0, self._arm_win_shell_drop)
         if sys.platform == "win32" and not self._test_mode:
             QTimer.singleShot(0, self._apply_hwnd_branding_safe)
-            QTimer.singleShot(0, self._start_explorer_drop_guard)
 
     def _start_explorer_drop_guard(self) -> None:
         if self._explorer_drop_guard is not None:
@@ -7508,12 +7540,20 @@ class MainWindow(QMainWindow):
             self._explorer_drop_guard = None
 
     def _arm_win_shell_drop(self) -> None:
+        # Qt IDropTarget은 이 frameless 창에서 탐색기 DragEnter를 이벤트로
+        # 넘기지 않아 커서가 금지 표시로 남는다. CF_HDROP을 동기 Copy로 받는다.
         try:
-            from iris.ui.window.win_shell_drop import enable_shell_file_drop
+            from iris.ui.window.win_ole_drop import install_explorer_drop_target
+            from iris.ui.window.win_shell_drop import ensure_ole_drop_surface
 
-            enable_shell_file_drop(int(self.winId()))
+            if not self._test_mode:
+                self._start_explorer_drop_guard()
+            hwnd = int(self.winId())
+            ensure_ole_drop_surface(hwnd)
+            self._arm_file_drops(self)
+            install_explorer_drop_target(hwnd, self)
         except Exception:
-            pass
+            return
 
     def _apply_hwnd_branding_safe(self) -> None:
         try:

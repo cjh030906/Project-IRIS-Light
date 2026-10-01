@@ -381,7 +381,118 @@ def _check_hermes_sees_it(home: Path) -> None:
     print("hermes mcp test ok", "ping" in out)
 
 
+def _check_skip_notification() -> None:
+    """initialize 직후 list_changed 알림이 와도 tools/list 응답을 읽는다."""
+    import sys
+    import textwrap
+
+    script = Path(tempfile.mkdtemp(prefix="iris-mcp-note-")) / "note_server.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json, sys
+
+            def read_msg():
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                return json.loads(line.decode())
+
+            def write_msg(msg):
+                sys.stdout.buffer.write((json.dumps(msg) + "\\n").encode())
+                sys.stdout.buffer.flush()
+
+            while True:
+                msg = read_msg()
+                if not msg:
+                    break
+                if msg.get("id") is None:
+                    continue
+                method = msg.get("method")
+                i = msg["id"]
+                if method == "initialize":
+                    write_msg({"jsonrpc": "2.0", "id": i, "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {"listChanged": True}},
+                        "serverInfo": {"name": "note", "version": "0"},
+                    }})
+                    write_msg({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+                elif method == "tools/list":
+                    write_msg({"jsonrpc": "2.0", "id": i, "result": {"tools": [{
+                        "name": "ping",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }]}})
+                elif method == "tools/call":
+                    write_msg({"jsonrpc": "2.0", "id": i, "result": {
+                        "content": [{"type": "text", "text": "pong"}],
+                    }})
+            """
+        ),
+        encoding="utf-8",
+    )
+    result = probe_mcp(sys.executable, ["-u", str(script)], {}, timeout=15)
+    assert result["ok"], result
+    assert result["tools"] == ["ping"], result
+    assert any("notifications/tools/list_changed" in str(frame) for frame in result["frames"]), result["frames"]
+    print("notification skip ok")
+
+
+def _check_npx_spawn_resolves_cmd() -> None:
+    """bare npx 는 CreateProcess WinError 2. spawn argv[0] 는 npx.cmd 절대경로."""
+    import sys
+    from unittest.mock import patch
+
+    from iris.system.executable_resolve import resolve_executable
+
+    resolved = resolve_executable("npx")
+    if not resolved:
+        print("npx resolve skip: npx not installed")
+        return
+    captured: dict = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["cwd"] = kwargs.get("cwd")
+        captured["shell"] = kwargs.get("shell", False)
+        raise OSError("stop-before-stdio")
+
+    allowed = r"C:\Users\serin\Github\Project-IRIS-Light"
+    with patch("iris.system.github_extension_install.subprocess.Popen", side_effect=fake_popen):
+        result = probe_mcp(
+            "npx",
+            ["-y", "@modelcontextprotocol/server-filesystem", allowed],
+            {},
+            cwd="",
+        )
+    assert result["ok"] is False
+    assert captured["shell"] is False
+    assert captured["cwd"] is None
+    argv = captured["argv"]
+    assert Path(argv[0]).is_file(), argv[0]
+    assert argv[1:] == ["-y", "@modelcontextprotocol/server-filesystem", allowed]
+    if sys.platform == "win32":
+        assert argv[0].lower().endswith("npx.cmd"), argv[0]
+        assert argv[0] != "npx"
+    # PATH에서 nodejs를 빼도 설치 경로로 찾는다.
+    if sys.platform == "win32":
+        import os
+
+        saved = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = os.pathsep.join(
+                p for p in saved.split(os.pathsep) if "nodejs" not in p.lower() and "npm" not in p.lower()
+            )
+            off_path = resolve_executable("npx")
+        finally:
+            os.environ["PATH"] = saved
+        assert off_path and Path(off_path).is_file(), off_path
+        assert off_path.lower().endswith("npx.cmd")
+    print("npx spawn resolves", argv[0])
+
+
 def main() -> None:
+    _check_skip_notification()
+    _check_npx_spawn_resolves_cmd()
     _check_parse()
     with tempfile.TemporaryDirectory(prefix="iris-ext-") as tmp:
         home = Path(tmp)

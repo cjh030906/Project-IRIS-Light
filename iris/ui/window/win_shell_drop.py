@@ -19,6 +19,7 @@ MSGFLT_ALLOW = 1
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_ACCEPTFILES = 0x00000010
+WS_EX_LAYERED = 0x00080000
 
 
 def enable_shell_file_drop(hwnd: int) -> bool:
@@ -60,6 +61,28 @@ def enable_shell_file_drop(hwnd: int) -> bool:
     except Exception as exc:
         _log(f"shell_drop_arm_fail {exc!r}")
         return False
+
+
+def ensure_ole_drop_surface(hwnd: int) -> int:
+    """OLE DragEnter는 layered·transparent HWND에 닿지 않는다.
+
+    setWindowOpacity / WA_TranslucentBackground가 WS_EX_LAYERED를 켜면
+    탐색기 드롭이 금지 커서로 끝난다. 스타일 비트만 끄고, 메시지 훅은 걸지 않는다.
+    """
+    if sys.platform != "win32" or not hwnd:
+        return 0
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        ex = user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
+        cleaned = int(ex) & ~WS_EX_LAYERED & ~WS_EX_TRANSPARENT
+        if cleaned != int(ex):
+            user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, cleaned)
+        return int(user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)) & 0xFFFFFFFF
+    except Exception as exc:
+        _log(f"ole_surface_fail {exc!r}")
+        return 0
 
 
 def hwnd_drop_debug(hwnd: int) -> str:

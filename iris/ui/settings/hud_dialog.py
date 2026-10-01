@@ -207,6 +207,16 @@ def hud_dialog_qss() -> str:
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
             height: 0;
         }}
+        /* 부모 QLabel color(#e8f0fe)가 네이티브 흰 QMessageBox까지 상속됨.
+           ID 선택자보다 한 단계 구체적으로 덮는다. */
+        QDialog#IrisHudDialog QMessageBox {{
+            background-color: {t.space_deep};
+            color: {t.text_primary};
+        }}
+        QDialog#IrisHudDialog QMessageBox QLabel {{
+            background-color: transparent;
+            color: {t.text_primary};
+        }}
     """
 
 
@@ -547,4 +557,6 @@ if __name__ == "__main__":
     assert "QSlider::groove:horizontal" in qss
     assert "IrisHudConfirm" in _confirm_qss(accent=TOKENS.warning)
     assert "HudSectionToggle" in qss
+    assert "QDialog#IrisHudDialog QMessageBox QLabel" in qss
+    assert TOKENS.text_primary in qss
     print("hud_dialog ok")

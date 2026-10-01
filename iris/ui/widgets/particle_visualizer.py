@@ -7,7 +7,7 @@ import random
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
 from PyQt6.QtWidgets import QWidget
 
@@ -276,7 +276,19 @@ class ParticleVisualizer(QWidget):
         self._state_burst *= 0.90
         if self._state_burst < 0.01:
             self._state_burst = 0.0
-        self.update()
+        # 창 전체를 update() 하면 투명 형제(채팅·사이드바)가 같이 다시 그려진다.
+        self.update(self._orb_dirty_rect())
+
+    def _orb_dirty_rect(self) -> QRect:
+        # 그려지는 코어 반지름은 core_r * 1.1. 헤일로 박스(2.05)까지 넓히면
+        # 옆 패널과 겹쳐 그 위젯이 25fps로 다시 그려진다.
+        reach = self._core_r * 1.35 + 4.0
+        return QRect(
+            int(self._cx - reach),
+            int(self._cy - reach),
+            int(reach * 2),
+            int(reach * 2),
+        )
 
     def paintEvent(self, event) -> None:  # noqa: ARG002, N802
         if self.width() < 4 or self.height() < 4:

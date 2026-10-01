@@ -469,12 +469,17 @@ def _apply_mcps(
             notes.append(f"MCP '{spec.name}' 스크립트를 저장소에서 찾지 못했습니다: {spec.script}")
             result.status = "failed"
             continue
+        spawn_timeout = float(probe_timeout)
+        if _cmd_base(str(spawn[0])) in ("npx", "uvx", "uv", "npm", "node"):
+            spawn_timeout = max(spawn_timeout, 180.0)
         probe = probe_mcp(
             spawn[0],
             spawn[1:],
             block.get("env") if isinstance(block.get("env"), dict) else {},
             cwd=str(block.get("cwd") or ""),
-            timeout=probe_timeout,
+            timeout=spawn_timeout,
+            startup_timeout=spawn_timeout,
+            rpc_timeout=30.0,
             secrets=secrets,
         )
         if not probe.get("ok"):
@@ -516,33 +521,72 @@ def probe_mcp(
     *,
     cwd: str = "",
     timeout: float = 20.0,
+    startup_timeout: float | None = None,
+    rpc_timeout: float | None = None,
     secrets: dict[str, str] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """stdio initialize + tools/list + 인자 없는 도구 1회 호출. 끝나면 프로세스를 죽인다."""
+    """stdio initialize + tools/list + 도구 호출. 끝나면 프로세스를 죽인다.
+
+    tool_calls 가 없으면 필수 인자가 없는 도구를 한 번 호출한다.
+    허용 디렉터리는 args 이고, cwd 로 넣지 않는다.
+    """
+    from iris.system.executable_resolve import resolve_executable
+
     secrets = secrets or {}
-    out: dict[str, Any] = {"ok": False, "tools": [], "detail": "", "called_tool": "", "call_preview": ""}
-    if not command or not Path(command).is_file() and shutil.which(command) is None:
-        # absolute python is a file; npx is which()
-        if not (Path(command).is_file() or shutil.which(command)):
-            out["detail"] = f"실행 파일을 찾지 못했습니다: {Path(command).name}"
+    out: dict[str, Any] = {
+        "ok": False,
+        "tools": [],
+        "detail": "",
+        "called_tool": "",
+        "call_preview": "",
+        "command": command,
+        "args": list(args),
+        "resolved": "",
+        "cwd": cwd or "",
+        "stderr": "",
+        "tool_results": [],
+        "pid": None,
+        "returncode": None,
+        "frames": [],
+    }
+    frames: list[str] = out["frames"]
+    resolved = resolve_executable(command)
+    if not resolved:
+        out["detail"] = f"실행 파일을 찾지 못했습니다: {Path(command).name}"
+        return out
+    out["resolved"] = resolved
+    spawn_cwd: str | None = None
+    if cwd:
+        cwd_path = Path(cwd).expanduser()
+        if not cwd_path.is_dir():
+            out["detail"] = f"cwd가 디렉터리가 아닙니다: {cwd}"
             return out
+        spawn_cwd = str(cwd_path)
+        out["cwd"] = spawn_cwd
     child_env = os.environ.copy()
     for key, val in env.items():
         if _ENV_KEY.match(str(key)):
             child_env[str(key)] = str(val)
     child_env["PYTHONUNBUFFERED"] = "1"
+    bin_dir = str(Path(resolved).parent)
+    path_val = child_env.get("PATH", "")
+    path_parts = [p for p in path_val.split(os.pathsep) if p]
+    if os.path.normcase(bin_dir) not in {os.path.normcase(p) for p in path_parts}:
+        child_env["PATH"] = bin_dir + (os.pathsep + path_val if path_val else "")
     stderr_chunks: list[str] = []
     proc: subprocess.Popen | None = None
+    drain: threading.Thread | None = None
     try:
         from iris.system.win_subprocess import no_window_kwargs
 
         flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         proc = subprocess.Popen(
-            [command, *args],
+            [resolved, *args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=cwd or None,
+            cwd=spawn_cwd,
             env=child_env,
             **no_window_kwargs(extra_creationflags=flags),
         )
@@ -550,20 +594,20 @@ def probe_mcp(
 
         def _drain() -> None:
             try:
-                data = proc.stderr.read() if proc and proc.stderr else b""
-                stderr_chunks.append(data.decode("utf-8", errors="replace")[-800:])
+                while proc and proc.stderr:
+                    chunk = proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk.decode("utf-8", errors="replace"))
             except Exception:
                 pass
 
-        threading.Thread(target=_drain, daemon=True).start()
-        deadline = threading.Event()
-
-        def _kill_later() -> None:
-            if not deadline.wait(timeout):
-                _kill_tree(proc)
-
-        killer = threading.Thread(target=_kill_later, daemon=True)
-        killer.start()
+        drain = threading.Thread(target=_drain, daemon=True)
+        drain.start()
+        out["pid"] = proc.pid
+        startup = float(startup_timeout if startup_timeout is not None else timeout)
+        rpc = float(rpc_timeout if rpc_timeout is not None else timeout)
+        started = time_monotonic()
         init = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -574,48 +618,109 @@ def probe_mcp(
                 "clientInfo": {"name": "iris-light", "version": "0"},
             },
         }
+        out["initialize_request"] = init
         _send(proc, init)
-        first = _recv(proc, timeout)
+        first, why = _wait_response(
+            proc, 1, startup, phase="initialize", stderr_chunks=stderr_chunks, frames=frames
+        )
+        out["initialize_sec"] = round(time_monotonic() - started, 3)
         if not first or "result" not in first:
-            out["detail"] = _fail_detail(proc, first, stderr_chunks, secrets)
+            out["detail"] = why or _fail_detail(proc, first, stderr_chunks, secrets, phase="initialize")
             return out
+        out["initialize"] = first.get("result")
         _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
         _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        listed = _recv(proc, timeout)
+        listed_at = time_monotonic()
+        listed, why = _wait_response(
+            proc, 2, rpc, phase="tools/list", stderr_chunks=stderr_chunks, frames=frames
+        )
+        out["tools_list_sec"] = round(time_monotonic() - listed_at, 3)
         tools = ((listed or {}).get("result") or {}).get("tools") if isinstance(listed, dict) else None
         if not isinstance(tools, list):
-            out["detail"] = _fail_detail(proc, listed, stderr_chunks, secrets)
+            out["detail"] = why or _fail_detail(proc, listed, stderr_chunks, secrets, phase="tools/list")
             return out
         names = [str(t.get("name")) for t in tools if isinstance(t, dict) and t.get("name")]
         out["tools"] = names
-        called = _callable_tool(tools)
-        if called:
-            _send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {"name": called, "arguments": {}},
-                },
-            )
-            called_msg = _recv(proc, timeout)
-            preview = _call_preview(called_msg)
-            if preview is None:
-                out["detail"] = _fail_detail(proc, called_msg, stderr_chunks, secrets)
-                return out
-            out["called_tool"] = called
-            out["call_preview"] = _redact(preview, secrets)[:180]
+        if tool_calls:
+            results: list[dict[str, Any]] = []
+            for offset, call in enumerate(tool_calls):
+                name = str(call.get("name") or "")
+                arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                _send(
+                    proc,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3 + offset,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    },
+                )
+                called_msg, why = _wait_response(
+                    proc,
+                    3 + offset,
+                    rpc,
+                    phase=f"tools/call {name}",
+                    stderr_chunks=stderr_chunks,
+                    frames=frames,
+                )
+                text = _call_text(called_msg)
+                if text is None:
+                    out["detail"] = why or _fail_detail(
+                        proc, called_msg, stderr_chunks, secrets, phase=f"tools/call {name}"
+                    )
+                    out["tool_results"] = results
+                    return out
+                redacted = _redact(text, secrets)
+                results.append({"name": name, "text": redacted[:2000]})
+            out["tool_results"] = results
+            if results:
+                out["called_tool"] = str(results[-1]["name"])
+                out["call_preview"] = str(results[-1]["text"])[:180]
+        else:
+            called = _callable_tool(tools)
+            if called:
+                _send(
+                    proc,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": called, "arguments": {}},
+                    },
+                )
+                called_msg, why = _wait_response(
+                    proc,
+                    3,
+                    rpc,
+                    phase=f"tools/call {called}",
+                    stderr_chunks=stderr_chunks,
+                    frames=frames,
+                )
+                preview = _call_preview(called_msg)
+                if preview is None:
+                    out["detail"] = why or _fail_detail(
+                        proc, called_msg, stderr_chunks, secrets, phase=f"tools/call {called}"
+                    )
+                    return out
+                out["called_tool"] = called
+                out["call_preview"] = _redact(preview, secrets)[:180]
+        out["handshake_sec"] = round(time_monotonic() - started, 3)
         out["ok"] = True
         out["detail"] = "connected"
         return out
     except Exception as exc:  # noqa: BLE001
-        out["detail"] = _redact(str(exc), secrets)[:300]
+        out["detail"] = _redact(
+            f"{exc} (resolved={out.get('resolved') or command})",
+            secrets,
+        )[:300]
         return out
     finally:
-        deadline.set() if "deadline" in locals() else None
         if proc is not None:
+            out["returncode"] = proc.poll()
             _kill_tree(proc)
+        if drain is not None:
+            drain.join(timeout=2)
+        out["stderr"] = "".join(stderr_chunks).strip()[:800]
 
 
 def _prepare_block(
@@ -1059,7 +1164,9 @@ def _normalize_command(command: str, args: list[str]) -> tuple[str, list[str], s
         return "", [], err
     base = _cmd_base(command)
     if base in ("npx", "uvx", "uv", "node"):
-        if shutil.which(base) is None and shutil.which(command) is None:
+        from iris.system.executable_resolve import resolve_executable
+
+        if resolve_executable(base) is None and resolve_executable(command) is None:
             return "", [], f"{base}를 찾을 수 없습니다"
         return base, args, ""
     if base in ("python", "python3", "py"):
@@ -1206,35 +1313,158 @@ def _send(proc: subprocess.Popen, msg: dict) -> None:
     proc.stdin.flush()
 
 
-def _recv(proc: subprocess.Popen, timeout: float) -> dict | None:
-    assert proc.stdout
-    deadline = time_monotonic() + timeout
-    while time_monotonic() < deadline:
-        line = _readline(proc.stdout, deadline)
-        if not line:
-            return None
-        stripped = line.strip()
-        if not stripped:
+_EOF = object()
+_TIMEOUT = object()
+
+
+def _parse_json_line(raw: bytes) -> dict | None:
+    """한 줄에서 JSON-RPC 객체만 꺼낸다. npm 진행 표시(\\r)가 앞에 붙어도 된다."""
+    for part in raw.split(b"\r"):
+        text = part.strip()
+        if not text:
             continue
-        if stripped.lower().startswith(b"content-length"):
-            length = int(stripped.split(b":", 1)[1].strip() or b"0")
-            while True:
-                header = _readline(proc.stdout, deadline)
-                if header in (b"\r\n", b"\n", b""):
-                    break
-            body = proc.stdout.read(length)
+        candidates = [text]
+        brace = text.find(b"{")
+        if brace > 0:
+            candidates.append(text[brace:])
+        for piece in candidates:
             try:
-                return json.loads(body.decode("utf-8"))
-            except json.JSONDecodeError:
-                return None
-        try:
-            return json.loads(stripped.decode("utf-8"))
-        except json.JSONDecodeError:
-            continue
+                obj = json.loads(piece.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(obj, dict):
+                return obj
     return None
 
 
-def _readline(stdout, deadline: float) -> bytes | None:
+def _read_frame(proc: subprocess.Popen, deadline: float) -> tuple[object, str]:
+    """stdout에서 프레임 하나. (dict | _EOF | _TIMEOUT, raw)."""
+    assert proc.stdout
+    while time_monotonic() < deadline:
+        if proc.poll() is not None:
+            return _EOF, ""
+        line = _readline(proc.stdout, deadline)
+        if line is _TIMEOUT:
+            return _TIMEOUT, ""
+        if line is _EOF:
+            return _EOF, ""
+        if not isinstance(line, (bytes, bytearray)):
+            return _EOF, ""
+        raw = bytes(line)
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(b"content-length"):
+            try:
+                length = int(stripped.split(b":", 1)[1].strip() or b"0")
+            except ValueError:
+                continue
+            while True:
+                header = _readline(proc.stdout, deadline)
+                if header is _TIMEOUT:
+                    return _TIMEOUT, ""
+                if header is _EOF:
+                    return _EOF, ""
+                if header in (b"\r\n", b"\n", b""):
+                    break
+            body = proc.stdout.read(length)
+            shown = (stripped + b"\n" + body)[:500].decode("utf-8", errors="replace")
+            try:
+                obj = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(obj, dict):
+                return obj, shown
+            continue
+        obj = _parse_json_line(stripped)
+        shown = stripped[:500].decode("utf-8", errors="replace")
+        if obj is not None:
+            return obj, shown
+    return _TIMEOUT, ""
+
+
+def _answer_server_request(proc: subprocess.Popen, msg: dict) -> None:
+    """서버가 클라이언트로 보낸 요청. 무시하면 서버가 다음 응답을 멈춘다."""
+    method = str(msg.get("method") or "")
+    req_id = msg.get("id")
+    if method == "roots/list":
+        result: dict[str, Any] = {"roots": []}
+    elif method == "ping":
+        result = {}
+    else:
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"method not found: {method}"},
+            },
+        )
+        return
+    _send(proc, {"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _wait_response(
+    proc: subprocess.Popen,
+    expect_id: int,
+    timeout: float,
+    *,
+    phase: str,
+    stderr_chunks: list[str],
+    frames: list[str],
+) -> tuple[dict | None, str]:
+    """id가 맞는 응답까지 알림은 건너뛰고 서버 요청은 답한다."""
+    deadline = time_monotonic() + max(0.1, float(timeout))
+    while time_monotonic() < deadline:
+        code = proc.poll()
+        if code is not None:
+            return None, _phase_dead(phase, code, stderr_chunks)
+        msg, raw = _read_frame(proc, deadline)
+        if raw:
+            frames.append(raw[:500])
+            del frames[:-12]
+        if msg is _TIMEOUT:
+            break
+        if msg is _EOF:
+            code = proc.poll()
+            if code is None:
+                err = _stderr_text(stderr_chunks)
+                text = f"{phase}: stdout이 닫혔습니다"
+                return None, f"{text}: {err[:240]}" if err else text
+            return None, _phase_dead(phase, code, stderr_chunks)
+        if not isinstance(msg, dict):
+            continue
+        method = msg.get("method")
+        if method and "id" not in msg:
+            frames.append(f"notification {method}")
+            del frames[:-12]
+            continue
+        if method and "id" in msg:
+            frames.append(f"server-request {method}")
+            del frames[:-12]
+            _answer_server_request(proc, msg)
+            continue
+        if msg.get("id") == expect_id:
+            return msg, ""
+    code = proc.poll()
+    if code is not None:
+        return None, _phase_dead(phase, code, stderr_chunks)
+    err = _stderr_text(stderr_chunks)
+    text = f"{phase}: 응답 시간이 초과되었습니다 ({timeout:.0f}s)"
+    return None, f"{text}: {err[:240]}" if err else text
+
+
+def _stderr_text(chunks: list[str]) -> str:
+    return "".join(chunks).strip()
+
+
+def _phase_dead(phase: str, code: int, stderr_chunks: list[str]) -> str:
+    err = _stderr_text(stderr_chunks)
+    text = f"{phase}: 프로세스가 종료되었습니다 (code {code})"
+    return f"{text}: {err[:240]}" if err else text
+
+
+def _readline(stdout, deadline: float) -> object:
     box: queue.Queue = queue.Queue(1)
 
     def _read() -> None:
@@ -1246,13 +1476,15 @@ def _readline(stdout, deadline: float) -> bytes | None:
     threading.Thread(target=_read, daemon=True).start()
     remain = deadline - time_monotonic()
     if remain <= 0:
-        return None
+        return _TIMEOUT
     try:
         item = box.get(timeout=remain)
     except queue.Empty:
-        return None
-    if isinstance(item, Exception) or not item:
-        return None
+        return _TIMEOUT
+    if isinstance(item, Exception):
+        return _EOF
+    if not item:
+        return _EOF
     return item
 
 
@@ -1266,14 +1498,17 @@ def _callable_tool(tools: list) -> str:
     for tool in tools:
         if not isinstance(tool, dict) or not tool.get("name"):
             continue
+        name = str(tool.get("name"))
+        if name in {"get-env", "env"}:
+            continue
         schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {}
         required = schema.get("required") if isinstance(schema.get("required"), list) else []
         if not required:
-            return str(tool["name"])
+            return name
     return ""
 
 
-def _call_preview(msg: dict | None) -> str | None:
+def _call_text(msg: dict | None) -> str | None:
     if not isinstance(msg, dict) or "result" not in msg:
         return None
     result = msg.get("result")
@@ -1286,18 +1521,32 @@ def _call_preview(msg: dict | None) -> str | None:
             if isinstance(item, dict) and item.get("text"):
                 bits.append(str(item["text"]))
         if bits:
-            return " ".join(bits)[:180]
+            return " ".join(bits)
     return "ok"
 
 
-def _fail_detail(proc: subprocess.Popen, msg: dict | None, stderr_chunks: list[str], secrets: dict[str, str]) -> str:
+def _call_preview(msg: dict | None) -> str | None:
+    text = _call_text(msg)
+    if text is None:
+        return None
+    return text[:180]
+
+
+def _fail_detail(
+    proc: subprocess.Popen,
+    msg: dict | None,
+    stderr_chunks: list[str],
+    secrets: dict[str, str],
+    *,
+    phase: str = "mcp",
+) -> str:
     if isinstance(msg, dict) and msg.get("error"):
-        text = str(msg.get("error"))
+        text = f"{phase}: {msg.get('error')}"
     elif proc.poll() not in (None, 0):
-        text = f"프로세스가 종료되었습니다 (code {proc.poll()})"
+        text = f"{phase}: 프로세스가 종료되었습니다 (code {proc.poll()})"
     else:
-        text = "MCP 핸드셰이크 응답이 없습니다"
-    err = " ".join(stderr_chunks).strip()
+        text = f"{phase}: 응답이 없습니다"
+    err = _stderr_text(stderr_chunks)
     if err:
         text = f"{text}: {err[:240]}"
     return _redact(text, secrets)[:300]
@@ -1361,7 +1610,11 @@ def _safe_name(name: str) -> str:
 
 
 def _cmd_base(command: str) -> str:
-    return Path(command).name.lower().removesuffix(".exe")
+    name = Path(command).name.lower()
+    for ext in (".exe", ".cmd", ".bat", ".com"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return name
 
 
 def _clean_secret(val: str) -> str:

@@ -604,6 +604,29 @@ def _run_dep(
     return _run(cmd, cwd=cwd, timeout=hard)
 
 
+def _pip_unmarked_core_deps(venv_py: Path, agent: Path) -> subprocess.CompletedProcess[str]:
+    """3.14 마커를 떼고 core pin을 설치. 없으면 빈 성공."""
+    text = ""
+    try:
+        text = (agent / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError as exc:
+        return subprocess.CompletedProcess(["pip"], 1, "", str(exc))
+    match = re.search(r"^dependencies = \[(.*?)^\]", text, re.S | re.M)
+    specs: list[str] = []
+    if match:
+        for line in match.group(1).splitlines():
+            line = line.split("#", 1)[0].strip().strip(",")
+            found = re.match(r'"([^"]+)"', line)
+            if not found:
+                continue
+            spec = found.group(1).split(";", 1)[0].strip()
+            if "==" in spec:
+                specs.append(spec)
+    if not specs:
+        return subprocess.CompletedProcess(["pip"], 0, "", "")
+    return _run([str(venv_py), "-m", "pip", "install", *specs], timeout=900.0)
+
+
 def _finish_staged_install(
     *,
     staging: Path,
@@ -695,6 +718,7 @@ def _finish_staged_install(
                     [
                         str(venv_py), "-m", "pip", "install",
                         "aiohttp==3.14.3", "mcp==2.0.0", "httpx2==2.7.0", "starlette==1.3.1",
+                        "python-dotenv==1.2.2", "ruamel.yaml==0.18.16",
                     ],
                     timeout=300.0,
                 )
@@ -703,6 +727,16 @@ def _finish_staged_install(
                 if boost.returncode != 0:
                     _discard_tree(staging)
                     return fail("exit", "gateway/mcp 의존성 보강 실패", "\n".join(log))
+                # pyproject pins are `python_version >= 3.14`. 3.12 editable
+                # install then has zero runtime deps and gateway dies on import.
+                ver = python_version(venv_py)
+                if ver is not None and ver < (3, 14):
+                    core = _pip_unmarked_core_deps(venv_py, staging)
+                    log.append(core.stdout or "")
+                    log.append(core.stderr or "")
+                    if core.returncode != 0:
+                        _discard_tree(staging)
+                        return fail("exit", "Python<3.14 core deps 설치 실패", "\n".join(log))
         if pip.returncode != 0:
             _discard_tree(staging)
             return fail("exit", "pip 설치 실패", "\n".join(log))
