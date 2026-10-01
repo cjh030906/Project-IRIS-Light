@@ -101,7 +101,9 @@ class WorkspaceIrisChatLog(QTextEdit):
             return
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(f"<p><b>You</b>: {render_user_message(body)}</p>")
+        html_body = render_user_message(body)
+        prefetch_chat_html_images(self, html_body)
+        cursor.insertHtml(f"<p><b>You</b>: {html_body}</p>")
         self.setTextCursor(cursor)
         self._append_trailing_blank()
         self._scroll_bottom()

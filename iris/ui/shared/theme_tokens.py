@@ -88,6 +88,14 @@ class ThemeTokens:
     font_size_micro: str = "10px"
     font_size_input: str = "14px"
 
+    # 채팅 본문 — HUD 13px와 분리. 대비·줄간격은 읽기 우선.
+    chat_font_size: str = "15px"
+    chat_line_height: str = "1.7"
+    chat_body: str = "#f8fafc"
+    chat_user_name: str = "#7dd3fc"
+    chat_iris_name: str = "#c4b5fd"
+    chat_user_bubble: str = "rgba(56, 189, 248, 0.10)"
+
     # 채팅 블록 (Cursor식 prose / code / tool) — 채팅창 배경과의 명도 차이를 크게
     # 벌리지 않는 차분한 다크 네이비, 테두리도 은은하게.
     chat_block_bg: str = "#141b2e"

@@ -63,6 +63,13 @@ def _load_image_sync(src: str) -> QImage | None:
                 qimg = QImage.fromData(base64.b64decode(b64))
                 return None if qimg.isNull() else qimg
             return None
+        if raw.startswith("iris-chip:"):
+            name = raw.split(":", 1)[1]
+            if not name.replace("_", "").isalnum():
+                return None
+            icon = Path.home() / ".iris-light" / "chip-icons" / f"{name}.png"
+            qimg = QImage(str(icon))
+            return None if qimg.isNull() else qimg
         if raw.startswith("file:"):
             path = QUrl(raw).toLocalFile()
             qimg = QImage(path)

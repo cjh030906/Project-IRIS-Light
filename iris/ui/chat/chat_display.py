@@ -10,6 +10,7 @@ from iris.core.markdown_text import (
     markdown_to_plain,
     markdown_to_plain_partial,
 )
+from iris.ui.shared.theme_tokens import TOKENS
 
 _IRIS_PREFIX = re.compile(r"^\s*Iris\s*:\s*", re.IGNORECASE)
 
@@ -202,7 +203,10 @@ def visible_typing_text(
 def typing_body_to_html(text: str) -> str:
     """타이핑 중 본문 HTML — 공백·줄바꿈이 HTML 접힘 없이 그대로 보이게 한다."""
     escaped = html.escape(text or "")
-    return f'<span style="color:#e8f0fe;white-space:pre-wrap;">{escaped}</span>'
+    return (
+        f'<span style="color:{TOKENS.chat_body};line-height:{TOKENS.chat_line_height};'
+        f'font-size:{TOKENS.chat_font_size};white-space:pre-wrap;">{escaped}</span>'
+    )
 
 
 # 타이핑 속도 기본값 (speech_sync 없을 때)

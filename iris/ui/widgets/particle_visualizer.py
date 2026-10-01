@@ -8,7 +8,16 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
+from PyQt6.QtGui import (
+    QColor,
+    QImage,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QRadialGradient,
+)
 from PyQt6.QtWidgets import QWidget
 
 _BOOT_RNG = random.Random(7)
@@ -134,6 +143,7 @@ class ParticleVisualizer(QWidget):
         # 기동 인트로 — 0이면 미표시, 1이면 정상 / glitch는 치지직 강도
         self._boot_reveal = 1.0
         self._boot_glitch = 0.0
+        self._chat_fade_y: float | None = None
 
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -170,6 +180,20 @@ class ParticleVisualizer(QWidget):
 
     def set_activity_level(self, level: float) -> None:
         self._activity_level = max(0.0, min(2.0, float(level)))
+
+    def chat_fade_y(self) -> float | None:
+        return self._chat_fade_y
+
+    def set_chat_fade_y(self, y: float | None) -> None:
+        """채팅 상단(로컬 y). None이면 구체 그대로. 겹치는 구간만 블러·페이드."""
+        nxt = None if y is None else float(y)
+        prev = self._chat_fade_y
+        if prev is None and nxt is None:
+            return
+        if prev is not None and nxt is not None and abs(prev - nxt) < 0.5:
+            return
+        self._chat_fade_y = nxt
+        self.update()
 
     def set_custom_center(self, cx: float, cy: float) -> None:
         """레이아웃 앵커 등으로 구체 중심을 고정한다."""
@@ -295,7 +319,27 @@ class ParticleVisualizer(QWidget):
             return
         if self._boot_reveal <= 0.001:
             return
-        painter = QPainter(self)
+        if self._chat_fade_y is None:
+            painter = QPainter(self)
+            self._paint_orb(painter)
+            painter.end()
+            return
+        rect = self._orb_dirty_rect().adjusted(-16, -16, 16, 16)
+        rect = rect.intersected(QRect(0, 0, self.width(), self.height()))
+        if rect.isEmpty():
+            return
+        image = QImage(rect.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(0)
+        painter = QPainter(image)
+        painter.translate(-rect.left(), -rect.top())
+        self._paint_orb(painter)
+        painter.end()
+        faded = self._fade_orb_image(image, rect.top())
+        screen = QPainter(self)
+        screen.drawImage(rect.topLeft(), faded)
+        screen.end()
+
+    def _paint_orb(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         cx, cy = self._cx, self._cy
@@ -325,7 +369,64 @@ class ParticleVisualizer(QWidget):
         if self._boot_glitch > 0.02:
             self._draw_boot_static(painter, cx, cy, accent)
 
-        painter.end()
+    def _fade_orb_image(self, image: QImage, top: int) -> QImage:
+        """채팅 상단 가장자리에서만 블러+알파. 채팅 안쪽은 구체가 없고 위쪽은 그대로."""
+        edge = self._chat_fade_y
+        if edge is None:
+            return image
+        feather = 140.0
+        end = edge + 28.0
+
+        def sharp_alpha(widget_y: float) -> int:
+            if widget_y <= edge - feather:
+                return 255
+            if widget_y >= end:
+                return 0
+            t = (widget_y - (edge - feather)) / (feather + 28.0)
+            t = t * t * (3.0 - 2.0 * t)
+            return int(255 * (1.0 - t))
+
+        def blur_alpha(widget_y: float) -> int:
+            if widget_y <= edge - feather or widget_y >= end:
+                return 0
+            t = (widget_y - (edge - feather)) / (feather + 28.0)
+            return int(190 * math.sin(t * math.pi))
+
+        def mask(src: QImage, alpha_at) -> QImage:
+            out = src.copy()
+            mask_painter = QPainter(out)
+            mask_painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_DestinationIn
+            )
+            grad = QLinearGradient(0, 0, 0, max(1, out.height()))
+            steps = 8
+            height = max(1, out.height() - 1)
+            for step in range(steps + 1):
+                row = int(height * step / steps)
+                grad.setColorAt(step / steps, QColor(255, 255, 255, alpha_at(top + row)))
+            mask_painter.fillRect(out.rect(), grad)
+            mask_painter.end()
+            return out
+
+        small_w = max(1, image.width() // 7)
+        small_h = max(1, image.height() // 7)
+        blurred = image.scaled(
+            small_w,
+            small_h,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ).scaled(
+            image.size(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        merged = QImage(image.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        merged.fill(0)
+        merge = QPainter(merged)
+        merge.drawImage(0, 0, mask(blurred, blur_alpha))
+        merge.drawImage(0, 0, mask(image, sharp_alpha))
+        merge.end()
+        return merged
 
     def _draw_boot_static(
         self,

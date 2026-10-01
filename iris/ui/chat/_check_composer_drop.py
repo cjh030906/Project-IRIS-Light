@@ -10,13 +10,16 @@ from PyQt6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QUrl
 from PyQt6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDropEvent, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QLabel
 
-from iris.ui.chat.chat_panel import ChatPanel
+from iris.ui.chat.chat_panel import ChatPanel, _quote_at_ref
+from iris.ui.chat.chat_renderer import render_user_message
 from iris.ui.chat.composer_attachments import (
     composer_chip_label,
     composer_chip_meta,
     format_byte_size,
     partition_attachment_paths,
 )
+from iris.knowledge.content_extract import extract_from_source
+from iris.ui.chat.at_path_refs import resolve_at_kind
 
 
 def main() -> None:
@@ -81,7 +84,31 @@ def main() -> None:
     png = root / "iris" / "assets" / "iris_icon.png"
     pdf = Path(tempfile.gettempdir()) / "iris_drop_sample.pdf"
     doc = Path(tempfile.gettempdir()) / "iris_drop_sample.txt"
-    pdf.write_bytes(b"%PDF-1.1")
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=300, height=200)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {
+            NameObject("/Font"): DictionaryObject(
+                {
+                    NameObject("/F1"): DictionaryObject(
+                        {
+                            NameObject("/Type"): NameObject("/Font"),
+                            NameObject("/Subtype"): NameObject("/Type1"),
+                            NameObject("/BaseFont"): NameObject("/Helvetica"),
+                        }
+                    )
+                }
+            )
+        }
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 18 Tf 36 100 Td (IRIS_PDF_MARK) Tj ET")
+    page[NameObject("/Contents")] = stream
+    with pdf.open("wb") as handle:
+        writer.write(handle)
     doc.write_text("hello", encoding="utf-8")
     try:
         panel._input_area.attachment_strip.clear_paths()
@@ -109,7 +136,35 @@ def main() -> None:
         panel.set_input_text("첨부 확인")
         panel._emit_send()
         assert sent and "첨부 확인" in sent[0][0], sent
-        assert panel._input_area.attachment_strip.paths() == []
+        assert any(str(p).endswith("iris_icon.png") for p in sent[0][1]), sent
+        payload = sent[0][0]
+        assert "iris_drop_sample.pdf" in payload and '@"' in payload, payload
+        html_doc = render_user_message(payload)
+        assert "iris_drop_sample.pdf" in html_doc
+        assert "iris_drop_sample.txt" in html_doc
+        assert "C:/" not in html_doc and "C:\\" not in html_doc, html_doc
+        fenced = render_user_message("```python\nprint('ok')\n```\n" + payload)
+        assert "print" in fenced and "iris_drop_sample.pdf" in fenced
+        assert composer_chip_label(r"C:\Users\serin\document.pdf") != "C"
+        panel._input_area.attachment_strip.clear_paths()
+        panel._input_area.input_bar._on_paths_attached([str(pdf), str(root)])
+        picked = panel._input_area.attachment_strip.paths()
+        panel._input_area.attachment_strip.clear_paths()
+        panel._on_composer_drop_paths([str(pdf), str(root)])
+        dropped_same = panel._input_area.attachment_strip.paths()
+        assert [Path(p).name for p in picked] == [Path(p).name for p in dropped_same]
+        chips_ui = panel._input_area.attachment_strip.findChildren(QLabel)
+        assert any(w.text() == "iris_drop_sample.pdf" for w in chips_ui)
+        assert any(w.text() == root.name for w in chips_ui)
+        assert all(w.text() != "C" for w in chips_ui)
+        folder_hit = resolve_at_kind(_quote_at_ref(str(root)).lstrip("@").strip('"'))
+        assert folder_hit["kind"] == "folder", folder_hit
+        got = extract_from_source(str(doc))
+        assert got["kind"] == "text" and "hello" in str(got["text"])
+        pdf_hit = extract_from_source(str(pdf))
+        assert pdf_hit["kind"] == "pdf", pdf_hit
+        assert "IRIS_PDF_MARK" in str(pdf_hit["text"]), pdf_hit
+        panel._input_area.attachment_strip.clear_paths()
     finally:
         pdf.unlink(missing_ok=True)
         doc.unlink(missing_ok=True)

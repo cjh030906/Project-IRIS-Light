@@ -11,8 +11,11 @@ from iris.ui.chat.chat_blocks import parse_file_chip_location
 
 # @mcp:foo 는 제외, @integrations/foo/bar.ts:12 형태 지원
 _AT_PATH_RE = re.compile(
-    r"(?<![\w/@])@((?:[A-Za-z]:[\\/])?[^\s@,;]+?)"
-    r"(?=\s|$|[,;)}\]])"
+    r'(?<![\w/@])@(?:'
+    r'"([^"]+)"'
+    r"|'([^']+)'"
+    r"|((?:[A-Za-z]:[\\/])?[^\s@,;]+?)"
+    r")(?=\s|$|[,;)}\]])"
 )
 
 
@@ -21,7 +24,8 @@ def extract_at_path_refs(text: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for m in _AT_PATH_RE.finditer(text or ""):
-        raw = (m.group(1) or "").strip().strip('"').strip("'")
+        raw = next((group or "") for group in m.groups() if group)
+        raw = raw.strip().strip('"').strip("'")
         if not raw or raw.startswith("mcp:"):
             continue
         if raw not in seen:
@@ -149,6 +153,8 @@ def resolve_at_path(ref: str, *, workspace_root: str = "", project_root: str = "
 def _self_check() -> None:
     refs = extract_at_path_refs("열어줘 @integrations/iris-ide/tsconfig.json 그리고 @mcp:foo")
     assert refs == ["integrations/iris-ide/tsconfig.json"]
+    quoted = extract_at_path_refs('분석 @"C:/Users/serin/보고서 최종.pdf"')
+    assert quoted == ["C:/Users/serin/보고서 최종.pdf"], quoted
     root = Path(__file__).resolve().parents[3]
     ws = str(root)
     resolved = resolve_at_path("integrations/iris-ide/tsconfig.json", workspace_root=ws)

@@ -93,9 +93,61 @@ def render_wiki_document(text: str) -> str:
     return render_markdown_document(text, citations=True)
 
 
+_ATTACH_TOKEN = "\ue010{}\ue011"
+_LOCAL_ATTACH = re.compile(
+    r'@"([^"]+)"'
+    r"|@'([^']+)'"
+    r"|@([A-Za-z]:[\\/][^\s<>]+)"
+    r"|`([A-Za-z]:[\\/][^`\n]+)`"
+    r"|`(\\\\[^`\n]+)`"
+)
+
+
+def _swap_attachment_prose(text: str, chips: list[str]) -> str:
+    from iris.ui.chat.composer_attachments import attachment_chip_html
+
+    def repl(match: re.Match[str]) -> str:
+        raw = next(group for group in match.groups() if group)
+        chips.append(attachment_chip_html(raw))
+        return _ATTACH_TOKEN.format(len(chips) - 1)
+
+    return _LOCAL_ATTACH.sub(repl, text)
+
+
+def _swap_local_attachments(text: str) -> tuple[str, list[str]]:
+    """절대경로·백틱 경로는 칩 토큰으로. 코드 펜스 안은 그대로."""
+    chips: list[str] = []
+    parts: list[str] = []
+    pos = 0
+    source = text or ""
+    while pos < len(source):
+        fence = source.find(_FENCE, pos)
+        if fence < 0:
+            parts.append(_swap_attachment_prose(source[pos:], chips))
+            break
+        if fence > pos:
+            parts.append(_swap_attachment_prose(source[pos:fence], chips))
+        close = source.find(_FENCE, fence + 3)
+        if close < 0:
+            parts.append(source[fence:])
+            break
+        parts.append(source[fence : close + 3])
+        pos = close + 3
+    return "".join(parts), chips
+
+
 def render_user_message(text: str) -> str:
-    """사용자 메시지 — markdown (인용 칩 제외)."""
-    return render_markdown_document(text, citations=False)
+    """사용자 메시지 — markdown. 로컬 첨부는 파일명 칩."""
+    source, chips = _swap_local_attachments(text or "")
+    rendered = render_markdown_document(source, citations=False)
+    for index, chip in enumerate(chips):
+        rendered = rendered.replace(_ATTACH_TOKEN.format(index), chip)
+    t = TOKENS
+    return (
+        '<table cellspacing="0" cellpadding="0" style="margin:4px 0 10px 0;">'
+        f'<tr><td style="background-color:{t.chat_user_bubble};padding:10px 14px;">'
+        f"{rendered}</td></tr></table>"
+    )
 
 
 def render_error_inline(text: str) -> str:
@@ -342,7 +394,7 @@ def _style_tables(html_body: str) -> str:
 
 def _style_chat_html(html_body: str) -> str:
     t = TOKENS
-    body = f"color:{t.text_primary};"
+    body = f"color:{t.chat_body};line-height:{t.chat_line_height};font-size:{t.chat_font_size};"
     shell = (
         f"background-color:{t.chat_block_bg};"
         f"border:1px solid {t.chat_block_border};"
@@ -352,7 +404,7 @@ def _style_chat_html(html_body: str) -> str:
     out = html_body
     out = re.sub(
         r"<p>",
-        f'<span style="display:block;margin:0 0 4px 0;{body}">',
+        f'<span style="display:block;margin:0 0 12px 0;{body}">',
         out,
     )
     out = re.sub(r"</p>", "</span>", out)
