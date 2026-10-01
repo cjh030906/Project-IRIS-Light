@@ -150,12 +150,16 @@ message=f"우회 설치도 실패: {detail[:200]}"     # ← 다시 앞 200자
 | 항목 | 상태 |
 |------|------|
 | 원인 범위 조사 | 완료 (본 문서) |
-| H1 코드 수정 | **완료** — `format_pip_failure` 꼬리+로그파일, `_install_hermes_bypass` head 절단 제거 |
+| H1 코드 수정 | **완료** — `format_pip_failure` 꼬리+로그파일, `_install_hermes_bypass` head 절단 제거. 테스트 설치본 `dist\IRIS-Setup-0.1.91.exe` (SHA-256 `604e1538ec0188043e07f25d20e7f99516b98851e0a966f9692c00273ff010f9`) |
 | 우회 uv sync / UI 버튼 | **완료** — uv sync→pip, NeedsUser「로그 열기」·「우회로 다시 설치」, 공식 실패시 우회 1회 |
 | 잔여 R1–R5 | **완료** — R1=(a)+(c): prefer_bypass/last_error bypass·448 → 공식 생략 + 스트림 448 조기 abort. R2 staging 정리. R3 `format_runtime_failure`+log_path+`bypass_runtime`. R4 clip ≤800. R5 §7-1·2 unittest |
 | 총괄표 연번 | **22** (긴급 · **완료**) — `조치-소요-사항-총괄표.md` §3 자 |
+| 개발 PC 제거 후 재설치 | **성공** (2026-09-25). 기존 개발 PC에서 백업 후 제거한 뒤 위 설치본으로 다시 설치. 깨끗한 Windows 검증 아님. 이 실행은 **공식 `install.ps1`이 성공**했다. 최초 문제의 공식 실패 → 우회 설치는 이 재설치로 검증된 것이 아니다 |
+| 격리된 공식 실패 → 우회 | **성공** (2026-09-25). 사용자 `%LOCALAPPDATA%\hermes`는 유지. 공식 러너는 통제된 rc=1. WinError 448 재현은 아님. 테스트 설치본의 `_install_hermes` → `_install_hermes_bypass` → `install_hermes_with_system_python`. 자식 PATH에 uv가 없어 pip fallback. 최종 경로 health 200, hermes-agent 0.21.5. 위치 `C:\Users\serin\IRIS-reinstall-test-20260925\bypass-isolated` |
 | §7 실기 | unittest로 1·2 대체 통과. cold/`_check_setup_hermes_live`는 **네트워크·기존 hermes 없으면 스킵** (사유: 에이전트 환경에 cold wipe 비권장) |
+| 채팅→Hermes→도구 | 미검증. 파일 작성·실행은 `write_project_file` / `run_project_command` 직접 호출. Cursor 새 창은 IRIS 내장 IDE 검증이 아님 |
 | 타 사용자 재현 로그 | UI 스크린샷만 (전체 pip 로그 없음 — H9) → 이후 설치부터 `%LOCALAPPDATA%\hermes\logs\iris-bypass-pip-*.log` |
+| 타 사용자·완전 초기화 Windows | 미실시 |
 
 ---
 
@@ -167,3 +171,4 @@ message=f"우회 설치도 실패: {detail[:200]}"     # ← 다시 앞 200자
 | 2026-09-24 | 연번 1–11 구현: 꼬리 로그·staging clone·py 3.11 우선·uv sync·NeedsUser 우회 버튼·idle 완화 |
 | 2026-09-24 | 총괄표 연번 22 등록(부분 조치). 잔여 R1–R5 후속 프롬프트 분리 |
 | 2026-09-24 | 잔여 R1–R5 구현·unittest 12건·총괄표 22 **완료**. R1 조합 (a)+(c) |
+| 2026-09-25 | 개발 PC 제거 후 `IRIS-Setup-0.1.91` 재설치 성공. 공식 설치 성공이라 우회 실기 검증으로 보지 않음. 격리 경로에서 통제된 공식 rc=1 뒤 테스트 설치본 우회로 설치, 최종 경로 health 200. 사용자 환경은 백업에서 복원 |

@@ -98,35 +98,193 @@ def _message_parts(msg: ChatMessage | dict[str, str]) -> tuple[str, str]:
     return msg.role, msg.content
 
 
+# ponytail: 어휘 겹침으로 주제 전환을 본다. 오탐이 늘면 LLM 제목 생성으로 교체.
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*|[가-힣]{2,}")
+_STOPWORDS = frozenset(
+    {
+        "and", "for", "the", "this", "that", "with", "from", "please", "can", "you",
+        "how", "what", "just", "okay", "yes",
+        "그리고", "그래서", "그럼", "아니면", "또는",
+        "이것", "그것", "저것", "알려줘", "해줘", "해주세요", "짜줘",
+        "관련", "대해", "대한", "뭔가", "어떻게", "무엇", "왜요",
+    }
+)
+_FOLLOWUP_RE = re.compile(
+    r"^(그럼|그리고|그래서|아니면|또는|또|다시|응|네|아니|"
+    r"ok|okay|yes|no|thanks?|고마워|감사|더|자세히|왜요?)\b",
+    re.IGNORECASE,
+)
+
+
+def _tokens(text: str) -> frozenset[str]:
+    return frozenset(
+        p.lower()
+        for p in _TOKEN_RE.findall(text or "")
+        if p.lower() not in _STOPWORDS and len(p) >= 2
+    )
+
+
+def _is_topic_line(text: str) -> bool:
+    body = " ".join((text or "").split())
+    if len(body) < 6:
+        return False
+    tokens = _tokens(body)
+    if _FOLLOWUP_RE.match(body) and len(tokens) < 4:
+        return False
+    return len(tokens) >= 2
+
+
+def topic_shifted(anchor: str, later: list[str]) -> bool:
+    """later 가 anchor 와 다른 주제로 넘어갔는지."""
+    if not later:
+        return False
+    a = _tokens(anchor)
+    b = _tokens(" ".join(later))
+    if len(b) < 3:
+        return False
+    shared = a & b
+    novel = b - a
+    if len(novel) < 3:
+        return False
+    lead = " ".join(later[0].split())
+    if _FOLLOWUP_RE.match(lead) and len(novel) < 5:
+        return False
+    return len(novel) >= max(3, 2 * len(shared))
+
+
+def _anchor_line(texts: list[str]) -> str:
+    for text in texts:
+        if _is_topic_line(text):
+            return text
+    return texts[0]
+
+
+# ponytail: 어휘 규칙으로 10~25자 요약을 만든다. 제목이 자주 빗나가면 완료된 턴에서만 LLM으로 교체.
+_SUMMARY_LIMIT = 25
+_VERB_STEMS = ("수정", "구현", "개선", "추가", "삭제", "연결", "확대", "생성", "검색", "초기화", "저장", "확인", "열기")
+_SUMMARY_STOP = _STOPWORDS | {
+    "문제",
+    "원인",
+    "프로그램",
+    "링크",
+    "입력",
+    "선택",
+    "이거",
+    "저거",
+    "그냥",
+    "부분",
+    "알려",
+    "보여",
+    "하고",
+    "있는",
+    "있는데",
+    "하면",
+    "해서",
+}
+_TAIL = re.compile(
+    r"(에서|으로|부터|까지|처럼|보다|하면|해서|하는|되는|한테|에게|이라고|라고|은|는|이|가|을|를|에|의|도|만|과|와|요|죠|한)$"
+)
+
+
+def _stem_token(token: str) -> str:
+    word = token
+    if re.fullmatch(r"[가-힣]+", word):
+        trimmed = _TAIL.sub("", word)
+        if len(trimmed) >= 2:
+            word = trimmed
+    return word
+
+
+def summarize_work_title(text: str) -> str:
+    """사용자 문장을 대상+작업 형태의 짧은 제목으로 줄인다. 요약이 안 되면 빈 문자열."""
+    raw = " ".join((text or "").split())
+    if not raw:
+        return ""
+    auto_link = bool(re.search(r"없으면|자동", raw))
+    show_feature = bool(re.search(r"보여\s*주|보고\s*싶", raw))
+    folded = raw
+    folded = re.sub(r"검색창", "검색", folded)
+    folded = re.sub(
+        r"프로그램(?:이|을|가)?\s*꺼\w*|꺼지\w*|꺼짐|crash\w*|강제\s*종료",
+        " 종료 오류 ",
+        folded,
+        flags=re.IGNORECASE,
+    )
+    folded = re.sub(r"에러|버그|errors?", " 오류 ", folded, flags=re.IGNORECASE)
+    folded = re.sub(r"고쳐\s*줘(?:요)?", " 수정 ", folded)
+    folded = re.sub(r"(붙여|붙이)\s*줘(?:요)?", " 추가 ", folded)
+    verb = "|".join(_VERB_STEMS)
+    folded = re.sub(rf"({verb})\s*해\s*(?:줘(?:요)?|주세요|봐)?", r" \1 ", folded)
+    folded = re.sub(
+        r"(?:해\s*줘(?:요)?|해주세요|해\s*주세요|하고\s*싶(?:어|어요|습니다)?|"
+        r"싶(?:어|어요|습니다)?|보여\s*주고|보여주고|알려\s*줘(?:요)?|"
+        r"문제가\s*있\w*|가능한지|없으면|확인하고|입력하\w*|선택한|창에서|링크를)",
+        " ",
+        folded,
+    )
+    tokens: list[str] = []
+    for piece in _TOKEN_RE.findall(folded):
+        stem = _stem_token(piece)
+        key = stem.lower()
+        if key in _SUMMARY_STOP or len(stem) < 2:
+            continue
+        if tokens and tokens[-1].lower() == key:
+            continue
+        tokens.append(stem)
+    if auto_link and "연결" in tokens and "자동" not in tokens:
+        tokens.insert(tokens.index("연결"), "자동")
+    if show_feature and "기능" not in tokens and not any(t in tokens for t in ("수정", "구현", "삭제")):
+        tokens.append("기능")
+    if "검색" in tokens and "노드" in tokens:
+        merged: list[str] = []
+        for token in tokens:
+            if token == "노드" and merged and merged[-1] == "검색":
+                merged.append("및")
+            merged.append(token)
+        tokens = merged
+    if len([t for t in tokens if t != "및"]) < 2:
+        return ""
+    while len(tokens) > 2 and len(" ".join(tokens)) > _SUMMARY_LIMIT:
+        drop_at = -2 if tokens[-1] in _VERB_STEMS or tokens[-1] == "기능" else -1
+        if tokens[drop_at] == "및" and len(tokens) > 3:
+            drop_at = -3
+        tokens.pop(drop_at)
+    title = " ".join(tokens).strip()
+    if len(title) > _SUMMARY_LIMIT:
+        title = title[: _SUMMARY_LIMIT - 1].rstrip() + "…"
+    if title == raw:
+        return ""
+    return title
+
+
+def _user_lines(messages: list[ChatMessage] | list[dict[str, str]]) -> list[str]:
+    users: list[str] = []
+    for msg in messages:
+        role, content = _message_parts(msg)
+        body = content.strip()
+        if role == "user" and body:
+            users.append(body)
+    return users
+
+
 def suggest_title(
     messages: list[ChatMessage] | list[dict[str, str]],
     *,
     basis: str = TITLE_BASIS_LAST,
 ) -> str:
-    """제목은 사용자 입력이 아니라 아이리스 답변 요약.
-
-    last: 가장 최근 답변. first: 첫 사용자 입력에 대한 첫 답변.
-    """
-    replies_after_user: list[str] = []
-    last_reply = ""
-    seen_user = False
-    for msg in messages:
-        role, content = _message_parts(msg)
-        body = content.strip()
-        if role == "user" and body:
-            seen_user = True
-        elif role == "assistant" and body.replace(INTERRUPTED_NOTE, "").strip():
-            body = body.replace(INTERRUPTED_NOTE, "").strip()
-            last_reply = body
-            if seen_user and not replies_after_user:
-                replies_after_user.append(body)
-    if basis == TITLE_BASIS_FIRST:
-        source = replies_after_user[0] if replies_after_user else ""
-    else:
-        source = last_reply
-    if not source:
+    """작업 내용을 짧게 요약. first는 첫 주제, last는 마지막으로 바뀐 주제."""
+    users = _user_lines(messages)
+    if not users:
         return DEFAULT_TITLE
-    return summarize_reply(source)
+    start = 0
+    if basis != TITLE_BASIS_FIRST:
+        for i in range(1, len(users)):
+            if topic_shifted(users[start], [users[i]]):
+                start = i
+    anchor = _anchor_line(users[start:])
+    if not _is_topic_line(anchor):
+        return DEFAULT_TITLE
+    return summarize_work_title(anchor) or DEFAULT_TITLE
 
 
 def ensure_chat_schema(db: Database) -> None:
@@ -329,19 +487,45 @@ def _set_title(
 
 
 def _maybe_refresh_title(db: Database, conversation_id: int) -> None:
+    """임시 제목은 첫 응답 뒤에 한 번 요약. 사용자가 잠그면 유지. 주제가 바뀌면 다시 요약."""
     conv = get_conversation(db, conversation_id)
     if conv is None or conv.title_locked:
         return
-    suggested = suggest_title(list_messages(db, conversation_id), basis=load_title_basis(db))
+    messages = list_messages(db, conversation_id)
+    if not any(m.role == "assistant" and m.content.strip() for m in messages):
+        return
+    basis = load_title_basis(db)
+    suggested = suggest_title(messages, basis=basis)
     if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
         return
-    _set_title(db, conversation_id, suggested, locked=False)
+    if conv.title in ("", DEFAULT_TITLE):
+        _set_title(db, conversation_id, suggested, locked=False)
+        return
+    if basis == TITLE_BASIS_FIRST:
+        return
+    users = [
+        m.content.strip()
+        for m in messages
+        if m.role == "user" and m.content.strip()
+    ]
+    anchor = _anchor_line(users) if users else ""
+    if anchor and topic_shifted(anchor, [users[-1]]):
+        _set_title(db, conversation_id, suggested, locked=False)
 
 
 def refresh_conversation_title(db: Database, conversation_id: int) -> None:
     """설정 변경 직후, 잠기지 않은 제목을 현재 기준으로 다시 맞춘다."""
     ensure_chat_schema(db)
-    _maybe_refresh_title(db, conversation_id)
+    conv = get_conversation(db, conversation_id)
+    if conv is None or conv.title_locked:
+        return
+    messages = list_messages(db, conversation_id)
+    if not any(m.role == "assistant" and m.content.strip() for m in messages):
+        return
+    suggested = suggest_title(messages, basis=load_title_basis(db))
+    if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
+        return
+    _set_title(db, conversation_id, suggested, locked=False)
     db._commit()
 
 
@@ -373,7 +557,7 @@ def append_message(db: Database, conversation_id: int, role: str, content: str) 
         "UPDATE chat_conversations SET updated_at = ? WHERE id = ?",
         (stamp, int(conversation_id)),
     )
-    if str(role) == "assistant" and (content or "").strip():
+    if str(role) in ("user", "assistant") and (content or "").strip():
         _maybe_refresh_title(db, conversation_id)
     db._commit()
     return int(cur.lastrowid or 0)

@@ -1,11 +1,14 @@
-"""사이버스페이스 배경 — 성운·지평선 그리드 + 구체·UI 오버레이 레이어."""
+"""사이버스페이스 배경 — 성운·지평선 그리드.
+
+배경은 정적으로 그린다. 전체 위젯을 주기적으로 update() 하면 투명 자식
+(채팅·사이드바·버튼)이 같이 다시 그려져 화면이 깜박인다.
+"""
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QRadialGradient
 from PyQt6.QtWidgets import QLayout, QWidget
 
@@ -17,16 +20,12 @@ class CyberspaceBackground(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._phase = 0.0
         self._orb_layer: Optional[QWidget] = None
         self._ui_overlay: Optional[QWidget] = None
         self._orb_host: Optional[QWidget] = None
         self._orb_above_ui = False
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAutoFillBackground(False)
-        self._timer = QTimer(self)
-        self._timer.setInterval(80)
-        self._timer.timeout.connect(self._tick)
 
     def set_orb_layer(self, widget: QWidget) -> None:
         """구체 비주얼라이저 — 기본은 창 전체 레이어(히어로/일반). Companion A는 release 후 슬롯 자식."""
@@ -135,21 +134,6 @@ class CyberspaceBackground(QWidget):
             if isinstance(child_lay, QLayout):
                 child_lay.activate()
 
-    def showEvent(self, event) -> None:  # noqa: N802
-        super().showEvent(event)
-        if not self._timer.isActive():
-            self._timer.start()
-
-    def hideEvent(self, event) -> None:  # noqa: N802
-        super().hideEvent(event)
-        self._timer.stop()
-
-    def _tick(self) -> None:
-        self._phase += 0.012
-        if self._phase > math.tau:
-            self._phase -= math.tau
-        self.update()
-
     def paintEvent(self, event) -> None:  # noqa: ARG002, N802
         w, h = max(self.width(), 1), max(self.height(), 1)
         painter = QPainter(self)
@@ -169,7 +153,7 @@ class CyberspaceBackground(QWidget):
         cx, cy = w * 0.52, h * 0.38
         nebula_r = max(w, h) * 0.55
         nebula = QRadialGradient(cx, cy, nebula_r)
-        pulse = 0.5 + 0.5 * math.sin(self._phase * 0.7)
+        pulse = 0.65
         nebula.setColorAt(0.0, QColor(56, 189, 248, int(28 + 10 * pulse)))
         nebula.setColorAt(0.25, QColor(37, 99, 235, int(14 + 6 * pulse)))
         nebula.setColorAt(0.55, QColor(13, 40, 71, int(8 + 4 * pulse)))

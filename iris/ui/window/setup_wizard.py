@@ -160,6 +160,11 @@ class _NeedsUserCard(QFrame):
         self._install_btn.clicked.connect(self.install_clicked.emit)
         self._install_btn.hide()
         row.addWidget(self._install_btn)
+        self._log_path = ""
+        self._log_btn = QPushButton("로그 열기")
+        self._log_btn.clicked.connect(self._open_log)
+        self._log_btn.hide()
+        row.addWidget(self._log_btn)
         # 설치 시작 시 _install_btn 자리를 대신 차지하는 로딩 표시 — 버튼이 그냥
         # 사라지지 않고 "지금 여기서 설치 중"임을 보여준다.
         self._loading_row = QWidget()
@@ -253,6 +258,8 @@ class _NeedsUserCard(QFrame):
         self._log_btn.setVisible(bool(self._log_path))
         self._install_btn.setText(result.install_label or "설치")
         self._install_btn.setVisible(bool(result.can_install))
+        self._log_path = (result.log_path or "").strip()
+        self._log_btn.setVisible(bool(self._log_path))
         # 키 붙여넣기는 external_api 등 hint에 '붙여넣'이 있을 때만
         need_paste = "붙여넣" in (result.action_hint or "") or "키" in (result.action_hint or "")
         self._paste.setVisible(need_paste and result.step_id in ("external_api",))
@@ -275,6 +282,7 @@ class _NeedsUserCard(QFrame):
         self._open_btn.hide()
         self._log_btn.hide()
         self._install_btn.hide()
+        self._log_btn.hide()
         self._later_btn.hide()
         self._done_btn.hide()
         self._loading_row.show()

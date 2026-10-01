@@ -23,6 +23,18 @@ def default_user_wiki_root() -> Path:
     return base
 
 
+def markdown_heading(text: str) -> str:
+    """본문 앞부분의 첫 제목. `# ` 접두만 벗긴다 (lstrip 문자집합으로 글자를 먹지 않음)."""
+    for line in (text or "").splitlines()[:12]:
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        title = stripped.lstrip("#").strip()
+        if title:
+            return title
+    return ""
+
+
 def slugify_note_name(title: str, *, max_len: int = 64) -> str:
     """제목 → 파일명 슬러그 (한글·영문·숫자·하이픈)."""
     s = (title or "").strip().lower()
@@ -30,6 +42,23 @@ def slugify_note_name(title: str, *, max_len: int = 64) -> str:
     s = re.sub(r"[^\w\-가-힣]+", "", s, flags=re.UNICODE)
     s = re.sub(r"-{2,}", "-", s).strip("-_") or "note"
     return s[:max_len]
+
+
+def match_wiki_notes(notes: list[IrisWikiNote], query: str, *, limit: int = 8) -> list[IrisWikiNote]:
+    """제목·경로·폴더 부분 일치. 대소문자 무시. 빈 검색은 빈 목록."""
+    q = (query or "").strip().casefold()
+    if not q:
+        return []
+    hits: list[IrisWikiNote] = []
+    for note in notes:
+        blob = " ".join(
+            (note.title, note.rel_path, note.folder, Path(note.rel_path).name)
+        ).casefold()
+        if q in blob:
+            hits.append(note)
+        if len(hits) >= limit:
+            break
+    return hits
 
 
 @dataclass(frozen=True)
@@ -86,10 +115,15 @@ class IrisWiki:
                 folder = USER_PREFIX.rstrip("/")
             else:
                 folder = f"{USER_PREFIX}{folder}"
+            heading = ""
+            try:
+                heading = markdown_heading(path.read_text(encoding="utf-8", errors="replace")[:800])
+            except OSError:
+                heading = ""
             notes.append(
                 IrisWikiNote(
                     rel_path=f"{USER_PREFIX}{rel}",
-                    title=path.stem,
+                    title=heading or path.stem,
                     folder=folder,
                     source="user",
                 )

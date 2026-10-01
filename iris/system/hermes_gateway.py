@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -57,6 +58,7 @@ _POLLUTION_ENV_KEYS = (
 )
 
 _GATEWAY_PORT_DEFAULT = 8642
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -86,12 +88,23 @@ class GatewayDiagnosis:
     timestamp: str = ""
 
     def user_message(self) -> str:
-        """설치 UI용 짧은 문구 (시크릿 없음)."""
+        """설치 UI용 짧은 문구 (시크릿 없음). command/exit/stdout·stderr를 앞에 둔다."""
         parts = [f"[{self.code}] {self.message}".strip()]
+        if self.command:
+            parts.append("command: " + " ".join(self.command))
+        else:
+            parts.append("command: (not started)")
+        parts.append(
+            f"exit: {self.exit_code if self.exit_code is not None else 'none'}"
+        )
+        if self.detail:
+            parts.append(str(self.detail)[:900])
         if self.action:
             parts.append(self.action)
+        if self.stdout_log:
+            parts.append(f"stdout_log: {self.stdout_log}")
         if self.stderr_log:
-            parts.append(f"로그: {self.stderr_log}")
+            parts.append(f"stderr_log: {self.stderr_log}")
         elif self.log_dir:
             parts.append(f"로그: {self.log_dir}")
         return "\n".join(p for p in parts if p)
@@ -107,6 +120,7 @@ class GatewayDiagnosis:
 _LAST_DIAGNOSIS: GatewayDiagnosis | None = None
 _LAST_CHILD: subprocess.Popen[bytes] | None = None
 _LAST_LOG_PATHS: tuple[Path, Path] | None = None
+_LAST_CMD: list[str] = []
 
 
 def get_last_gateway_diagnosis() -> GatewayDiagnosis | None:
@@ -193,6 +207,16 @@ def _set_diagnosis(diag: GatewayDiagnosis) -> GatewayDiagnosis:
         path.write_text(diag.copy_text(), encoding="utf-8")
     except OSError:
         pass
+    if diag.code != CODE_OK:
+        _log.warning(
+            "gateway %s exit=%s command=%s stdout=%s stderr=%s detail=%s",
+            diag.code,
+            diag.exit_code,
+            diag.command,
+            diag.stdout_log,
+            diag.stderr_log,
+            (diag.detail or "")[:1500],
+        )
     return diag
 
 
@@ -212,8 +236,16 @@ def _new_gateway_log_paths() -> tuple[Path, Path]:
 
 
 def _windows_hermes_candidates() -> list[Path]:
-    root = hermes_home() / "hermes-agent" / "venv" / "Scripts"
-    return [root / "hermes.exe", root / "hermes-agent.exe"]
+    """venv Scripts 와 공식 설치 심(hermes/bin, hermes-agent/bin)."""
+    home = hermes_home()
+    scripts = home / "hermes-agent" / "venv" / "Scripts"
+    return [
+        scripts / "hermes.exe",
+        scripts / "hermes-agent.exe",
+        home / "hermes-agent" / "bin" / "hermes.exe",
+        home / "bin" / "hermes.exe",
+        home / "bin" / "hermes.cmd",
+    ]
 
 
 def hermes_executable(command: str = "hermes") -> str | None:
@@ -284,6 +316,30 @@ def _hermes_venv_python() -> Path | None:
     return py if py.is_file() else None
 
 
+def _hermes_committed_python() -> Path | None:
+    """PM이 고른 의존성 venv. 3.12 트리에서 이 site-packages를 쓰면 pydantic_core가 깨진다."""
+    root = hermes_home() / "installs"
+    if not root.is_dir():
+        return None
+    for facts in root.glob("*/facts.json"):
+        try:
+            data = json.loads(facts.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        env = str(((data.get("packages") or {}).get("venv") or {}).get("environment") or "")
+        if not env:
+            continue
+        scripts = "Scripts" if sys.platform == "win32" else "bin"
+        py = Path(env) / scripts / ("python.exe" if sys.platform == "win32" else "python")
+        if py.is_file():
+            return py
+    return None
+
+
+def _hermes_runtime_python() -> Path | None:
+    return _hermes_committed_python() or _hermes_venv_python()
+
+
 def is_hermes_trampoline_failure(text: str) -> bool:
     """uv trampoline이 베이스 Python을 못 찾는 실패(os error 2)인지."""
     t = (text or "").lower()
@@ -326,7 +382,7 @@ def is_hermes_gateway_dep_missing_failure(text: str) -> bool:
         return True
     if "modulenotfounderror" not in t:
         return False
-    for mod in ("aiohttp", "hermes_cli", "mcp"):
+    for mod in ("aiohttp", "hermes_cli", "mcp", "ruamel", "dotenv"):
         if f"no module named '{mod}'" in t or f'no module named "{mod}"' in t:
             return True
     return False
@@ -340,8 +396,8 @@ def probe_hermes_runtime(
     파일만 있고 베이스 인터프리터가 사라진 경우(uv trampoline os error 2)와
     venv만 있고 hermes_cli/aiohttp 가 없는 껍데기 설치를 설치·gateway 전에 잡는다.
     """
-    venv_dir = _hermes_venv_dir()
-    venv_py = _hermes_venv_python()
+    venv_py = _hermes_runtime_python()
+    venv_dir = venv_py.parent.parent if venv_py is not None else _hermes_venv_dir()
     if venv_py is not None:
         home = _pyvenv_home_path(venv_dir)
         if home is not None and not home.is_dir():
@@ -353,7 +409,7 @@ def probe_hermes_runtime(
                 [
                     str(venv_py),
                     "-c",
-                    "import hermes_cli, aiohttp, mcp; print('ok')",
+                    "import hermes_cli, aiohttp, mcp, ruamel.yaml, dotenv; print('ok')",
                 ],
                 capture_output=True,
                 text=True,
@@ -430,6 +486,8 @@ def _gateway_child_env() -> dict[str, str]:
     home = hermes_home()
     env["HERMES_HOME"] = str(home)
     env["HERMES_ACCEPT_HOOKS"] = "1"
+    # Iris가 pip로 깐 트리. 매 기동마다 source-update를 돌리면 /health가 안 뜬다.
+    env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
     dotenv = load_hermes_dotenv()
     for key, val in dotenv.items():
         # Iris 프로세스 값이 있어도 Hermes 전용 키는 파일 값을 쓴다
@@ -438,11 +496,11 @@ def _gateway_child_env() -> dict[str, str]:
     env.setdefault("API_SERVER_HOST", "127.0.0.1")
     env.setdefault("API_SERVER_PORT", str(_GATEWAY_PORT_DEFAULT))
 
-    venv = _hermes_venv_dir()
-    venv_py = _hermes_venv_python()
+    venv_py = _hermes_runtime_python()
+    venv = venv_py.parent.parent if venv_py is not None else _hermes_venv_dir()
     if venv.is_dir() and venv_py is not None:
         env["VIRTUAL_ENV"] = str(venv)
-        scripts = str(venv / ("Scripts" if sys.platform == "win32" else "bin"))
+        scripts = str(venv_py.parent)
         path = env.get("PATH", "")
         if scripts and not path.lower().startswith(scripts.lower()):
             env["PATH"] = scripts + os.pathsep + path
@@ -468,7 +526,7 @@ def _windows_hidden_cmd(hermes_exe: str) -> list[str]:
     venv python -m hermes_cli.main 우선 — hermes.exe(uv trampoline)만 쓰면
     Iris VIRTUAL_ENV 오염 시 base Python 으로 re-exec 되어 pydantic_core 가 빠진다.
     """
-    venv_py = _hermes_venv_python()
+    venv_py = _hermes_runtime_python()
     if venv_py is not None:
         return [str(venv_py), "-m", "hermes_cli.main", *_gateway_argv()]
     return [hermes_exe, *_gateway_argv()]
@@ -476,7 +534,7 @@ def _windows_hidden_cmd(hermes_exe: str) -> list[str]:
 
 def _build_gateway_cmd(command: str = "hermes") -> list[str] | None:
     exe = hermes_executable(command)
-    venv_py = _hermes_venv_python()
+    venv_py = _hermes_runtime_python()
     if not exe and venv_py is None:
         return None
     if sys.platform == "win32":
@@ -558,18 +616,70 @@ def _child_exit_code() -> int | None:
     return proc.poll()
 
 
+def hermes_runtime_report(*, command: str = "hermes") -> str:
+    """gateway 시도의 실행 파일·cwd·명령·종료코드·로그. 시크릿 값은 넣지 않는다."""
+    exe = hermes_executable(command)
+    venv_py = _hermes_runtime_python()
+    agent = _hermes_agent_dir()
+    cmd = _build_gateway_cmd(command)
+    cwd = str(agent) if agent.is_dir() else ""
+    lines = [
+        f"[Hermes] executable={exe or 'MISSING'}",
+        f"[Hermes] venv_python={venv_py or 'MISSING'}",
+        f"[Hermes] cwd={cwd or 'MISSING'}",
+        f"[Hermes] command={' '.join(cmd) if cmd else 'MISSING'}",
+    ]
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    py_name = "python.exe" if sys.platform == "win32" else "python"
+    required: list[Path] = []
+    if not exe:
+        required.extend(_windows_hermes_candidates() if sys.platform == "win32" else [])
+    if venv_py is None:
+        required.append(agent / "venv" / scripts / py_name)
+    mcp_tool = agent / "tools" / "mcp_tool.py"
+    if not mcp_tool.is_file():
+        required.append(mcp_tool)
+    if not agent.is_dir():
+        lines.append(f"[Hermes] missing={agent}")
+    for path in required:
+        if not path.is_file():
+            lines.append(f"[Hermes] missing={path}")
+    code = _child_exit_code()
+    lines.append(f"[Hermes] return_code={code if code is not None else 'none'}")
+    if _LAST_LOG_PATHS:
+        lines.append(f"[Hermes] stdout={_tail_log(_LAST_LOG_PATHS[0], limit=400) or '(empty)'}")
+        lines.append(f"[Hermes] stderr={_tail_log(_LAST_LOG_PATHS[1], limit=400) or '(empty)'}")
+    else:
+        lines.append("[Hermes] stdout=(no log)")
+        lines.append("[Hermes] stderr=(no log)")
+    text = "\n".join(lines)
+    try:
+        path = _gateway_log_dir() / "hermes-iris.log"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+    return text
+
+
 def start_hermes_gateway(command: str = "hermes") -> bool:
     """`hermes gateway run`을 창 없이 백그라운드로 기동. 실행 파일이 없으면 False."""
+    global _LAST_CMD
     cmd = _build_gateway_cmd(command)
     if cmd is None:
+        _LAST_CMD = []
+        report = hermes_runtime_report(command=command)
         _set_diagnosis(
             GatewayDiagnosis(
                 code=CODE_EXE_MISSING,
                 message="Hermes 실행 파일/venv python을 찾지 못했습니다.",
                 action="시작 프로토콜에서 Hermes 설치를 다시 실행하거나 PATH를 확인하세요.",
+                detail=report,
+                log_dir=str(_gateway_log_dir()),
             )
         )
         return False
+    _LAST_CMD = list(cmd)
     env = _gateway_child_env()
     cwd = str(_hermes_agent_dir())
     if not Path(cwd).is_dir():
@@ -1082,118 +1192,140 @@ def _wait_until_healthy(
     last_health: HealthProbeResult | None = None
     last_ready: GatewayReadyResult | None = None
     key = resolve_hermes_api_key(api_key)
-    while time.monotonic() < deadline:
-        if should_abort and should_abort():
-            return False
-        exit_code = _child_exit_code()
-        if exit_code is not None:
-            err_tail = _tail_log(_LAST_LOG_PATHS[1] if _LAST_LOG_PATHS else None)
-            out_log = str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else ""
-            err_log = str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else ""
-            _set_diagnosis(
-                GatewayDiagnosis(
-                    code=CODE_PROCESS_CRASH,
-                    message=f"gateway 프로세스가 즉시 종료되었습니다 (exit {exit_code}).",
-                    action=(
-                        "stderr 로그를 확인하세요. 흔한 원인: stale lock, "
-                        "venv 오염, 누락 패키지, 포트 충돌."
-                    ),
-                    exit_code=exit_code,
-                    log_dir=str(_gateway_log_dir()),
-                    stdout_log=out_log,
-                    stderr_log=err_log,
-                    detail=err_tail[:1500],
-                    has_api_key=bool(key),
-                )
-            )
-            return False
-        health = probe_gateway_health(base_url, timeout_sec=min(2.0, delay + 1.0))
-        last_health = health
-        if health.ok:
-            if not require_ready:
-                _set_diagnosis(
-                    GatewayDiagnosis(
-                        code=CODE_OK,
-                        ok=True,
-                        message="gateway /health OK",
-                        health={
-                            "code": health.code,
-                            "url": health.url,
-                            "summary": health.body_summary,
-                        },
-                        log_dir=str(_gateway_log_dir()),
-                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
-                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
-                        has_api_key=bool(key),
-                        api_server_enabled=load_hermes_dotenv().get(
-                            "API_SERVER_ENABLED", "true"
-                        ),
-                    )
-                )
-                return True
-            ready = probe_gateway_ready(
-                base_url, api_key=key, timeout_sec=min(3.0, delay + 1.5)
-            )
-            last_ready = ready
-            if ready.ok:
-                _set_diagnosis(
-                    GatewayDiagnosis(
-                        code=CODE_OK,
-                        ok=True,
-                        message="gateway /health·/v1/models OK",
-                        health={
-                            "code": health.code,
-                            "url": health.url,
-                            "summary": health.body_summary,
-                        },
-                        log_dir=str(_gateway_log_dir()),
-                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
-                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
-                        has_api_key=bool(key),
-                        api_server_enabled=load_hermes_dotenv().get(
-                            "API_SERVER_ENABLED", "true"
-                        ),
-                        models_ok=True,
-                        ready_detail=ready.detail,
-                    )
-                )
-                return True
-            # 401/no_key는 시간이 지나도 안 살아남 — wait_sec 끝까지 끌지 않음
-            if ready.code in ("no_key",) or ready.http_status in (401, 403):
-                code = CODE_API_KEY_SEPARATE
-                _set_diagnosis(
-                    GatewayDiagnosis(
-                        code=code,
-                        ok=False,
-                        message=(
-                            f"gateway /health OK 이지만 ready 실패 ({ready.code})."
-                        ),
-                        action="API 키 정합 후 gateway를 재기동하세요.",
-                        detail=ready.detail,
-                        log_dir=str(_gateway_log_dir()),
-                        stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
-                        stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
-                        health={
-                            "code": health.code,
-                            "url": health.url,
-                            "summary": health.body_summary,
-                        },
-                        port=gateway_port_from_base_url(base_url),
-                        has_api_key=bool(key),
-                        api_server_enabled=load_hermes_dotenv().get(
-                            "API_SERVER_ENABLED", ""
-                        ),
-                        models_ok=False,
-                        ready_detail=ready.detail,
-                    )
-                )
+    grace_used = False
+    while True:
+        while time.monotonic() < deadline:
+            if should_abort and should_abort():
                 return False
-            if on_progress:
-                on_progress(f"ready 대기… ({ready.code})")
-        elif on_progress:
-            on_progress(f"health 대기… ({health.code})")
-        time.sleep(delay)
-        delay = min(2.0, delay * 1.35)
+            exit_code = _child_exit_code()
+            if exit_code is not None:
+                out_path = _LAST_LOG_PATHS[0] if _LAST_LOG_PATHS else None
+                err_path = _LAST_LOG_PATHS[1] if _LAST_LOG_PATHS else None
+                out_tail = _tail_log(out_path)
+                err_tail = _tail_log(err_path)
+                out_log = str(out_path) if out_path else ""
+                err_log = str(err_path) if err_path else ""
+                _set_diagnosis(
+                    GatewayDiagnosis(
+                        code=CODE_PROCESS_CRASH,
+                        message=f"gateway 프로세스가 즉시 종료되었습니다 (exit {exit_code}).",
+                        action=(
+                            "stderr 로그를 확인하세요. 흔한 원인: stale lock, "
+                            "venv 오염, 누락 패키지, 포트 충돌."
+                        ),
+                        command=list(_LAST_CMD),
+                        exit_code=exit_code,
+                        log_dir=str(_gateway_log_dir()),
+                        stdout_log=out_log,
+                        stderr_log=err_log,
+                        detail=f"stdout:\n{out_tail[:700]}\nstderr:\n{err_tail[:700]}",
+                        has_api_key=bool(key),
+                    )
+                )
+                hermes_runtime_report()
+                return False
+            health = probe_gateway_health(base_url, timeout_sec=min(2.0, delay + 1.0))
+            last_health = health
+            if health.ok:
+                if not require_ready:
+                    _set_diagnosis(
+                        GatewayDiagnosis(
+                            code=CODE_OK,
+                            ok=True,
+                            message="gateway /health OK",
+                            health={
+                                "code": health.code,
+                                "url": health.url,
+                                "summary": health.body_summary,
+                            },
+                            log_dir=str(_gateway_log_dir()),
+                            stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                            stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                            has_api_key=bool(key),
+                            api_server_enabled=load_hermes_dotenv().get(
+                                "API_SERVER_ENABLED", "true"
+                            ),
+                        )
+                    )
+                    return True
+                ready = probe_gateway_ready(
+                    base_url, api_key=key, timeout_sec=min(3.0, delay + 1.5)
+                )
+                last_ready = ready
+                if ready.ok:
+                    _set_diagnosis(
+                        GatewayDiagnosis(
+                            code=CODE_OK,
+                            ok=True,
+                            message="gateway /health·/v1/models OK",
+                            health={
+                                "code": health.code,
+                                "url": health.url,
+                                "summary": health.body_summary,
+                            },
+                            log_dir=str(_gateway_log_dir()),
+                            stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                            stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                            has_api_key=bool(key),
+                            api_server_enabled=load_hermes_dotenv().get(
+                                "API_SERVER_ENABLED", "true"
+                            ),
+                            models_ok=True,
+                            ready_detail=ready.detail,
+                        )
+                    )
+                    return True
+                # 401/no_key는 시간이 지나도 안 살아남 — wait_sec 끝까지 끌지 않음
+                if ready.code in ("no_key",) or ready.http_status in (401, 403):
+                    code = CODE_API_KEY_SEPARATE
+                    _set_diagnosis(
+                        GatewayDiagnosis(
+                            code=code,
+                            ok=False,
+                            message=(
+                                f"gateway /health OK 이지만 ready 실패 ({ready.code})."
+                            ),
+                            action="API 키 정합 후 gateway를 재기동하세요.",
+                            detail=ready.detail,
+                            log_dir=str(_gateway_log_dir()),
+                            stdout_log=str(_LAST_LOG_PATHS[0]) if _LAST_LOG_PATHS else "",
+                            stderr_log=str(_LAST_LOG_PATHS[1]) if _LAST_LOG_PATHS else "",
+                            health={
+                                "code": health.code,
+                                "url": health.url,
+                                "summary": health.body_summary,
+                            },
+                            port=gateway_port_from_base_url(base_url),
+                            has_api_key=bool(key),
+                            api_server_enabled=load_hermes_dotenv().get(
+                                "API_SERVER_ENABLED", ""
+                            ),
+                            models_ok=False,
+                            ready_detail=ready.detail,
+                        )
+                    )
+                    return False
+                if on_progress:
+                    on_progress(f"ready 대기… ({ready.code})")
+            elif on_progress:
+                on_progress(f"health 대기… ({health.code})")
+            time.sleep(delay)
+            delay = min(2.0, delay * 1.35)
+
+        if not grace_used and _child_exit_code() is None:
+            out_tail = _tail_log(_LAST_LOG_PATHS[0] if _LAST_LOG_PATHS else None)
+            err_tail = _tail_log(_LAST_LOG_PATHS[1] if _LAST_LOG_PATHS else None)
+            blob = f"{out_tail}\n{err_tail}"
+            if any(
+                token in blob
+                for token in ("Gateway Starting", "dependency lock", "continuing without it")
+            ):
+                grace_used = True
+                deadline = time.monotonic() + 30.0
+                if on_progress:
+                    on_progress("gateway 프로세스는 살아 있음 — 잠금 이후 30초 더 대기")
+                continue
+        break
 
     # timeout — 재시작 전 원인 스냅샷
     if last_health and last_health.ok and last_ready and not last_ready.ok:
@@ -1260,6 +1392,8 @@ def _wait_until_healthy(
             port=gateway_port_from_base_url(base_url),
             has_api_key=bool(key),
             api_server_enabled=load_hermes_dotenv().get("API_SERVER_ENABLED", ""),
+            command=list(_LAST_CMD),
+            exit_code=_child_exit_code(),
         )
     )
     return False
@@ -1379,14 +1513,7 @@ def ensure_hermes_gateway_running(
 
     # G5/G9: 실행 경로·env 사전 점검
     if _build_gateway_cmd(command) is None:
-        _set_diagnosis(
-            GatewayDiagnosis(
-                code=CODE_EXE_MISSING,
-                message="Hermes 실행 파일/venv python을 찾지 못했습니다.",
-                action="Hermes 설치 단계를 다시 실행하세요.",
-            )
-        )
-        return False
+        return start_hermes_gateway(command)
     env = _gateway_child_env()
     if env.get("API_SERVER_ENABLED", "").lower() in ("0", "false", "no"):
         _set_diagnosis(
@@ -1447,6 +1574,10 @@ def restart_hermes_gateway(
     def _aborted() -> bool:
         return bool(should_abort and should_abort())
 
+    # exe가 없으면 stop이 떠 있는 gateway만 죽이고 재기동은 실패한다.
+    if _build_gateway_cmd(command) is None:
+        return start_hermes_gateway(command)
+
     # 재시작 전 스냅샷
     pre = probe_gateway_health(base_url, timeout_sec=1.5)
     _note("기존 gateway 중지…")
@@ -1478,6 +1609,7 @@ def restart_hermes_gateway(
 
     _note("gateway 재기동…")
     if not start_hermes_gateway(command):
+        hermes_runtime_report(command=command)
         return False
 
     ok = _wait_until_healthy(
@@ -1488,26 +1620,40 @@ def restart_hermes_gateway(
         require_ready=True,
         api_key=key,
     )
+    report = hermes_runtime_report(command=command)
     if not ok and _LAST_DIAGNOSIS is not None:
-        # 이전 health 정보를 detail에 보강
         d = _LAST_DIAGNOSIS
         d.detail = (
             (d.detail or "")
-            + f"\npre_restart_health={pre.code}:{pre.body_summary}"
+            + f"\npre_restart_health={pre.code}:{pre.body_summary}\n"
+            + report
         )[:2000]
+        if not d.action:
+            d.action = report
         d.has_api_key = bool(key)
         _set_diagnosis(d)
     return ok
 
 
+def _hermes_module_cmd(*args: str) -> list[str] | None:
+    """PM python -m hermes_cli.main. 3.12로 3.14 site-packages를 열면 pydantic_core가 깨진다."""
+    py = _hermes_runtime_python()
+    if py is not None:
+        return [str(py), "-m", "hermes_cli.main", *args]
+    exe = hermes_executable()
+    if not exe:
+        return None
+    return [exe, *args]
+
+
 def verify_iris_mcp_tools(*, command: str = "hermes", timeout_sec: float = 45.0) -> tuple[bool, str]:
     """게이트웨이 밖에서도 MCP stdio 핸드셰이크가 되는지만 확인 (설정 유지 검증)."""
-    exe = hermes_executable(command)
-    if not exe:
+    cmd = _hermes_module_cmd("mcp", "test", "iris-control")
+    if not cmd:
         return False, "hermes executable missing"
     try:
         proc = subprocess.run(
-            [exe, "mcp", "test", "iris-control"],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1621,10 +1767,10 @@ if __name__ == "__main__":
     os.environ["VIRTUAL_ENV"] = str(Path.cwd() / ".venv-fake-iris")
     os.environ["PYTHONPATH"] = str(Path.cwd())
     cleaned = _gateway_child_env()
-    venv_py = _hermes_venv_python()
+    venv_py = _hermes_runtime_python()
     assert "PYTHONPATH" not in cleaned
     if venv_py is not None:
-        assert cleaned.get("VIRTUAL_ENV") == str(_hermes_venv_dir())
+        assert cleaned.get("VIRTUAL_ENV") == str(venv_py.parent.parent)
         cmd = _windows_hidden_cmd(hermes_executable("hermes") or "hermes")
         assert cmd[:3] == [str(venv_py), "-m", "hermes_cli.main"]
     else:
@@ -1636,6 +1782,9 @@ if __name__ == "__main__":
     assert parse_health_payload({"status": "healthy"})[0]
     assert not parse_health_payload({"status": "down"})[0]
     exe = hermes_executable("hermes")
+    report = hermes_runtime_report(command="hermes")
+    assert "[Hermes] command=" in report
+    assert "[Hermes] return_code=" in report
     print(
         "hermes_gateway ok - exe:",
         exe,

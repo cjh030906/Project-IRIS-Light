@@ -51,6 +51,7 @@ When the user asks to open IDE / start coding / Companion / "ide 켜줘" / open 
 14. Calendar / 일정: `workspace.open_calendar`, then `calendar.add_event` / `calendar.list_events` / `calendar.select_day` / `calendar.delete_event` (skill iris-calendar).
 
 15. Wiki / 위키에 저장: Iris may handle locally (file chip + save intent). Else PDF·URL·파일 → `wiki.import_content` (`source`, `mode=raw|summarize`); manual → `wiki.write_user_note`; never claim saved without ok (skill iris-wiki). 여러 페이지·사이트 전체는 `wiki.import_pages` (`source` 또는 `sources`, `discover=true`). 페이지마다 `import_content` 를 반복하지 말 것. 저장 성공은 반환의 saved 건수로만 말한다.
+15b. "PDF로 저장/만들어 줘" (위키 아님): Iris handles it locally. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process.
 
 16. Email / 메일: `workspace.open_email`, then `email.list_messages` (today=true or since=YYYY-MM-DD) / `email.read_message` / `email.open_compose` / `email.send` (skill iris-email). Never invent inbox contents.
 

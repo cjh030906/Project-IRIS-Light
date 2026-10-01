@@ -117,7 +117,7 @@ def _replace_unnecessary_paths(text: str) -> str:
     path_re = re.compile(
         rf"(?<![A-Za-z0-9_./:\\-])(?<!://)"
         rf"("
-        rf"[A-Za-z]:[\\/][A-Za-z0-9_.\-\\/:]+"
+        rf"[A-Za-z]:[\\/][^\\/:*?\"<>|\r\n]+(?:[\\/][^\\/:*?\"<>|\r\n]+)*"
         rf"|\\\\[A-Za-z0-9_.\-\\/:]+"
         rf"|/(?:Users|home|var|tmp|opt|usr)/[A-Za-z0-9_.\-\\/:]+"
         rf"|(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.{_FILE_EXT}{line}"
@@ -139,7 +139,7 @@ def _replace_unnecessary_paths(text: str) -> str:
 def _has_file_ext(path: str) -> bool:
     from iris.ui.chat.chat_renderer import _FILE_EXT
 
-    name = _basename(path).split(":", 1)[0]
+    name = _basename(path)
     return bool(re.search(rf"\.{_FILE_EXT}\Z", name, re.IGNORECASE))
 
 
@@ -147,6 +147,9 @@ def _basename(path: str) -> str:
     name = path.replace("\\", "/").rstrip("/").split("/")[-1]
     if name in ("", ".", ".."):
         return ""
+    head, sep, tail = name.rpartition(":")
+    if sep and tail.isdigit() and head:
+        name = head
     return name
 
 

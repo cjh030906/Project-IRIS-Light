@@ -22,7 +22,13 @@ def main() -> None:
         note.write_text("# Demo\n\nHello wiki import.", encoding="utf-8")
         out = extract_from_source(str(note))
         assert out["kind"] == "text"
+        assert out["title"] == "Demo"
         assert "Hello wiki import" in str(out["text"])
+
+        named = root / "network_security.txt"
+        named.write_text("body", encoding="utf-8")
+        named_out = extract_from_source(str(named))
+        assert named_out["title"] == "network_security.txt", named_out["title"]
 
         path, rel = wiki.write_inbox_note(
             str(out["title"]),

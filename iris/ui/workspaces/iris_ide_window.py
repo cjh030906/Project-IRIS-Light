@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import quote
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -254,6 +254,19 @@ class IrisIdeWindow(QMainWindow):
         else:
             enable_windows_snap_caption(self)
         refresh_snap_button_rect(self)
+        QTimer.singleShot(0, self._arm_explorer_drop)
+
+    def _on_explorer_file_drag(self, phase: str, paths: list[str]) -> None:
+        if phase == "drop" and paths:
+            self.files_dropped.emit([str(p) for p in paths if str(p).strip()])
+
+    def _arm_explorer_drop(self) -> None:
+        try:
+            from iris.ui.window.win_ole_drop import ensure_explorer_drop_targets
+
+            ensure_explorer_drop_targets(int(self.winId()), self, target="ide")
+        except Exception:
+            return
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -309,6 +322,8 @@ class IrisIdeWindow(QMainWindow):
 
     def _on_theia_load_finished(self, ok: bool) -> None:
         self.theia_load_finished.emit(ok)
+        QTimer.singleShot(0, self._arm_explorer_drop)
+        QTimer.singleShot(500, self._arm_explorer_drop)
         if ok and self._defer_show:
             self._defer_show = False
             self.show()

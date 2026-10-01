@@ -2763,8 +2763,8 @@ class SettingsDialog(QDialog):
         else:
             QMessageBox.warning(
                 self,
-                "Iris Control 동기화",
-                "일부 실패:\n" + text[:500],
+                "Iris Control 동기화 실패",
+                text[:1800],
             )
 
     def _reload_account_list(self) -> None:

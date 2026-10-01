@@ -80,7 +80,15 @@ class HermesHealthWorker(QThread):
                             )
                             ok = False
                     else:
-                        self.notice.emit("Hermes gateway 재기동 실패")
+                        from iris.system.hermes_gateway import (
+                            get_last_gateway_diagnosis,
+                            hermes_runtime_report,
+                        )
+
+                        report = hermes_runtime_report(command=self._command)
+                        diag = get_last_gateway_diagnosis()
+                        why = diag.user_message() if diag is not None else report
+                        self.notice.emit(why[:800])
                     self.finished_ok.emit(ok)
                     return
 
@@ -114,6 +122,15 @@ class HermesHealthWorker(QThread):
                             else f"MCP 재검증 실패: {mcp_detail2}"
                         )
                         ok = mcp_ok2
+                    else:
+                        from iris.system.hermes_gateway import (
+                            get_last_gateway_diagnosis,
+                            hermes_runtime_report,
+                        )
+
+                        report = hermes_runtime_report(command=self._command)
+                        diag = get_last_gateway_diagnosis()
+                        self.notice.emit((diag.user_message() if diag is not None else report)[:800])
                     self.finished_ok.emit(ok)
                     return
             except Exception as sync_exc:  # noqa: BLE001
@@ -177,7 +194,11 @@ class HermesControlSyncWorker(QThread):
             self.progress.emit("상태: MCP/스킬 동기화 중…")
             report = sync_iris_control(reconnect_gateway=True)
             lines.append(report.summary_line())
-            lines.extend(report.messages[:6])
+            shown = list(report.messages[:8])
+            for msg in report.messages:
+                if "missing" in msg and msg not in shown:
+                    shown.append(msg)
+            lines.extend(shown)
             for s in report.mcp_servers[:8]:
                 mark = "OK" if s.get("ok") else "FAIL"
                 if not s.get("enabled", True):
@@ -194,7 +215,17 @@ class HermesControlSyncWorker(QThread):
                 wait_sec=60.0,
             )
             if not ok:
-                lines.append("gateway 재기동 실패")
+                from iris.system.hermes_gateway import (
+                    get_last_gateway_diagnosis,
+                    hermes_runtime_report,
+                )
+
+                runtime = hermes_runtime_report(command=self._command)
+                diag = get_last_gateway_diagnosis()
+                why = diag.user_message() if diag is not None else runtime
+                lines.insert(0, why)
+                if diag is not None and runtime not in why:
+                    lines.insert(1, runtime)
                 self.finished_ok.emit(False, "\n".join(lines))
                 return
 

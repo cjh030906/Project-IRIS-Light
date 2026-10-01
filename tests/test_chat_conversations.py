@@ -6,28 +6,31 @@ import tempfile
 from pathlib import Path
 from unittest import TestCase
 
+from iris.runtime.chat_session import ChatSession, workspace_needs_fresh_chat
 from iris.storage.conversations import (
     DEFAULT_TITLE,
+    TITLE_BASIS_FIRST,
     active_conversation_id,
-        append_message,
-        clear_conversation_messages,
-        create_conversation,
-        delete_conversation,
-        ensure_active_conversation,
-        get_conversation,
-        history_dicts,
-        list_conversations,
-        load_title_basis,
-        pop_last_user_message,
-        refresh_conversation_title,
-        rename_conversation,
-        save_title_basis,
-        set_active_conversation_id,
-        start_new_conversation,
-        summarize_reply,
-        title_from_text,
-        TITLE_BASIS_FIRST,
-    )
+    append_message,
+    clear_conversation_messages,
+    create_conversation,
+    delete_conversation,
+    ensure_active_conversation,
+    get_conversation,
+    history_dicts,
+    list_conversations,
+    load_title_basis,
+    pop_last_user_message,
+    refresh_conversation_title,
+    rename_conversation,
+    save_title_basis,
+    set_active_conversation_id,
+    start_new_conversation,
+    suggest_title,
+    summarize_reply,
+    summarize_work_title,
+    title_from_text,
+)
 from iris.storage.database import Database
 
 
@@ -67,6 +70,25 @@ class ChatConversationTests(TestCase):
             [{"role": "user", "content": "둘째 세션 질문"}],
         )
 
+    def test_title_stays_blank_until_reply_then_summarizes(self) -> None:
+        conv = create_conversation(self.db)
+        self.assertEqual(conv.title, DEFAULT_TITLE)
+        question = "PDF 저장하면 프로그램이 꺼지는 문제가 있는데 원인 확인하고 수정해줘"
+        append_message(self.db, conv.id, "user", question)
+        waiting = get_conversation(self.db, conv.id)
+        assert waiting is not None
+        self.assertEqual(waiting.title, DEFAULT_TITLE)
+        append_message(self.db, conv.id, "assistant", "저장 직후 종료 경로를 고쳤습니다.")
+        reloaded = get_conversation(self.db, conv.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.title, "PDF 저장 종료 오류 수정")
+        self.assertNotIn(question, reloaded.title)
+        self.assertFalse(reloaded.title_locked)
+        append_message(self.db, conv.id, "user", "그럼 그 부분 더 자세히")
+        kept = get_conversation(self.db, conv.id)
+        assert kept is not None
+        self.assertEqual(kept.title, "PDF 저장 종료 오류 수정")
+
     def test_user_text_does_not_become_title(self) -> None:
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 구조 알려줘")
@@ -74,18 +96,7 @@ class ChatConversationTests(TestCase):
         assert reloaded is not None
         self.assertEqual(reloaded.title, DEFAULT_TITLE)
 
-    def test_last_reply_becomes_title(self) -> None:
-        conv = create_conversation(self.db)
-        append_message(self.db, conv.id, "user", "IRIS 구조 알려줘")
-        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다. 자세한 트리는 아래와 같습니다.")
-        append_message(self.db, conv.id, "user", "그다음 질문")
-        append_message(self.db, conv.id, "assistant", "패키지는 iris 폴더에 있습니다.")
-        reloaded = get_conversation(self.db, conv.id)
-        assert reloaded is not None
-        self.assertEqual(reloaded.title, "패키지는 iris 폴더에 있습니다.")
-        self.assertFalse(reloaded.title_locked)
-
-    def test_first_reply_title_stays_when_basis_is_first(self) -> None:
+    def test_first_basis_keeps_first_topic(self) -> None:
         save_title_basis(self.db, TITLE_BASIS_FIRST)
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
@@ -94,42 +105,113 @@ class ChatConversationTests(TestCase):
         append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
-        self.assertEqual(reloaded.title, "ui와 system으로 나뉩니다.")
+        self.assertEqual(reloaded.title, "IRIS 구조")
+
+    def test_topic_shift_updates_title(self) -> None:
+        conv = create_conversation(self.db)
+        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
+        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
+        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
+        append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
+        reloaded = get_conversation(self.db, conv.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.title, "내일 부산 여행 일정")
+        self.assertFalse(reloaded.title_locked)
 
     def test_first_basis_skips_reply_before_user(self) -> None:
         save_title_basis(self.db, TITLE_BASIS_FIRST)
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "assistant", "무엇을 도와드릴까요?")
-        append_message(self.db, conv.id, "user", "창 구조 알려줘")
+        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
         append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
-        self.assertEqual(reloaded.title, "ui와 system으로 나뉩니다.")
+        self.assertEqual(reloaded.title, "IRIS 구조")
 
     def test_switching_basis_retitles_unlocked_chat(self) -> None:
         conv = create_conversation(self.db)
-        append_message(self.db, conv.id, "user", "질문")
+        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
         append_message(self.db, conv.id, "assistant", "첫 답변입니다.")
+        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
         append_message(self.db, conv.id, "assistant", "마지막 답변입니다.")
-        self.assertEqual(get_conversation(self.db, conv.id).title, "마지막 답변입니다.")
+        self.assertEqual(get_conversation(self.db, conv.id).title, "내일 부산 여행 일정")
         save_title_basis(self.db, TITLE_BASIS_FIRST)
         refresh_conversation_title(self.db, conv.id)
-        self.assertEqual(get_conversation(self.db, conv.id).title, "첫 답변입니다.")
+        self.assertEqual(get_conversation(self.db, conv.id).title, "IRIS 구조")
         self.assertEqual(load_title_basis(self.db), TITLE_BASIS_FIRST)
 
     def test_summarize_reply_skips_code_fence(self) -> None:
         title = summarize_reply("```python\nprint(1)\n```\n설치가 끝났습니다. 이어서 실행하세요.")
         self.assertEqual(title, "설치가 끝났습니다.")
 
+    def test_summaries_are_short_work_titles(self) -> None:
+        cases = {
+            "PDF 저장하면 프로그램이 꺼지는 문제가 있는데 원인 확인하고 수정해줘": "PDF 저장 종료 오류 수정",
+            "GitHub 링크를 입력하면 MCP 연결 가능한지 확인하고 없으면 구현해줘": "GitHub MCP 자동 연결 구현",
+            "Wiki 검색창에서 선택한 노드를 확대해서 보여주고 싶어": "Wiki 검색 및 노드 확대 기능",
+        }
+        for question, title in cases.items():
+            self.assertEqual(summarize_work_title(question), title)
+            self.assertEqual(suggest_title([{"role": "user", "content": question}]), title)
+            self.assertLessEqual(len(title), 25)
+            self.assertNotEqual(title, question)
+
     def test_manual_title_is_not_auto_updated(self) -> None:
         conv = create_conversation(self.db)
-        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
-        rename_conversation(self.db, conv.id, "내 채팅")
-        append_message(self.db, conv.id, "assistant", "이 답변으로 제목이 바뀌면 안 됩니다.")
+        append_message(self.db, conv.id, "user", "PDF 저장하면 프로그램이 꺼지는 문제가 있는데 원인 확인하고 수정해줘")
+        append_message(self.db, conv.id, "assistant", "고쳤습니다.")
+        rename_conversation(self.db, conv.id, "PDF Export Crash")
+        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
+        append_message(self.db, conv.id, "assistant", "일정을 정리했습니다.")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
-        self.assertEqual(reloaded.title, "내 채팅")
+        self.assertEqual(reloaded.title, "PDF Export Crash")
         self.assertTrue(reloaded.title_locked)
+
+    def test_launch_chat_keeps_old_history(self) -> None:
+        session = ChatSession(self.db)
+        session.record("user", "예전 질문")
+        session.record("assistant", "예전 답")
+        old_id = session.conversation_id
+        fresh = session.open_launch_chat()
+        self.assertNotEqual(fresh, old_id)
+        self.assertEqual(session.history, [])
+        self.assertEqual(
+            history_dicts(self.db, old_id),
+            [
+                {"role": "user", "content": "예전 질문"},
+                {"role": "assistant", "content": "예전 답"},
+            ],
+        )
+        self.assertIn(old_id, [item.id for item in session.list_items()])
+
+    def test_workspace_change_asks_for_fresh_chat(self) -> None:
+        self.assertTrue(
+            workspace_needs_fresh_chat(
+                prev_active=False, prev_root="", mode="welcome", root=""
+            )
+        )
+        self.assertTrue(
+            workspace_needs_fresh_chat(
+                prev_active=True, prev_root="", mode="workspace", root="C:/proj-a"
+            )
+        )
+        self.assertTrue(
+            workspace_needs_fresh_chat(
+                prev_active=True,
+                prev_root="C:/proj-a",
+                mode="workspace",
+                root="C:/proj-b",
+            )
+        )
+        self.assertFalse(
+            workspace_needs_fresh_chat(
+                prev_active=True,
+                prev_root="C:/proj-a",
+                mode="workspace",
+                root="C:/proj-a",
+            )
+        )
 
     def test_title_from_text_truncates_long_input(self) -> None:
         title = title_from_text("가" * 100)

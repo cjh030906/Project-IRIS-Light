@@ -115,7 +115,10 @@ class ChatHistoryPanel(QWidget):
         if self._editing_id:
             self._pending = packed
             return
+        if getattr(self, "_painted", False) and packed == (self._items, self._active_id):
+            return
         self._items, self._active_id = packed
+        self._painted = True
         self._rebuild()
 
     def _rebuild(self) -> None:

@@ -47,6 +47,7 @@ class WikiSaveRequest:
     title: str | None = None
     rel_path: str | None = None
     from_attachment: bool = False
+    content: str = ""
 
 
 def _norm(text: str) -> str:
@@ -121,11 +122,33 @@ def extract_source_candidates(
 def parse_wiki_save_request(
     text: str,
     attachments: list[str] | tuple[str, ...] = (),
+    history: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
 ) -> WikiSaveRequest | None:
     if not is_wiki_save_intent(text, attachments):
         return None
     candidates = extract_source_candidates(text, attachments)
     if not candidates:
+        # Only intercept an explicit reference to an existing answer. Requests to
+        # research something new must still reach the agent and its search tools.
+        reference = re.fullmatch(
+            r"(?:방금\s*|지금\s*|아까\s*)?"
+            r"(?:찾은\s*(?:정보|내용)|검색한\s*(?:정보|내용)|검색\s*결과|"
+            r"이\s*(?:내용|정보|답변)|위\s*(?:내용|정보|답변)|방금\s*답변|직전\s*답변)"
+            r"(?:을|를)?\s*(?:위키|wiki|옵시디언)(?:에)?\s*"
+            r"(?:저장|기록|보관)(?:해\s*줘|해\s*주세요|해|해주세요)?[.!?\s]*",
+            text.strip(), re.IGNORECASE,
+        )
+        if reference and not attachments:
+            for message in reversed(history):
+                if message.get("role") != "assistant":
+                    continue
+                content = message.get("content", "").strip()
+                if not content or content.startswith(
+                    ("위키에 저장했습니다", "위키 저장 실패:", "저장되었습니다")
+                ):
+                    return None
+                title = content.splitlines()[0].lstrip("# ")[:80] or "검색 결과"
+                return WikiSaveRequest(source="", mode="raw", title=title, content=content)
         return None
     source = candidates[0]
     mode = "summarize" if wants_summarize(text) else "raw"

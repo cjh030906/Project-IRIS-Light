@@ -50,15 +50,15 @@ def _check_history_panel(app: QApplication, db: Database) -> None:
 
     buttons = panel.findChildren(QPushButton)
     titles = {b.toolTip() for b in buttons}
-    assert "ui와 system으로 나뉩니다." in titles, titles
-    assert "채팅 목록을 왼쪽 패널에 붙였습니다." in titles, titles
+    assert "IRIS 구조" in titles, titles
+    assert "채팅 기능 추가" in titles, titles
     assert "새 채팅" in titles, "새 채팅(+) 버튼이 없다"
     assert "제목 수정" in titles, "제목 수정 버튼이 없다"
 
     for b in buttons:
-        if b.toolTip() == "ui와 system으로 나뉩니다.":
+        if b.toolTip() == "IRIS 구조":
             b.click()
-        elif b.toolTip() == "대화 삭제: 채팅 목록을 왼쪽 패널에 붙였습니다.":
+        elif b.toolTip() == "대화 삭제: 채팅 기능 추가":
             b.click()
         elif b.toolTip() == "새 채팅":
             b.click()

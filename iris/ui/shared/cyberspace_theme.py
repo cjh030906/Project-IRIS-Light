@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from PyQt6.QtCore import QEvent, QObject
 from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from iris.ui.shared.theme_tokens import TOKENS
 
@@ -39,7 +40,12 @@ def build_cyberspace_qss() -> str:
             border: none;
         }}
         QDialog, QMessageBox {{
-            background-color: {t.void_black};
+            background-color: {t.space_deep};
+            color: {t.text_primary};
+        }}
+        QMessageBox QLabel {{
+            background-color: transparent;
+            color: {t.text_primary};
         }}
         QWidget#FramelessShell {{
             background-color: {t.void_black};
@@ -503,6 +509,60 @@ def build_cyberspace_qss() -> str:
     """
 
 
+def message_box_qss() -> str:
+    """QMessageBox 자체 시트. 부모 QLabel color보다 우선한다."""
+    t = TOKENS
+    return f"""
+        QMessageBox {{
+            background-color: {t.space_deep};
+            color: {t.text_primary};
+        }}
+        QLabel {{
+            background-color: transparent;
+            color: {t.text_primary};
+        }}
+        QPushButton {{
+            background-color: {t.accent_primary};
+            color: {t.text_primary};
+            border: 1px solid {t.border_color};
+            border-radius: 4px;
+            padding: 6px 14px;
+            min-width: 72px;
+        }}
+    """
+
+
+class _MessageBoxContrast(QObject):
+    """부모 QSS의 밝은 QLabel color가 네이티브 흰 메시지 박스에 묻지 않게."""
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() != QEvent.Type.Show or not isinstance(watched, QMessageBox):
+            return False
+        if watched.property("_iris_mb_contrast"):
+            return False
+        watched.setProperty("_iris_mb_contrast", True)
+        watched.setStyleSheet(message_box_qss())
+        bg = QColor(TOKENS.space_deep)
+        fg = QColor(TOKENS.text_primary)
+        pal = watched.palette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, fg)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        pal.setColor(QPalette.ColorRole.ButtonText, fg)
+        watched.setPalette(pal)
+        watched.setAutoFillBackground(True)
+        return False
+
+
+def install_message_box_contrast(app: QApplication | None = None) -> None:
+    app = app or QApplication.instance()
+    if app is None or getattr(app, "_iris_mb_contrast_filter", None) is not None:
+        return
+    filt = _MessageBoxContrast(app)
+    app.installEventFilter(filt)
+    app._iris_mb_contrast_filter = filt  # type: ignore[attr-defined]
+
+
 def apply_cyberspace_theme(widget: QWidget) -> None:
     """팔레트 + QSS 적용."""
     t = TOKENS
@@ -515,3 +575,12 @@ def apply_cyberspace_theme(widget: QWidget) -> None:
     pal.setColor(QPalette.ColorRole.ButtonText, QColor(t.text_primary))
     widget.setPalette(pal)
     widget.setStyleSheet(build_cyberspace_qss())
+    install_message_box_contrast()
+
+
+if __name__ == "__main__":
+    sheet = message_box_qss()
+    assert "QMessageBox" in sheet and "QLabel" in sheet
+    assert TOKENS.space_deep in sheet and TOKENS.text_primary in sheet
+    assert "QMessageBox QLabel" in build_cyberspace_qss()
+    print("cyberspace_theme ok")

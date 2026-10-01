@@ -380,7 +380,7 @@ def _style_chat_html(html_body: str) -> str:
     )
     out = re.sub(r"</h[1-6]>", "</span>", out)
     out = re.sub(
-        r'<a(?![^>]*\bstyle=)(?=[^>]*href="(?!iris-))',
+        r'<a(?![^>]*\bstyle=)(?=[^>]*href="(?!iris-(?!wiki://)))',
         '<a style="color:#60a5fa;" ',
         out,
     )

@@ -12,6 +12,7 @@ from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QDragEnterEvent,
     QDropEvent,
     QGuiApplication,
@@ -30,6 +31,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QLabel,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -147,14 +149,18 @@ def _save_clipboard_image(image: QImage) -> str | None:
 
 
 def _looks_like_path_line(text: str) -> bool:
+    """절대경로이고 디스크에 있을 때만. text/plain 문장은 파일이 아니다."""
     t = (text or "").strip().strip('"').strip("'")
     if not t or t.startswith("@"):
         return False
-    if "/" in t or "\\" in t:
-        return True
-    if len(t) >= 2 and t[1] == ":" and t[0].isalpha():
-        return True
-    return "." in t and not t.startswith(".")
+    windows = len(t) >= 3 and t[0].isalpha() and t[1] == ":" and t[2] in "\\/"
+    unc = t.startswith("\\\\") or t.startswith("//")
+    if not windows and not unc:
+        return False
+    try:
+        return Path(t).exists()
+    except OSError:
+        return False
 
 
 def _paths_from_mime(mime) -> list[str]:
@@ -257,21 +263,125 @@ def _paths_from_clipboard() -> list[str]:
 def _mime_has_attachable(mime) -> bool:
     if mime is None:
         return False
-    if mime.hasUrls():
-        return any(u.isLocalFile() for u in mime.urls())
+    formats: list[str] = []
+    try:
+        formats = [str(f) for f in mime.formats()]
+    except Exception:
+        formats = []
+    low = [f.lower() for f in formats]
+    explorer = any(
+        "filename" in f or "cf_hdrop" in f or "shell idlist" in f or f == "text/uri-list"
+        for f in low
+    )
+    if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
+        return True
+    if explorer or "text/x-iris-ref" in low:
+        return True
+    # 페이지 드래그(html·chromium taint)는 파일로 보지 않는다.
+    if any("chromium" in f or f == "text/html" for f in low):
+        return False
     if mime.hasImage():
         return True
-    # Windows Explorer: DragEnter 시점에 urls()가 비고 CF_HDROP/uri-list만 있는 경우
     try:
-        for fmt in mime.formats():
-            f = str(fmt)
-            if f in ("text/uri-list", "text/x-iris-ref"):
-                return True
-            if "FileName" in f or "CF_HDROP" in f or "text/uri-list" in f:
-                return True
+        text = (mime.text() or "").strip() if mime.hasText() else ""
     except Exception:
-        pass
-    return bool(_drop_targets_from_mime(mime))
+        text = ""
+    return text.startswith("@") or text.startswith("file:")
+
+
+def _bubble_file_drag(widget: QWidget, active: bool) -> None:
+    w: QWidget | None = widget
+    while w is not None:
+        note = getattr(w, "note_file_drag", None)
+        if callable(note):
+            note(active)
+            return
+        w = w.parentWidget()
+
+
+def _forward_viewport_drag(widget: QWidget, watched: object, event: QEvent) -> bool | None:
+    """QTextEdit/QPlainTextEdit 드롭은 viewport가 받는다. 위젯 핸들러로 넘긴다."""
+    vp = widget.viewport() if hasattr(widget, "viewport") else None
+    if vp is None or watched is not vp:
+        return None
+    et = event.type()
+    if et == QEvent.Type.DragEnter:
+        widget.dragEnterEvent(event)  # type: ignore[attr-defined]
+        return bool(event.isAccepted())
+    if et == QEvent.Type.DragMove:
+        widget.dragMoveEvent(event)  # type: ignore[attr-defined]
+        return bool(event.isAccepted())
+    if et == QEvent.Type.DragLeave:
+        widget.dragLeaveEvent(event)  # type: ignore[attr-defined]
+        return False
+    if et == QEvent.Type.Drop:
+        widget.dropEvent(event)  # type: ignore[attr-defined]
+        return bool(event.isAccepted())
+    return None
+
+
+class _ChatDropHint(QWidget):
+    """채팅 위 드롭 안내. 자식이라 OLE 창은 아니고, 마우스는 통과시킨다."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("ChatDropHint")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet(
+            """
+            QWidget#ChatDropHint { background: rgba(186, 214, 255, 0.10); border: none; }
+            QLabel#ChatDropHintLabel {
+                color: #e8eef7;
+                font-size: 13px;
+                background: transparent;
+                border: none;
+            }
+            """
+        )
+        lay = QVBoxLayout(self)
+        label = QLabel("파일을 여기에 놓아주세요")
+        label.setObjectName("ChatDropHintLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        label.setAcceptDrops(False)
+        lay.addWidget(label)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if _mime_has_attachable(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if _mime_has_attachable(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        parent = self.parentWidget()
+        note = getattr(parent, "note_file_drag", None)
+        if callable(note):
+            note(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        parent = self.parentWidget()
+        paths = _drop_targets_from_mime(event.mimeData())
+        note = getattr(parent, "note_file_drag", None)
+        if callable(note):
+            note(False)
+        attach = getattr(parent, "_on_composer_drop_paths", None)
+        if paths and callable(attach):
+            attach(paths)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
 
 
 class ChatComposerInput(QPlainTextEdit):
@@ -287,6 +397,8 @@ class ChatComposerInput(QPlainTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.viewport().installEventFilter(self)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
@@ -434,17 +546,30 @@ class ChatComposerInput(QPlainTextEdit):
         event.accept()
         return True
 
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+        forwarded = _forward_viewport_drag(self, watched, event)
+        if forwarded is not None:
+            return forwarded
+        return super().eventFilter(watched, event)
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._accept_copy_drag(event):
+            _bubble_file_drag(self, True)
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
         if self._accept_copy_drag(event):
+            _bubble_file_drag(self, True)
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        _bubble_file_drag(self, False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        _bubble_file_drag(self, False)
         mime = event.mimeData()
         paths = _drop_targets_from_mime(mime)
         if not paths and mime is not None and mime.hasImage():
@@ -470,13 +595,22 @@ class ChatLogTextEdit(QTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.viewport().installEventFilter(self)
         self._tool_blocks: dict[str, ToolShellBlock] = {}
         attach_image_loader(self)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+        forwarded = _forward_viewport_drag(self, watched, event)
+        if forwarded is not None:
+            return forwarded
+        return super().eventFilter(watched, event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragEnterEvent(event)
 
@@ -484,10 +618,16 @@ class ChatLogTextEdit(QTextEdit):
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        _bubble_file_drag(self, False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        _bubble_file_drag(self, False)
         mime = event.mimeData()
         paths = _drop_targets_from_mime(mime)
         if not paths and mime is not None and mime.hasImage():
@@ -860,6 +1000,7 @@ class _ChatInputBar(QWidget):
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragEnterEvent(event)
 
@@ -867,10 +1008,16 @@ class _ChatInputBar(QWidget):
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        _bubble_file_drag(self, False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        _bubble_file_drag(self, False)
         mime = event.mimeData()
         paths = _drop_targets_from_mime(mime)
         if not paths and mime is not None and mime.hasImage():
@@ -985,6 +1132,13 @@ class _ChatInputArea(QWidget):
         col.setSpacing(0)
 
         self.attachment_strip = ComposerAttachmentStrip()
+        self.attach_notice = QLabel()
+        self.attach_notice.setObjectName("ComposerAttachNotice")
+        self.attach_notice.setWordWrap(True)
+        self.attach_notice.hide()
+        self.attach_notice.setStyleSheet(
+            "color: #f5b4b4; font-size: 11px; background: transparent; border: none; padding: 0 8px 4px 8px;"
+        )
         self.input_bar = _ChatInputBar()
         self.waveform = MicWaveformBar()
         self.waveform.setStyleSheet(
@@ -997,6 +1151,7 @@ class _ChatInputArea(QWidget):
         )
 
         col.addWidget(self.attachment_strip)
+        col.addWidget(self.attach_notice)
         col.addWidget(self.input_bar)
         col.addWidget(self.waveform)
 
@@ -1010,19 +1165,22 @@ class _ChatInputArea(QWidget):
         inp_h = max(self.input_bar.input.height(), self.input_bar.input.sizeHint().height())
         bar_h = inp_h + 8
         strip_h = self.attachment_strip.sizeHint().height() if self.attachment_strip.isVisible() else 0
-        need = bar_h + strip_h + self.waveform.minimumHeight()
+        notice_h = self.attach_notice.sizeHint().height() if self.attach_notice.isVisible() else 0
+        need = bar_h + strip_h + notice_h + self.waveform.minimumHeight()
         if self.height() != need or self.minimumHeight() != need:
             self.setFixedHeight(need)
         self.updateGeometry()
 
     def sizeHint(self) -> QSize:  # noqa: N802
         inp_h = max(self.input_bar.input.height(), self.input_bar.input.sizeHint().height())
-        return QSize(200, inp_h + 8 + self.waveform.minimumHeight())
+        notice_h = self.attach_notice.sizeHint().height() if self.attach_notice.isVisible() else 0
+        return QSize(200, inp_h + 8 + notice_h + self.waveform.minimumHeight())
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragEnterEvent(event)
 
@@ -1030,10 +1188,16 @@ class _ChatInputArea(QWidget):
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            _bubble_file_drag(self, True)
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        _bubble_file_drag(self, False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        _bubble_file_drag(self, False)
         mime = event.mimeData()
         paths = _drop_targets_from_mime(mime)
         if not paths and mime is not None and mime.hasImage():
@@ -1180,11 +1344,47 @@ class ChatPanel(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(self._natural_min_height())
+        self._drop_hint = _ChatDropHint(self)
+        self._drop_hint.hide()
+        self._drop_hint_gen = 0
+
+    def note_file_drag(self, active: bool, *, force: bool = False) -> None:
+        """드래그 중 채팅을 살짝 밝히고, 벗어나거나 놓으면 안내를 끈다."""
+        if active and not force and not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            active = False
+        if active:
+            self._drop_hint_gen += 1
+            self._drop_hint.setGeometry(self.rect())
+            self._drop_hint.raise_()
+            self._drop_hint.show()
+            return
+        gen = self._drop_hint_gen
+        QTimer.singleShot(50, lambda g=gen: self._hide_drop_hint(g))
+
+    def _hide_drop_hint(self, gen: int) -> None:
+        if gen == self._drop_hint_gen:
+            self._drop_hint.hide()
+
+    def show_attach_notice(self, text: str) -> None:
+        label = self._input_area.attach_notice
+        label.setText(text)
+        label.setVisible(bool(text))
+        self._input_area.sync_height_to_contents()
+        if text:
+            QTimer.singleShot(4500, lambda t=text: self._clear_attach_notice(t))
+
+    def _clear_attach_notice(self, expected: str) -> None:
+        label = self._input_area.attach_notice
+        if label.text() == expected:
+            label.clear()
+            label.hide()
+            self._input_area.sync_height_to_contents()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            self.note_file_drag(True, force=True)
             return
         super().dragEnterEvent(event)
 
@@ -1192,10 +1392,16 @@ class ChatPanel(QWidget):
         if _mime_has_attachable(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            self.note_file_drag(True, force=True)
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self.note_file_drag(False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        self.note_file_drag(False)
         mime = event.mimeData()
         paths = _drop_targets_from_mime(mime)
         if not paths and mime is not None and mime.hasImage():
@@ -1249,9 +1455,23 @@ class ChatPanel(QWidget):
         return f"@{path.as_posix()}"
 
     def _on_composer_drop_paths(self, paths: list[str]) -> None:
-        """탭/익스플로러 드롭 — Cursor식 파일·폴더 칩(이름+아이콘)."""
-        clean = [str(p).strip() for p in paths if str(p).strip()]
+        """파일 선택·드롭 공통 — normalize → validate → 칩. 메시지는 보내지 않는다."""
+        from iris.ui.chat.composer_attachments import attachment_filename, validate_files
+        from iris.ui.window.file_drop import log_drag_line
+
+        clean, errors = validate_files(list(paths or []))
+        log_drag_line(f"normalized_paths={clean}")
+        for item in clean:
+            log_drag_line(f"filename={attachment_filename(item)}")
+        log_drag_line("attach_start")
+        if errors:
+            self.show_attach_notice("\n".join(errors))
+        elif self._input_area.attach_notice.isVisible():
+            self._clear_attach_notice(self._input_area.attach_notice.text())
         if not clean:
+            if errors:
+                log_drag_line("[ERROR] stage=validate")
+                log_drag_line(f"[ERROR] reason={errors[0]}")
             return
         chips: list[str] = []
         for item in clean:
@@ -1266,6 +1486,7 @@ class ChatPanel(QWidget):
             chips.append(ref if ref else item)
         if chips:
             self._input_area.attachment_strip.add_paths(chips)
+            log_drag_line("attach_success")
         self.files_attached.emit(clean)
         self._on_input_changed()
 
@@ -1492,6 +1713,9 @@ class ChatPanel(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        hint = getattr(self, "_drop_hint", None)
+        if hint is not None and hint.isVisible():
+            hint.setGeometry(self.rect())
         if self._extra_h > 0:
             cap = self._max_extra()
             if self._extra_h > cap:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
@@ -23,6 +24,30 @@ _PAD = 44.0
 _HIT_RADIUS = 16.0
 _STAR_COUNT = 2800
 _HUB_PALETTE = (QColor(251, 210, 108), QColor(125, 245, 232), QColor(170, 210, 255))
+_FOCUS_MS = 420
+
+
+def rotate_xyz(x: float, y: float, z: float, angle: float, tilt: float) -> tuple[float, float, float]:
+    ca, sa = math.cos(angle), math.sin(angle)
+    cb, sb = math.cos(tilt), math.sin(tilt)
+    x1 = x * ca + z * sa
+    z1 = -x * sa + z * ca
+    y2 = y * cb - z1 * sb
+    z2 = y * sb + z1 * cb
+    return x1, y2, z2
+
+
+def nearest_angle(current: float, target: float) -> float:
+    delta = (target - current + math.pi) % (2 * math.pi) - math.pi
+    return current + delta
+
+
+def camera_aim(x: float, y: float, z: float) -> tuple[float, float]:
+    """노드 (x,y,z)가 화면 중앙·앞면으로 오게 하는 (yaw, pitch)."""
+    angle = math.atan2(-x, z if abs(z) > 1e-9 else 1e-9)
+    _x1, _y1, z1 = rotate_xyz(x, y, z, angle, 0.0)
+    tilt = math.atan2(y, z1 if abs(z1) > 1e-6 else 1.0)
+    return angle, max(-1.15, min(1.15, tilt))
 
 
 @dataclass
@@ -47,7 +72,7 @@ class WikiGraphView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("WikiGraphView")
-        self.setMinimumSize(360, 320)
+        self.setMinimumSize(280, 240)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._nodes: list[_Node] = []
@@ -66,10 +91,20 @@ class WikiGraphView(QWidget):
         self._drag_moved = False
         self._last_drag_pos = QPointF()
         self._press_idx = -1
+        self._aim: dict | None = None
+        self._focus_hold = False
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
-        self._timer.start()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._timer.stop()
 
     def build(self, wiki: IrisWiki | None) -> None:
         self._nodes = []
@@ -177,14 +212,53 @@ class WikiGraphView(QWidget):
         self._selected_rel = rel_path or ""
         self.update()
 
+    def focus(self, rel_path: str) -> None:
+        """검색 선택 — 해당 노트를 중앙으로 돌리고 확대. 기존 select 상태도 같이 켠다."""
+        self._selected_rel = rel_path or ""
+        node = next((n for n in self._nodes if n.rel == rel_path), None)
+        if node is None:
+            self.update()
+            return
+        x, y, z = self._node_pos(node)
+        angle, tilt = camera_aim(x, y, z)
+        self._aim = {
+            "t0": time.monotonic(),
+            "a0": self._angle,
+            "a1": nearest_angle(self._angle, angle),
+            "b0": self._tilt,
+            "b1": tilt,
+            "z0": self._zoom,
+            "z1": 2.1,
+        }
+        self._focus_hold = True
+        self._spin_x = 0.0
+        self._spin_y = 0.0
+        self.update()
+
     # ---- 좌표 ----
     def _tick(self) -> None:
-        if not self._dragging:
+        if self._aim is not None:
+            self._step_aim()
+        elif not self._dragging and not self._focus_hold:
             self._angle = (self._angle + self._spin_y) % (math.pi * 2)
             self._tilt = max(-1.15, min(1.15, self._tilt + self._spin_x))
             self._spin_x *= 0.94
             self._spin_y = 0.0025 + (self._spin_y - 0.0025) * 0.94
         self.update()
+
+    def _step_aim(self) -> None:
+        aim = self._aim
+        if not aim:
+            return
+        u = min(1.0, (time.monotonic() - aim["t0"]) * 1000 / _FOCUS_MS)
+        s = u * u * (3 - 2 * u)
+        self._angle = aim["a0"] + (aim["a1"] - aim["a0"]) * s
+        self._tilt = aim["b0"] + (aim["b1"] - aim["b0"]) * s
+        self._zoom = aim["z0"] + (aim["z1"] - aim["z0"]) * s
+        if u >= 1.0:
+            self._aim = None
+            self._spin_x = 0.0
+            self._spin_y = 0.0
 
     def _to_px(self, nx: float, ny: float) -> QPointF:
         p, _scale, _alpha, _z = self._project(*self._node_xyz(nx, ny))
@@ -263,15 +337,7 @@ class WikiGraphView(QWidget):
         return x * node.depth, y * node.depth, z * node.depth
 
     def _rotate(self, x: float, y: float, z: float) -> tuple[float, float, float]:
-        ca = math.cos(self._angle)
-        sa = math.sin(self._angle)
-        cb = math.cos(self._tilt)
-        sb = math.sin(self._tilt)
-        x1 = x * ca + z * sa
-        z1 = -x * sa + z * ca
-        y2 = y * cb - z1 * sb
-        z2 = y * sb + z1 * cb
-        return x1, y2, z2
+        return rotate_xyz(x, y, z, self._angle, self._tilt)
 
     def _project(self, x: float, y: float, z: float) -> tuple[QPointF, float, int, float]:
         x, y, z = self._rotate(x, y, z)
@@ -297,6 +363,8 @@ class WikiGraphView(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
             self._drag_moved = False
+            self._focus_hold = False
+            self._aim = None
             self._last_drag_pos = event.position()
             self._press_idx = self._hit_test(event.position())
             self._spin_x = 0.0
@@ -455,6 +523,11 @@ class WikiGraphView(QWidget):
             if selected or hover:
                 self._draw_flare(painter, p, fill, max(9.0, r * 2.6), alpha)
                 self._draw_particle_core(painter, p, fill, r, alpha)
+                if selected and self._focus_hold:
+                    painter.setPen(QPen(QColor(125, 245, 232, 230), 1.6))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(p, max(14.0, r * 3.4), max(14.0, r * 3.4))
+                    painter.setPen(Qt.PenStyle.NoPen)
                 self._draw_label(painter, p, node.label, r)
 
     def _sphere_rect(self) -> QRectF:

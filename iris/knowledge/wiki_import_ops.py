@@ -30,14 +30,65 @@ _SKIP_EXT = {
 }
 
 
+def _slug_base(title: str) -> str:
+    """파일명이면 확장자를 뺀 stem으로 슬러그. 화면 제목(H1)은 원문을 유지한다."""
+    name = Path(str(title).replace("\\", "/")).name
+    if Path(name).suffix:
+        name = Path(name).stem or name
+    return slugify_note_name(name or title)
+
+
 def _unique_inbox_rel(wiki: IrisWiki, title: str) -> str:
-    base = slugify_note_name(title)
+    base = _slug_base(title)
     rel = f"inbox/{base}.md"
     path = wiki.user_root / rel
     if not path.is_file():
         return rel
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"inbox/{base}-{stamp}.md"
+    candidate = f"inbox/{base}-{stamp}.md"
+    counter = 2
+    while (wiki.user_root / candidate).exists():
+        candidate = f"inbox/{base}-{stamp}-{counter}.md"
+        counter += 1
+    return candidate
+
+
+def wiki_location_label(rel_path: str, title: str, *, project: str = "") -> str:
+    """Wiki > 폴더 > 문서. inbox만 있으면 열린 프로젝트 이름을 쓴다."""
+    rel = (rel_path or "").replace("\\", "/").strip("/")
+    for prefix in ("user/", "docs/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+    parent = Path(rel).parent.as_posix() if rel else ""
+    folders = [part for part in parent.split("/") if part and part != "."]
+    if folders == ["inbox"] and (project or "").strip():
+        folders = [(project or "").strip()]
+    name = (title or "").strip() or (Path(rel).stem if rel else "") or "문서"
+    return " > ".join(["Wiki", *folders, name])
+
+
+def wiki_save_notice(result: dict[str, Any], *, project: str = "", href: str = "") -> str:
+    """저장 직후 채팅 문장. href가 있으면 경로를 마크다운 링크로 둔다."""
+    rel = str(result.get("rel_path") or "").replace("\\", "/")
+    title = str(result.get("title") or "").strip()
+    label = wiki_location_label(rel, title, project=project).replace("]", " ")
+    where = f"[{label}]({href})" if href else label
+    trunc = " (본문 일부 잘림)" if result.get("truncated") else ""
+    return f"저장되었습니다{trunc}.\n저장 위치: {where}"
+
+
+def save_answer_to_wiki(wiki: IrisWiki, *, title: str, content: str) -> dict[str, Any]:
+    """Preserve an existing answer, including its Markdown source citations."""
+    if not content.strip():
+        raise ValueError("content required")
+    path, rel = wiki.write_inbox_note(
+        title, content, rel_path=_unique_inbox_rel(wiki, title),
+    )
+    return {
+        "rel_path": f"user/{rel}", "path": str(path), "title": title,
+        "kind": "answer", "mode": "raw", "truncated": False,
+        "chars": len(content),
+    }
 
 
 def prepare_wiki_body(

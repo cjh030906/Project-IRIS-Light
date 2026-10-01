@@ -18,7 +18,12 @@ from PyQt6.QtWidgets import (
 )
 
 from iris.core.markdown_text import extract_chat_image_srcs, parse_iris_image_href
-from iris.ui.chat.chat_blocks import parse_copy_anchor, parse_file_chip_location, parse_iris_file_anchor
+from iris.ui.chat.chat_blocks import (
+    parse_copy_anchor,
+    parse_file_chip_location,
+    parse_iris_file_anchor,
+    parse_iris_wiki_anchor,
+)
 
 _MAX_BYTES = 8 * 1024 * 1024
 _UA = "IrisLight/1.0 (chat-image)"
@@ -294,6 +299,13 @@ def handle_chat_anchor_click(parent: QWidget, anchor: str) -> bool:
     rel_path = parse_iris_file_anchor(anchor)
     if rel_path is not None:
         _open_file_chip_in_ide(parent, rel_path)
+        return True
+    wiki_rel = parse_iris_wiki_anchor(anchor)
+    if wiki_rel is not None:
+        window = _find_main_window(parent)
+        opener = getattr(window, "_open_saved_wiki_note", None) if window else None
+        if callable(opener):
+            opener(wiki_rel)
         return True
     img_src = parse_iris_image_href(anchor)
     if img_src:

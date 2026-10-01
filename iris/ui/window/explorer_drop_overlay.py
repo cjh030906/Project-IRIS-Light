@@ -19,9 +19,11 @@ from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from iris.ui.window.file_drop import log_drop_event, mime_has_attachable, paths_from_mime
 
 _POLL_MS = 16
-_ARMED_OPACITY = 0.06
-_ACTIVE_OPACITY = 0.28
 _VK_LBUTTON = 0x01
+# 불투명 색만 쓴다. setWindowOpacity / rgba는 WS_EX_LAYERED가 되어 OLE 드롭이 죽는다.
+_IDLE_BG = "#121c30"
+_ACTIVE_BG = "#1a2944"
+_HINT_TEXT = "파일을 여기에 놓아주세요"
 
 
 def _lmb_down() -> bool:
@@ -74,15 +76,29 @@ def _drop_guard_paused(host: QWidget) -> bool:
     return False
 
 
+def _widget_global_rect(widget: QWidget | None) -> QRect:
+    if widget is None:
+        return QRect()
+    try:
+        if not widget.isVisible() or widget.width() < 40 or widget.height() < 40:
+            return QRect()
+        return QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+    except RuntimeError:
+        return QRect()
+
+
 def drop_target_global_rect(host: QWidget) -> QRect:
-    """Companion 8:2 — 우측 Iris(채팅)만. 전체 frame은 embedded IDE HWND를 덮는다."""
+    """채팅 패널만. Companion에서는 IDE HWND를 덮지 않는다."""
+    chat = _widget_global_rect(getattr(host, "_chat", None))
+    if not chat.isEmpty():
+        return chat
     if getattr(host, "_iris_ide_unified", False):
         shell = getattr(host, "_unified_shell", None)
         if shell is not None:
-            iris = shell.iris_host()
-            if iris is not None and iris.isVisible() and iris.width() > 0 and iris.height() > 0:
-                top_left = iris.mapToGlobal(QPoint(0, 0))
-                return QRect(top_left, iris.size())
+            iris = _widget_global_rect(shell.iris_host())
+            if not iris.isEmpty():
+                return iris
+        return QRect()
     try:
         return host.frameGeometry()
     except RuntimeError:
@@ -221,25 +237,30 @@ class ExplorerDropOverlay(QWidget):
         super().__init__(host)
         self._host = host
         self._armed = False
+        self._active = False
         self._logged_move = False
         self._windowed = False
+        self._leave_gen = 0
         self.setObjectName("ExplorerDropOverlay")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setAcceptDrops(True)
+        # 생산 경로에서는 숨긴 자식이다. acceptDrops를 켜면 별도 HWND가
+        # 탐색기 CF_HDROP을 메인 창 타깃보다 먼저 가져간다.
+        self.setAcceptDrops(False)
         self.setAutoFillBackground(True)
         pal = self.palette()
-        pal.setColor(self.backgroundRole(), QColor(8, 18, 36))
-        pal.setColor(QPalette.ColorRole.Window, QColor(8, 18, 36))
+        pal.setColor(self.backgroundRole(), QColor(_IDLE_BG))
+        pal.setColor(QPalette.ColorRole.Window, QColor(_IDLE_BG))
         self.setPalette(pal)
-        self.setStyleSheet(
-            "QWidget#ExplorerDropOverlay { background-color: #081224; border: 2px dashed #38bdf8; }"
-            "QLabel#ExplorerDropHint { color: #e8f0fe; font-size: 14px; }"
-        )
         lay = QVBoxLayout(self)
-        hint = QLabel("파일을 놓으면 첨부됩니다")
+        hint = QLabel(_HINT_TEXT)
         hint.setObjectName("ExplorerDropHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 자식이 드롭을 받으면 QLabel 기본 ignore()가 탐색기 드롭을 거절한다.
+        hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hint.setAcceptDrops(False)
         lay.addWidget(hint)
+        self._hint = hint
+        self._apply_chrome(False)
         self.hide()
 
     def _ensure_windowed(self) -> None:
@@ -280,6 +301,7 @@ class ExplorerDropOverlay(QWidget):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         log_drop_event("DragEnter", event.mimeData(), watched=self, pos=self._event_pos(event))
         self._logged_move = False
+        self._leave_gen += 1
         if self._accept_if_files(event):
             self._set_active(True)
             return
@@ -296,9 +318,22 @@ class ExplorerDropOverlay(QWidget):
     def dragLeaveEvent(self, event) -> None:  # noqa: N802
         log_drop_event("DragLeave", None, watched=self)
         self._set_active(False)
+        # Drop 직전에 Leave가 오는 플랫폼이 있다. 잠시 기다렸다가 아직 안이면 끈다.
+        self._leave_gen += 1
+        gen = self._leave_gen
+        QTimer.singleShot(80, lambda g=gen: self._disarm_if_left(g))
         super().dragLeaveEvent(event)
 
+    def _disarm_if_left(self, gen: int) -> None:
+        if gen != self._leave_gen or self._active or not self._armed:
+            return
+        pos = self.mapFromGlobal(QCursor.pos())
+        if self.rect().contains(pos) and _lmb_down():
+            return
+        self.disarm()
+
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        self._leave_gen += 1
         mime = event.mimeData()
         log_drop_event("Drop", mime, watched=self, pos=self._event_pos(event))
         paths = paths_from_mime(mime)
@@ -312,6 +347,7 @@ class ExplorerDropOverlay(QWidget):
                 event.accept()
         else:
             event.ignore()
+            log_drop_event("DropIgnored", mime, watched=self, pos=self._event_pos(event))
         self.disarm()
 
     def arm(self) -> None:
@@ -323,11 +359,18 @@ class ExplorerDropOverlay(QWidget):
             return
         self._armed = True
         self._logged_move = False
+        self.setAcceptDrops(True)
         self._ensure_windowed()
         self._set_active(False)
         self._sync_geom()
         self.show()
         self.raise_()
+        try:
+            from iris.ui.window.win_shell_drop import ensure_ole_drop_surface
+
+            ensure_ole_drop_surface(int(self.winId()))
+        except Exception:
+            pass
         try:
             from iris.ui.window.win_shell_drop import hwnd_drop_debug, _log
 
@@ -341,11 +384,26 @@ class ExplorerDropOverlay(QWidget):
 
     def disarm(self) -> None:
         self._armed = False
+        self._active = False
         self._logged_move = False
+        self._leave_gen += 1
         self.hide()
 
+    def _apply_chrome(self, active: bool) -> None:
+        bg = _ACTIVE_BG if active else _IDLE_BG
+        self.setStyleSheet(
+            "QWidget#ExplorerDropOverlay {"
+            f" background-color: {bg}; border: none;"
+            "}"
+            "QLabel#ExplorerDropHint {"
+            " color: #e8eef7; font-size: 13px; background: transparent; border: none;"
+            "}"
+        )
+
     def _set_active(self, active: bool) -> None:
-        self.setWindowOpacity(_ACTIVE_OPACITY if active else _ARMED_OPACITY)
+        # 창 투명도(setWindowOpacity)는 WS_EX_LAYERED라 탐색기 OLE가 거부된다.
+        self._active = bool(active)
+        self._apply_chrome(self._active)
 
     def _sync_geom(self) -> None:
         try:
@@ -355,7 +413,13 @@ class ExplorerDropOverlay(QWidget):
 
 
 class ExplorerDropGuard(QObject):
-    """외부 파일 드래그일 때만 overlay를 연다. IDE companion 드래그는 건드리지 않음."""
+    """파일 드롭 타깃은 미리 있는 채팅 창이다.
+
+    마우스 버튼을 누르고 있기만 해도 위에 창을 띄우면 두 가지가 깨진다.
+    클릭만으로 「파일을 여기에 놓아주세요」가 나오고, 그 창은 드래그 도중에
+    만들어져 탐색기 OLE가 금지 커서로 거절한다.
+    안내는 실제 DragEnter에서만 채팅 힌트가 연다.
+    """
 
     def __init__(self, host: QWidget) -> None:
         super().__init__(host)
@@ -371,10 +435,11 @@ class ExplorerDropGuard(QObject):
         try:
             from iris.ui.window.win_shell_drop import hwnd_drop_debug, _log
 
-            _log(f"overlay_guard_start host={hwnd_drop_debug(int(self._host.winId()))}")
+            _log(f"overlay_guard_start host={hwnd_drop_debug(int(self._host.winId()))} poll=off")
         except Exception:
             pass
-        self._timer.start()
+        self._timer.stop()
+        self._overlay.disarm()
 
     def stop(self) -> None:
         self._timer.stop()
@@ -386,40 +451,12 @@ class ExplorerDropGuard(QObject):
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
         if watched is self._host:
             et = event.type()
-            if et == QEvent.Type.MouseButtonPress and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
-                self._press_inside = True
-            elif et in (QEvent.Type.MouseButtonRelease, QEvent.Type.Leave):
-                if et == QEvent.Type.MouseButtonRelease:
-                    self._press_inside = False
-            elif et in (QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.WindowStateChange):
+            if et in (QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.WindowStateChange):
                 if self._overlay._armed:
                     self._overlay._sync_geom()
         return False
 
     def _tick(self) -> None:
-        if _drop_guard_paused(self._host):
+        # 왼쪽 버튼·커서 위치로는 열지 않는다. 파일 드래그와 클릭을 구분하지 못한다.
+        if self._overlay._armed:
             self._overlay.disarm()
-            return
-        if not _lmb_down():
-            self._press_inside = False
-            if self._overlay._armed:
-                self._overlay.disarm()
-            return
-        if self._press_inside:
-            return
-        if getattr(self._host, "_pending_ide_drag", None):
-            return
-        if _qt_modal_blocking():
-            self._overlay.disarm()
-            return
-        try:
-            if not self._host.isVisible() or self._host.isMinimized():
-                self._overlay.disarm()
-                return
-            if not _cursor_on_drop_surface(self._host, self._overlay):
-                self._overlay.disarm()
-                return
-        except RuntimeError:
-            self._overlay.disarm()
-            return
-        self._overlay.arm()
