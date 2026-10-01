@@ -109,7 +109,7 @@
   },
   {
     "name": "diagram.render",
-    "summary": "Render a typed JSON IR into an interactive diagram and show it (kind = architecture|workflow|sequence|dataflow|lifecycle). Read integrations/archify/schemas/<kind>.schema.json for the IR shape (architecture needs explicit placement: layout {mode:\"grid\",cols:n} with 0-based row/col per component, or pos/size per component); on failure the error data carries archify diagnostics[] — fix the IR and retry",
+    "summary": "Render a typed JSON IR into an interactive diagram and show it (kind = architecture|workflow|sequence|dataflow|lifecycle). Read integrations/archify/schemas/<kind>.schema.json for the IR shape (architecture needs explicit placement: layout {mode:\"grid\",cols:n} with 0-based row/col per component, or pos/size per component); on failure the error data carries archify diagnostics[] — fix the IR and retry. Call only when the user asks for structure, flow, sequence, or architecture, or when explaining or summarizing a multi-module structural change. One call per turn. Not for a single-file edit, bugfix, or run result. Opens in the Iris chat column, not a separate window. Do not use the architecture-diagram skill or write a standalone HTML diagram",
     "risk": "low",
     "confirm_required": false
   },
@@ -276,6 +276,12 @@
     "confirm_required": false
   },
   {
+    "name": "extension.install_github",
+    "summary": "Install a GitHub repo as Hermes MCP and/or skill. Required: url. kind=auto|mcp|skill. Optional secrets, directory. needs_input: ask the user and do not invent secrets. Do not claim installed without ok.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "get_catalog",
     "summary": "List all Iris control actions (catalog)",
     "risk": "low",
@@ -396,6 +402,12 @@
     "confirm_required": false
   },
   {
+    "name": "note.export_pdf",
+    "summary": "Save text to PDF in a child process. Required: content. Optional path (default Documents/IRIS/iris-note.pdf). Do not run PyMuPDF, reportlab, or pdf_create.py. Do not claim saved without ok.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "notify.add_alert",
     "summary": "Add notification alert row",
     "risk": "low",
@@ -462,8 +474,14 @@
     "confirm_required": false
   },
   {
+    "name": "project.write_image_code",
+    "summary": "Read code from an image file and write it via project.write_file. Required: image (file path), rel_path. Ask when the target file is unknown. Do not claim written without ok.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "routine.create",
-    "summary": "Register a recurring task the user asked for (task = user's sentence verbatim; kind=daily|weekly|interval|once, time_of_day=HH:MM, weekdays=mon,fri, interval_minutes=N, at=ISO, deliver=chat,notify,voice,wiki, model=pin a model, wake_when_closed=true, search=web query run before the model for live facts, search_engine=google_news|google|…)",
+    "summary": "Register a recurring task the user asked for. task = the user's own sentence, verbatim. kind=daily|weekly|interval|once, time_of_day=HH:MM, weekdays=mon,fri, interval_minutes=N, at=ISO datetime (once), deliver=chat,notify,voice,wiki (default chat,notify), model=pin a specific model (empty = whatever is selected then), wake_when_closed=true to run even when Iris is closed. **search**=a web search query to run BEFORE the model, so the answer is based on real pages instead of guesses. Set it whenever the task needs today's facts (news, weather, prices, scores) — without it the model will invent plausible-looking results. search_engine=google_news (default) | google | bing | google_finance …",
     "risk": "medium",
     "confirm_required": false
   },
@@ -471,7 +489,7 @@
     "name": "routine.delete",
     "summary": "Delete a routine by id or name",
     "risk": "high",
-    "confirm_required": true
+    "confirm_required": false
   },
   {
     "name": "routine.get",
@@ -493,7 +511,7 @@
   },
   {
     "name": "routine.update",
-    "summary": "Change a routine by id or name (schedule, task, deliver, enabled, model, search, wake_when_closed)",
+    "summary": "Change a routine by id or name — schedule, task, deliver, or enabled. Use enabled=false to pause instead of deleting",
     "risk": "medium",
     "confirm_required": false
   },
@@ -559,7 +577,13 @@
   },
   {
     "name": "wiki.import_content",
-    "summary": "Extract PDF/URL/file text and save to Iris Wiki inbox, then open in UI (mode=raw|summarize)",
+    "summary": "Extract PDF/URL/file text, classify into Iris Wiki folders, then open in UI (mode=raw|summarize)",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "wiki.import_pages",
+    "summary": "Save many pages into classified Iris Wiki folders in one call (sources or source, discover=true, limit<=80). Do not loop import_content per page.",
     "risk": "medium",
     "confirm_required": false
   },
@@ -582,8 +606,14 @@
     "confirm_required": false
   },
   {
+    "name": "wiki.search",
+    "summary": "Search saved Iris Wiki notes (FTS and embeddings). Excerpts only. Not conversation history.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
     "name": "wiki.write_user_note",
-    "summary": "Save markdown to Iris Wiki user/ (default inbox/{slug}.md) and show it",
+    "summary": "Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox.",
     "risk": "medium",
     "confirm_required": false
   },

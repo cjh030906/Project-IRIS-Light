@@ -98,6 +98,31 @@ def _merge_discovered(
                 merged = _dedupe_sources([*sources, *extra])
     return merged[:limit], len(merged) > limit
 
+def _wiki_filing(window: WikiHost) -> dict:
+    from iris.knowledge.wiki_filing import filing_kwargs
+
+    model = str(
+        window._chat.current_model()
+        or getattr(window, "_saved_model", "")
+        or window._settings.ollama_model
+        or ""
+    ).strip()
+    root = ""
+    getter = getattr(window, "_current_project_root", None)
+    if callable(getter):
+        try:
+            root = str(getter() or "")
+        except Exception:
+            root = ""
+    return filing_kwargs(
+        db=window._db,
+        base_url=window._settings.ollama_base_url,
+        history_settings=window._model_switch.history_settings,
+        model=model,
+        project_root=root,
+    )
+
+
 def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     from iris.ui.control_bindings import (
         Path,
@@ -145,18 +170,22 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
             return err_result("wiki.write_user_note", "title required")
         if not content:
             return err_result("wiki.write_user_note", "content required")
+        from iris.knowledge.wiki_filing import file_user_note
+
         try:
-            path, rel = window._iris_wiki.write_inbox_note(
+            filed = file_user_note(
+                window._iris_wiki,
                 title,
                 content,
                 source_url=source_url,
                 rel_path=rel_in,
+                **_wiki_filing(window),
             )
         except ValueError as exc:
             return err_result("wiki.write_user_note", str(exc))
         except OSError as exc:
             return err_result("wiki.write_user_note", str(exc))
-        wiki_rel = f"user/{rel}"
+        wiki_rel = str(filed["rel_path"])
         window._on_obsidian_icon()
         window._obsidian_page.reload_graph()
         window._left_sidebar.obsidian_detail.reload()
@@ -167,9 +196,11 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
             "wiki.write_user_note",
             {
                 "rel_path": wiki_rel,
-                "path": str(path),
+                "path": str(filed["path"]),
                 "title": title,
                 "opened": open_note,
+                "place": filed.get("place") or "",
+                "ask_folder": bool(filed.get("ask_folder")),
             },
         )
 
@@ -248,6 +279,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
                 mode=mode,
                 rel_path=rel_in,
                 summarize_fn=summarize_fn,
+                **_wiki_filing(window),
             )
         except UnsupportedAttachmentTypeError as exc:
             return err_result(
@@ -305,6 +337,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
             merged,
             mode=mode,
             summarize_fn=summarize_fn,
+            **_wiki_filing(window),
         )
         data["truncated"] = truncated
         last = next(
@@ -321,6 +354,53 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
         )
         return ok_result("wiki.import_pages", data)
 
+    def wiki_search(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.wiki_filing import open_classifier
+        from iris.knowledge.wiki_note_index import search_notes, sync_knowledge_notes
+
+        query = str(args.get("query") or args.get("q") or "").strip()
+        if not query:
+            return err_result("wiki.search", "query required")
+        try:
+            limit = int(args.get("limit") or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        limit = min(8, max(1, limit))
+        model = str(
+            window._chat.current_model()
+            or getattr(window, "_saved_model", "")
+            or window._settings.ollama_model
+            or ""
+        ).strip()
+        embedder, _namer = open_classifier(
+            window._settings.ollama_base_url,
+            window._model_switch.history_settings,
+            model,
+        )
+        try:
+            sync_knowledge_notes(window._db, window._iris_wiki)
+            hits = search_notes(window._db, query, embedder=embedder, limit=limit)
+        except OSError as exc:
+            return err_result("wiki.search", str(exc))
+        _log(window, "wiki.search", True)
+        return ok_result(
+            "wiki.search",
+            {
+                "hits": [
+                    {
+                        "rel_path": f"user/{hit.rel_path}",
+                        "title": hit.title,
+                        "excerpt": hit.excerpt,
+                        "score": hit.score,
+                        "similarity": hit.similarity,
+                        "source": "wiki-note",
+                    }
+                    for hit in hits
+                ],
+                "count": len(hits),
+            },
+        )
+
     reg.register("wiki.list_notes", wiki_list, summary="List Iris Wiki note paths")
 
     reg.register(
@@ -332,9 +412,15 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     reg.register("wiki.reload", wiki_reload, summary="Reload Iris Wiki graph/detail")
 
     reg.register(
+        "wiki.search",
+        wiki_search,
+        summary="Search saved Iris Wiki notes (FTS and embeddings). Excerpts only. Not conversation history.",
+    )
+
+    reg.register(
         "wiki.write_user_note",
         wiki_write,
-        summary="Save markdown to Iris Wiki user/ (default inbox/{slug}.md) and show it",
+        summary="Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox.",
         risk="medium",
     )
 
@@ -348,13 +434,13 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     reg.register(
         "wiki.import_content",
         wiki_import_content,
-        summary="Extract PDF/URL/file text and save to Iris Wiki inbox, then open in UI (mode=raw|summarize)",
+        summary="Extract PDF/URL/file text, classify into Iris Wiki folders, then open in UI (mode=raw|summarize)",
         risk="medium",
     )
 
     reg.register(
         "wiki.import_pages",
         wiki_import_pages,
-        summary="Save many pages to Iris Wiki in one call (sources or source, discover=true, limit<=80). Do not loop import_content per page.",
+        summary="Save many pages into classified Iris Wiki folders in one call (sources or source, discover=true, limit<=80). Do not loop import_content per page.",
         risk="medium",
     )

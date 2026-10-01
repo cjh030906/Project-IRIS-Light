@@ -1,6 +1,6 @@
 """연번 12 — 액션 이름·계약은 같고 등록만 기능별로 나뉘었는지.
 
-카탈로그 스냅샷은 분리 직전 104건이다. 사용자 확인 전 완료 판정은 하지 않는다.
+카탈로그 스냅샷은 register() 와 같다. 115건.
 """
 
 from __future__ import annotations
@@ -87,6 +87,9 @@ def check_invalid_and_write(reg: ActionRegistry, window: MagicMock) -> None:
 
 def check_threads() -> None:
     assert runs_off_ui_thread("project.run") is True
+    assert runs_off_ui_thread("note.export_pdf") is True
+    assert runs_off_ui_thread("extension.install_github") is True
+    assert runs_off_ui_thread("project.write_image_code") is True
     assert runs_off_ui_thread("project.write_file") is False
     assert runs_off_ui_thread("emulator.tap") is True
     assert runs_off_ui_thread("email.list_messages") is True
@@ -113,7 +116,7 @@ def main() -> None:
     before = json.loads(_CATALOG.read_text(encoding="utf-8"))
     assert got == before, "action catalog drifted"
     names = [a["name"] for a in got]
-    assert len(names) == len(set(names)) == 104
+    assert len(names) == len(set(names)) == 115
     check_invalid_and_write(reg, window)
     check_threads()
     check_summary_and_modules()

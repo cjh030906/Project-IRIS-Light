@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from iris.knowledge.content_extract import extract_from_source
-from iris.knowledge.iris_wiki import IrisWiki, slugify_note_name
+from iris.knowledge.iris_wiki import IrisWiki
+from iris.knowledge.wiki_filing import file_user_note
 
 _DOC_EXT = {"html", "htm"}
 _SKIP_EXT = {
@@ -28,29 +28,6 @@ _SKIP_EXT = {
     "rar",
     "7z",
 }
-
-
-def _slug_base(title: str) -> str:
-    """파일명이면 확장자를 뺀 stem으로 슬러그. 화면 제목(H1)은 원문을 유지한다."""
-    name = Path(str(title).replace("\\", "/")).name
-    if Path(name).suffix:
-        name = Path(name).stem or name
-    return slugify_note_name(name or title)
-
-
-def _unique_inbox_rel(wiki: IrisWiki, title: str) -> str:
-    base = _slug_base(title)
-    rel = f"inbox/{base}.md"
-    path = wiki.user_root / rel
-    if not path.is_file():
-        return rel
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    candidate = f"inbox/{base}-{stamp}.md"
-    counter = 2
-    while (wiki.user_root / candidate).exists():
-        candidate = f"inbox/{base}-{stamp}-{counter}.md"
-        counter += 1
-    return candidate
 
 
 def wiki_location_label(rel_path: str, title: str, *, project: str = "") -> str:
@@ -74,19 +51,22 @@ def wiki_save_notice(result: dict[str, Any], *, project: str = "", href: str = "
     label = wiki_location_label(rel, title, project=project).replace("]", " ")
     where = f"[{label}]({href})" if href else label
     trunc = " (본문 일부 잘림)" if result.get("truncated") else ""
-    return f"저장되었습니다{trunc}.\n저장 위치: {where}"
+    text = f"저장되었습니다{trunc}.\n저장 위치: {where}"
+    if result.get("ask_folder"):
+        text += "\n분류가 애매해 받는 함(inbox)에 두었습니다. 폴더를 지정해 주세요."
+    return text
 
 
-def save_answer_to_wiki(wiki: IrisWiki, *, title: str, content: str) -> dict[str, Any]:
+def save_answer_to_wiki(wiki: IrisWiki, *, title: str, content: str, **filing: Any) -> dict[str, Any]:
     """Preserve an existing answer, including its Markdown source citations."""
     if not content.strip():
         raise ValueError("content required")
-    path, rel = wiki.write_inbox_note(
-        title, content, rel_path=_unique_inbox_rel(wiki, title),
-    )
+    filed = file_user_note(wiki, title, content, **filing)
     return {
-        "rel_path": f"user/{rel}", "path": str(path), "title": title,
-        "kind": "answer", "mode": "raw", "truncated": False,
+        **filed,
+        "kind": "answer",
+        "mode": "raw",
+        "truncated": False,
         "chars": len(content),
     }
 
@@ -126,23 +106,28 @@ def import_to_wiki(
     rel_path: str | None = None,
     open_note: bool = True,
     summarize_fn: Callable[[str], str] | None = None,
+    db: Any = None,
+    embedder: Any = None,
+    namer: Any = None,
+    opened_slug: str = "",
+    classify: bool = False,
 ) -> dict[str, Any]:
     prepared = prepare_wiki_body(source, mode=mode, summarize_fn=summarize_fn)
     note_title = (title or prepared["title"] or "untitled").strip()
-    rel_in = rel_path
-    if not rel_in:
-        rel_in = _unique_inbox_rel(wiki, note_title)
-    path, rel = wiki.write_inbox_note(
+    filed = file_user_note(
+        wiki,
         note_title,
         prepared["body"],
         source_url=prepared["source_url"],
-        rel_path=rel_in,
+        rel_path=rel_path,
+        db=db,
+        embedder=embedder,
+        namer=namer,
+        opened_slug=opened_slug,
+        classify=classify,
     )
-    wiki_rel = f"user/{rel}"
     return {
-        "rel_path": wiki_rel,
-        "path": str(path),
-        "title": note_title,
+        **filed,
         "kind": prepared["kind"],
         "source": prepared["source"],
         "truncated": prepared["truncated"],
@@ -215,6 +200,11 @@ def import_pages(
     *,
     mode: str = "raw",
     summarize_fn: Callable[[str], str] | None = None,
+    db: Any = None,
+    embedder: Any = None,
+    namer: Any = None,
+    opened_slug: str = "",
+    classify: bool = False,
 ) -> dict[str, Any]:
     """소스마다 import_to_wiki 한 번. 한 건 실패가 다음 건을 막지 않는다."""
     items: list[dict[str, Any]] = []
@@ -228,6 +218,11 @@ def import_pages(
                 mode=mode,
                 open_note=False,
                 summarize_fn=summarize_fn,
+                db=db,
+                embedder=embedder,
+                namer=namer,
+                opened_slug=opened_slug,
+                classify=classify,
             )
         except Exception as exc:  # noqa: BLE001 — 한 건 실패 후 계속
             failed += 1

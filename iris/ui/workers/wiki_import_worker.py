@@ -23,6 +23,8 @@ class WikiImportWorker(QThread):
         rel_path: str | None = None,
         model: str = "",
         ollama_base_url: str = "",
+        db=None,
+        project_root: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -33,6 +35,8 @@ class WikiImportWorker(QThread):
         self._rel_path = rel_path
         self._model = model
         self._ollama_base_url = ollama_base_url
+        self._db = db
+        self._project_root = project_root
 
     def run(self) -> None:
         try:
@@ -51,6 +55,18 @@ class WikiImportWorker(QThread):
                     )
 
                 summarize_fn = _sum
+            filing = {}
+            if self._db is not None:
+                from iris.knowledge.wiki_filing import filing_kwargs
+                from iris.storage.failover_prefs import load_history_settings
+
+                filing = filing_kwargs(
+                    db=self._db,
+                    base_url=self._ollama_base_url,
+                    history_settings=load_history_settings(self._db),
+                    model=self._model,
+                    project_root=self._project_root,
+                )
             result = import_to_wiki(
                 self._wiki,
                 source=self._source,
@@ -58,6 +74,7 @@ class WikiImportWorker(QThread):
                 mode=self._mode,
                 rel_path=self._rel_path,
                 summarize_fn=summarize_fn,
+                **filing,
             )
         except Exception as exc:  # noqa: BLE001
             self.finished_err.emit(str(exc))

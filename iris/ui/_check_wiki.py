@@ -74,6 +74,8 @@ def main() -> None:
             "notes",
             rel_path="inbox/network-security.md",
         )
+        wiki.write_user_note("사용자/취미/기타.md", "# 기타\n\n[[가치관]]")
+        wiki.write_user_note("사용자/가치관/삶.md", "# 가치관\n\nkeep")
         page = ObsidianWorkspacePage()
         page.resize(1200, 700)
         page.set_wiki(wiki)
@@ -96,6 +98,7 @@ def main() -> None:
         assert page._graph._selected_rel.endswith("network-security.md")
         assert page._graph._aim is not None
         assert page._graph._aim["z1"] > 1.5
+        assert any(edge[2] == "link" for edge in page._graph._edges)
         page.hide_results()
     print("wiki self-check ok")
 

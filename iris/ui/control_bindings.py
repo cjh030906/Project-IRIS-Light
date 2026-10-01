@@ -370,6 +370,7 @@ def _call_on_ui(window: MainWindow, fn: Callable[[], Any]) -> Any:
 
 def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
     """기능별 등록 조립. 실행은 iris.ui.control_actions."""
+    from iris.ui.control_actions.agent_turn import register_agent_turn_actions
     from iris.ui.control_actions.chat import register_chat_actions
     from iris.ui.control_actions.email import register_email_actions
     from iris.ui.control_actions.emulator import register_emulator_actions
@@ -396,6 +397,7 @@ def _register_actions(window: MainWindow, surface: ControlSurface) -> None:
     register_email_actions(window, reg)
     register_wiki_actions(window, reg)
     register_chat_actions(window, reg)
+    register_agent_turn_actions(window, reg)
     names = [a["name"] for a in reg.catalog()]
     assert len(names) == len(set(names)), "duplicate control actions"
 

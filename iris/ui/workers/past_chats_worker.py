@@ -35,16 +35,27 @@ class PastChatsWorker(QThread):
 
     def run(self) -> None:
         try:
+            client = OllamaClient(self._base_url)
             hits = find_past_chats(
                 self._service,
                 self._query,
                 self._conversation_id,
-                OllamaClient(self._base_url),
+                client,
             )
+            wiki_block = ""
+            wiki = getattr(self._service, "wiki", None)
+            if wiki is not None:
+                from iris.knowledge.wiki_note_index import wiki_prompt_for_query
+                from iris.runtime.model_switch import resolve_embedder
+
+                embedder = resolve_embedder(self._service.history_settings, client)
+                wiki_block = wiki_prompt_for_query(
+                    self._service.db, wiki, self._query, embedder,
+                )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
-        self.ready.emit(list(hits))
+        self.ready.emit({"past": list(hits), "wiki": wiki_block})
 
 
 class EmbedWarmupWorker(QThread):

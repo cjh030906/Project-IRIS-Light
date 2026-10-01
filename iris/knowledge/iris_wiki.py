@@ -93,6 +93,10 @@ class IrisWiki:
         (self.user_root / HISTORY_DIR / "episodes").mkdir(parents=True, exist_ok=True)
         (self.user_root / IRIS_DIR).mkdir(parents=True, exist_ok=True)
         (self.user_root / IRIS_DIR / "routines").mkdir(parents=True, exist_ok=True)
+        from iris.knowledge.wiki_places import KNOWLEDGE_FOLDERS
+
+        for folder in KNOWLEDGE_FOLDERS:
+            (self.user_root / folder).mkdir(parents=True, exist_ok=True)
 
     def list_notes(self) -> list[IrisWikiNote]:
         notes: list[IrisWikiNote] = []

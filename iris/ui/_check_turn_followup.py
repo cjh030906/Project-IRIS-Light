@@ -77,6 +77,9 @@ def _check_window(app: QApplication) -> None:
     win = MainWindow(test_mode=True)
     win.show()
     app.processEvents()
+    assert win._sending_followthrough is False
+    assert win._followthrough_gen == 0
+    assert win._followthrough_token == 0
     win._chat_session.clear_messages()
     win._record_history("user", "첫 질문")
     win._chat.begin_stream_message("Iris", speech_sync=False)

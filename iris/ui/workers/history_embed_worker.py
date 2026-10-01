@@ -68,6 +68,13 @@ class HistoryEmbedWorker(QThread):
                         continue
                     if embed_entry(self._db, entry, embedder) > 0:
                         done += 1
+                from iris.knowledge.wiki_note_index import embed_pending_notes
+
+                embed_pending_notes(self._db, self._wiki, embedder, limit=8)
+            else:
+                from iris.knowledge.wiki_note_index import sync_knowledge_notes
+
+                sync_knowledge_notes(self._db, self._wiki)
 
             self._sync_index_note(embedder.model if embedder is not None else "")
             self.finished_ok.emit(done, embedder.model if embedder is not None else "")

@@ -1,36 +1,23 @@
-"""archify 다이어그램 HTML 표시.
+"""archify 다이어그램을 채팅 칸 카드에 연다.
 
-Theia에는 HTML 프리뷰 확장(`@theia/preview`·`mini-browser`)이 없어 에디터로 열면
-소스만 보인다. 그래서 표시는 IRIS 쪽 `QWebEngineView` 1개를 재사용한다.
+Theia에는 HTML 프리뷰가 없어 에디터로 열면 소스만 보인다.
+채팅 로그는 QTextEdit라 페이지를 문서 안에 넣지 않고, 로그와 입력창 사이 카드에 띄운다.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, QUrl
 
-
-def open_diagram_preview(window: Any, html_path: str) -> bool:
-    """다이어그램 HTML을 프리뷰 창에 띄운다. 파일이 없으면 False.
-
-    qt-webengine-bootstrap.mdc: WebEngine 뷰는 첫 사용 시에만 생성한다.
-    pyqt-orphan-windows.mdc: 부모를 반드시 넘긴다 (빈 「Iris Light」 창 방지).
-    """
-    path = Path(html_path)
-    if not path.is_file():
+def open_diagram_preview(window: Any, html_path: str, title: str = "") -> bool:
+    """채팅 카드에 HTML을 띄운다. 채팅이 없거나 파일이 없으면 False."""
+    chat = getattr(window, "_chat", None)
+    show = getattr(chat, "show_diagram", None)
+    if not callable(show):
         return False
-    view = getattr(window, "_diagram_preview", None)
-    if view is None:
-        from PyQt6.QtWebEngineWidgets import QWebEngineView
-
-        view = QWebEngineView(window)
-        view.setWindowFlag(Qt.WindowType.Window, True)
-        view.setWindowTitle("IRIS Diagram")
-        view.resize(1280, 820)
-        window._diagram_preview = view
-    view.load(QUrl.fromLocalFile(str(path.resolve())))
-    view.show()
-    view.raise_()
+    if not show(html_path, title):
+        return False
+    note = getattr(chat, "append_diagram_note", None)
+    if callable(note):
+        note(html_path, title)
     return True

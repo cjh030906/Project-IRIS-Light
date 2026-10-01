@@ -589,6 +589,7 @@ class ChatComposerInput(QPlainTextEdit):
 class ChatLogTextEdit(QTextEdit):
     speaker_clicked = pyqtSignal(str)
     update_action_clicked = pyqtSignal(str)  # apply | later
+    hermes_update_action_clicked = pyqtSignal(str)  # apply | later
     ollama_login_clicked = pyqtSignal()
     files_attached = pyqtSignal(list)
 
@@ -654,6 +655,12 @@ class ChatLogTextEdit(QTextEdit):
             self.speaker_clicked.emit(anchor.removeprefix("iris-tts://"))
             event.accept()
             return
+        if anchor.startswith("iris-hermes-update://"):
+            action = anchor.removeprefix("iris-hermes-update://").strip().lower()
+            if action in ("apply", "later"):
+                self.hermes_update_action_clicked.emit(action)
+            event.accept()
+            return
         if anchor.startswith("iris-update://"):
             action = anchor.removeprefix("iris-update://").strip().lower()
             if action in ("apply", "later"):
@@ -670,6 +677,17 @@ class ChatLogTextEdit(QTextEdit):
             event.accept()
             return
         if anchor.startswith("iris-stt://"):
+            event.accept()
+            return
+        if anchor.startswith("iris-diagram://"):
+            from iris.ui.chat.diagram_card import parse_diagram_href
+
+            path = parse_diagram_href(anchor)
+            panel = self.parent()
+            while panel is not None and not hasattr(panel, "show_diagram"):
+                panel = panel.parent()
+            if path and panel is not None:
+                panel.show_diagram(path)
             event.accept()
             return
         if handle_chat_anchor_click(self, anchor):
@@ -1224,6 +1242,7 @@ class ChatPanel(QWidget):
     mic_clicked = pyqtSignal()
     speaker_clicked = pyqtSignal(str)
     update_action_clicked = pyqtSignal(str)
+    hermes_update_action_clicked = pyqtSignal(str)
     ollama_login_clicked = pyqtSignal()
     # 입력창에 뭔가 쓰기 시작했다 — 보내기 전에 준비할 일(임베딩 모델 깨우기)용
     composing = pyqtSignal()
@@ -1327,6 +1346,7 @@ class ChatPanel(QWidget):
         self._input_area.attachment_strip.changed.connect(self._on_input_changed)
         self._log.speaker_clicked.connect(self.speaker_clicked.emit)
         self._log.update_action_clicked.connect(self.update_action_clicked.emit)
+        self._log.hermes_update_action_clicked.connect(self.hermes_update_action_clicked.emit)
         self._log.ollama_login_clicked.connect(self.ollama_login_clicked.emit)
         self._log.files_attached.connect(self._on_composer_drop_paths)
 
@@ -1720,6 +1740,7 @@ class ChatPanel(QWidget):
             cap = self._max_extra()
             if self._extra_h > cap:
                 self._apply_chat_extra(cap)
+        self._sync_diagram_card_height()
 
     def get_tts_text(self, token: str) -> str:
         key = (token or "").strip()
@@ -1817,6 +1838,44 @@ class ChatPanel(QWidget):
                 self._input_area.input_bar.fit_model_picker()
                 return True
         return False
+
+    def append_hermes_update_prompt(self, *, detail: str = "") -> None:
+        """Hermes 업데이트 안내 + 업데이트 / 나중에 링크."""
+        self.finish_typing()
+        self._typing_anchor_y = None
+        text = "Hermes 업데이트가 가능합니다. 업데이트를 하시겠습니까?"
+        extra = (detail or "").strip()
+        if extra:
+            text = f"{text} ({extra})"
+        link = 'style="color:#38bdf8;text-decoration:none;"'
+        buttons = (
+            f' <a href="iris-hermes-update://apply" {link}>[업데이트]</a>'
+            f' <a href="iris-hermes-update://later" {link}>[나중에]</a>'
+        )
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(f"<b>Iris</b>: {html.escape(text)}{buttons}")
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
+    def dismiss_hermes_update_prompt(self, note: str = "") -> None:
+        """Hermes 업데이트 버튼 제거."""
+        import re
+
+        html_doc = self._log.toHtml()
+        if "iris-hermes-update://" in html_doc:
+            updated = re.sub(
+                r'\s*<a[^>]*href="iris-hermes-update://(?:apply|later)"[^>]*>.*?</a>',
+                "",
+                html_doc,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            bar = self._log.verticalScrollBar()
+            pos = bar.value()
+            self._log.setHtml(updated)
+            bar.setValue(pos)
+        if (note or "").strip():
+            self.append_message_instant("Iris", note.strip())
 
     def dismiss_update_prompt(self, note: str = "") -> None:
         """Update/Late 클릭 후 버튼 제거."""
@@ -2379,6 +2438,58 @@ class ChatPanel(QWidget):
         self._log.setTextCursor(cursor)
         self._append_trailing_blank_line()
         self._scroll_log_to_bottom()
+
+    def show_diagram(self, html_path: str, title: str = "") -> bool:
+        """로그와 입력창 사이 카드에 archify HTML을 연다. 파일이 없으면 False."""
+        path = Path(html_path)
+        if not path.is_file():
+            return False
+        card = self._ensure_diagram_card()
+        card.setFixedHeight(self._diagram_card_height())
+        card.show_file(path, title=title)
+        card.show()
+        return True
+
+    def append_diagram_note(self, html_path: str, title: str = "") -> None:
+        """구조도 한 줄. 다시 보기가 카드를 연다. TTS 본문으로 등록하지 않는다."""
+        from iris.ui.chat.diagram_card import diagram_href
+
+        label = (title or "구조도").strip() or "구조도"
+        href = html.escape(diagram_href(html_path), quote=True)
+        self.finish_typing()
+        self._typing_anchor_y = None
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(
+            f'<span style="color:{TOKENS.text_secondary};font-size:12px;">'
+            f"{html.escape(label)} · "
+            f'<a href="{href}" style="color:{TOKENS.neon_cyan};text-decoration:none;">다시 보기</a>'
+            f"</span>"
+        )
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
+    def _diagram_card_height(self) -> int:
+        from iris.ui.chat.diagram_card import card_height_px
+
+        return card_height_px(self.height())
+
+    def _ensure_diagram_card(self):
+        card = getattr(self, "_diagram_card", None)
+        if card is not None:
+            return card
+        from iris.ui.chat.diagram_card import DiagramCard
+
+        card = DiagramCard(self)
+        # handle, log, [card], spacing, input
+        self.layout().insertWidget(2, card, 0)
+        self._diagram_card = card
+        return card
+
+    def _sync_diagram_card_height(self) -> None:
+        card = getattr(self, "_diagram_card", None)
+        if card is not None and card.isVisible():
+            card.setFixedHeight(self._diagram_card_height())
 
     def append_note(self, text: str) -> None:
         """앱이 붙이는 작은 안내 줄(참고한 이전 대화, 모델 전환 등).

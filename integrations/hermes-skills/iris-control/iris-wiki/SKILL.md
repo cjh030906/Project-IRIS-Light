@@ -33,11 +33,15 @@ User notes live under `~/.iris-light/iris-wiki/` and appear in the UI as `user/.
    - `title` (required) — short note title
    - `content` (required) — markdown body (facts, links, bullets)
    - `source_url` (optional) — original URL
-   - `rel_path` (optional) — default `inbox/{slug}.md`
+   - `rel_path` (optional) — 비우면 Iris가 임베딩 유사도와 모델 JSON으로 분류한다.
+     `사용자/`(특징·취미·강점·약점·사고력·가치관), `학습자료/{분야}/`, `인사이트/{주제}/`,
+     `projects/{열린 프로젝트}/`, `research/{주제}/`.
+     애매하면 `inbox/` 에 남고 `ask_folder` 가 true다. inbox를 기본값으로 넣지 말 것.
    - `open` (optional, default true) — open Wiki UI on the new note
-4. Confirm with the returned `rel_path` (e.g. `user/inbox/example.md`).
-5. If the user only wants to open an existing note: `wiki.open_note` with `rel_path`.
-6. List notes: `wiki.list_notes`. Reload UI: `wiki.reload`.
+4. Confirm with the returned `rel_path` (e.g. `user/학습자료/수학/note.md`).
+5. Search saved notes: `wiki.search` with `query`. This is not conversation History.
+6. If the user only wants to open an existing note: `wiki.open_note` with `rel_path`.
+7. List notes: `wiki.list_notes`. Reload UI: `wiki.reload`.
 
 ## Rules
 
@@ -45,5 +49,6 @@ User notes live under `~/.iris-light/iris-wiki/` and appear in the UI as `user/.
 - Local Iris may handle save without MCP when user attaches a file or pastes a URL with save intent.
 - Prefer `mode=summarize` when user asks to 요약/정리; default `raw` for full capture.
 - Do not write under `docs/` — user wiki only.
-- Prefer `inbox/` for ad-hoc / website captures.
+- Prefer the classified folder. Do not set `rel_path` to `inbox/` unless the user named that folder.
+- `wiki.search` reads saved notes. Do not treat those excerpts as prior chat transcripts.
 - After write, Iris opens the Wiki workspace and shows the note when `open=true`.

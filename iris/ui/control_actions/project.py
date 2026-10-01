@@ -689,7 +689,9 @@ def register_project_actions(window: ProjectHost, reg: ActionRegistry) -> None:
                 str(rendered.get("error") or "render failed"),
                 {"diagnostics": rendered.get("diagnostics") or [], "stage": rendered.get("stage")},
             )
-        rendered["opened"] = open_diagram_preview(window, str(rendered["html_path"]))
+        rendered["opened"] = open_diagram_preview(
+            window, str(rendered["html_path"]), title=title
+        )
         _log(window, "diagram.render", True)
         return ok_result("diagram.render", rendered)
 
@@ -741,7 +743,12 @@ def register_project_actions(window: ProjectHost, reg: ActionRegistry) -> None:
             "Read integrations/archify/schemas/<kind>.schema.json for the IR shape "
             "(architecture needs explicit placement: layout {mode:\"grid\",cols:n} with 0-based "
             "row/col per component, or pos/size per component); "
-            "on failure the error data carries archify diagnostics[] — fix the IR and retry"
+            "on failure the error data carries archify diagnostics[] — fix the IR and retry. "
+            "Call only when the user asks for structure, flow, sequence, or architecture, "
+            "or when explaining or summarizing a multi-module structural change. "
+            "One call per turn. Not for a single-file edit, bugfix, or run result. "
+            "Opens in the Iris chat column, not a separate window. "
+            "Do not use the architecture-diagram skill or write a standalone HTML diagram"
         ),
     )
 

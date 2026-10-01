@@ -261,6 +261,14 @@ class MainWindow(QMainWindow):
         self._chat_session = ChatSession(self._db)
         self._chat_session.open_launch_chat()
         self._turn_gate = ChatTurnGate()
+        # 첫 채팅 전송이 이 속성을 읽는다. 없으면 슬롯 AttributeError → Qt qFatal(0xC0000409).
+        self._sending_followthrough = False
+        self._turn_is_followthrough = False
+        self._followthrough_goal = ""
+        self._followthrough_count = 0
+        self._followthrough_gen = 0
+        self._followthrough_token = 0
+        self._tool_ok_count = 0
         self._last_assistant_text = ""
         self._pending_local_vibe_prompt = ""
         self._live_vibe: dict | None = None
@@ -286,6 +294,9 @@ class MainWindow(QMainWindow):
         self._app_update_apply_worker: QThread | None = None
         self._update_prompt_deferred = False
         self._pending_update_remote_sha = ""
+        self._hermes_update_check_worker: QThread | None = None
+        self._hermes_update_apply_worker: QThread | None = None
+        self._hermes_update_prompt_deferred = False
         self._email_inbox_worker: EmailInboxWorker | None = None
         self._email_message_worker: EmailMessageWorker | None = None
         self._email_send_worker: EmailSendWorker | None = None
@@ -388,6 +399,7 @@ class MainWindow(QMainWindow):
         self._turn_dispatcher.turn_dropped.connect(self._on_turn_dropped)
         self._active_turn_source = UserTurnSource.KEYBOARD
         self._wiki_import_worker: WikiImportWorker | None = None
+        self._wiki_session_worker = None
         self._pdf_export_worker = None
         self._ext_install_worker: ExtensionInstallWorker | None = None
         self._pending_ext: dict | None = None
@@ -544,6 +556,7 @@ class MainWindow(QMainWindow):
         self._history_evidence_worker: HistoryEvidenceWorker | None = None
         # 이번 턴에만 얹을 '이전 대화 참고' system 메시지. 턴이 끝나면 비운다.
         self._pending_past_chats = ""
+        self._pending_wiki_notes = ""
         self._past_chats_worker: PastChatsWorker | None = None
         self._embed_warm_worker: EmbedWarmupWorker | None = None
         self._embed_warmed_at = 0.0
@@ -645,6 +658,7 @@ class MainWindow(QMainWindow):
         self._chat.mic_clicked.connect(self._warm_embedder_soon)
         self._chat.speaker_clicked.connect(self._on_chat_speaker_clicked)
         self._chat.update_action_clicked.connect(self._on_chat_update_action)
+        self._chat.hermes_update_action_clicked.connect(self._on_hermes_update_action)
         self._chat.ollama_login_clicked.connect(self._on_ollama_cloud_login_clicked)
         left_lay.addWidget(self._chat, 3)
 
@@ -1028,6 +1042,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._maybe_restore_mic_listen)
         if not self._test_mode:
             QTimer.singleShot(2500, self._begin_app_update_check)
+            QTimer.singleShot(2800, self._begin_hermes_update_check)
 
     @staticmethod
     def _repair_taskbar_pins() -> None:
@@ -1176,6 +1191,87 @@ class MainWindow(QMainWindow):
         self._chat.append_message_instant(
             "Iris",
             ollama_login_status_message(applied=applied),
+        )
+
+    def _begin_hermes_update_check(self) -> None:
+        if self._hermes_update_prompt_deferred or not self._settings.hermes_enabled:
+            return
+        if (
+            self._hermes_update_check_worker is not None
+            and self._hermes_update_check_worker.isRunning()
+        ):
+            return
+        from iris.ui.workers.hermes_update_worker import HermesUpdateCheckWorker
+
+        worker = HermesUpdateCheckWorker(
+            command=self._settings.hermes_command,
+            parent=self,
+        )
+        self._hermes_update_check_worker = worker
+        worker.finished_ok.connect(self._on_hermes_update_status)
+        worker.failed.connect(self._on_hermes_update_check_failed)
+        worker.start()
+
+    def _on_hermes_update_check_failed(self, _message: str) -> None:
+        self._hermes_update_check_worker = None
+
+    def _on_hermes_update_status(self, status: object) -> None:
+        self._hermes_update_check_worker = None
+        if not bool(getattr(status, "available", False)) or self._hermes_update_prompt_deferred:
+            return
+        detail = str(getattr(status, "detail", "") or "").strip()
+        self._chat.append_hermes_update_prompt(detail=detail)
+
+    def _on_hermes_update_action(self, action: str) -> None:
+        kind = (action or "").strip().lower()
+        if kind == "later":
+            self._hermes_update_prompt_deferred = True
+            self._chat.dismiss_hermes_update_prompt(
+                "Hermes 업데이트를 미뤘습니다. Iris를 다시 시작하면 안내합니다."
+            )
+            return
+        if kind != "apply":
+            return
+        if (
+            self._hermes_update_apply_worker is not None
+            and self._hermes_update_apply_worker.isRunning()
+        ):
+            return
+        from iris.ui.workers.hermes_update_worker import HermesUpdateApplyWorker
+
+        self._chat.dismiss_hermes_update_prompt(
+            "Hermes 업데이트를 적용하는 중… 끝나면 gateway를 다시 시작합니다."
+        )
+        worker = HermesUpdateApplyWorker(
+            command=self._settings.hermes_command,
+            base_url=self._settings.hermes_base_url,
+            api_key=self._settings.hermes_api_key,
+            parent=self,
+        )
+        self._hermes_update_apply_worker = worker
+        worker.progress.connect(self._on_hermes_gateway_notice)
+        worker.finished_ok.connect(self._on_hermes_update_applied)
+        worker.failed.connect(self._on_hermes_update_apply_failed)
+        worker.start()
+
+    def _on_hermes_update_applied(self, message: str) -> None:
+        self._hermes_update_apply_worker = None
+        self._hermes_online = True
+        self._status_header.refresh_backend_status(
+            self._settings,
+            hermes_online=True,
+        )
+        self._chat.append_message_instant(
+            "Iris",
+            (message or "Hermes 업데이트가 끝났고 gateway를 재시작했습니다.").strip(),
+        )
+
+    def _on_hermes_update_apply_failed(self, message: str) -> None:
+        self._hermes_update_apply_worker = None
+        self._refresh_hermes_health()
+        self._chat.append_message_instant(
+            "Iris",
+            f"Hermes 업데이트 실패: {(message or '알 수 없는 오류').strip()}",
         )
 
     def _on_app_update_applied(self, message: str) -> None:
@@ -2601,8 +2697,43 @@ class MainWindow(QMainWindow):
             return
         panel.set_conversations(items, active_id=self._conversation_id)
 
+    def _schedule_wiki_session_close(self, next_id: int | None = None, *, force: bool = False) -> None:
+        """떠나기 전에 대화 묶음을 에피소드와 특성 노트로 남긴다. 창은 기다리지 않는다."""
+        if not force and next_id is not None and int(next_id) == int(self._conversation_id):
+            return
+        worker = getattr(self, "_wiki_session_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        history = [dict(message) for message in self._history]
+        if sum(1 for message in history if (message.get("content") or "").strip()) < 2:
+            return
+        model = (
+            self._chat.current_model()
+            or (getattr(self, "_saved_model", None) or "").strip()
+            or (self._settings.ollama_model or "").strip()
+        )
+        if not model:
+            return
+        try:
+            from iris.ui.workers.wiki_session_worker import WikiSessionWorker
+
+            worker = WikiSessionWorker(
+                self._db,
+                self._iris_wiki,
+                int(self._conversation_id or 0),
+                history,
+                model,
+                self._settings.ollama_base_url,
+                parent=self,
+            )
+        except Exception:
+            return
+        self._wiki_session_worker = worker
+        worker.start()
+
     def _load_conversation(self, conversation_id: int) -> None:
         """세션 전환 — 진행 중 턴은 끊고 트랜스크립트를 다시 그린다."""
+        self._schedule_wiki_session_close(int(conversation_id))
         self._drop_followthrough()
         if self._busy:
             self._cancel_current_turn(
@@ -2619,6 +2750,7 @@ class MainWindow(QMainWindow):
 
     def reset_current_conversation(self) -> None:
         """현재 세션의 대화 내용만 비운다 (세션 자체는 유지)."""
+        self._schedule_wiki_session_close(force=True)
         self._drop_followthrough()
         if self._busy:
             self._cancel_current_turn(
@@ -3337,6 +3469,8 @@ class MainWindow(QMainWindow):
             rel_path=req.rel_path,
             model=model,
             ollama_base_url=self._settings.ollama_base_url,
+            db=self._db,
+            project_root=self._current_project_root(),
             parent=self,
         )
         worker.finished_ok.connect(
@@ -3366,7 +3500,7 @@ class MainWindow(QMainWindow):
         self._refresh_context_gauge()
         self._finish_current_turn(turn_id)
 
-    def _try_local_extension_install(self, turn: UserTurn) -> bool:
+    def _try_local_extension_install(self, turn: UserTurn, *, allow_new: bool = True) -> bool:
         from iris.system.github_extension_install import (
             ExtensionRequest,
             parse_dir_reply,
@@ -3381,6 +3515,9 @@ class MainWindow(QMainWindow):
         directory: str | None = None
         display = text
         if req is not None:
+            if not allow_new:
+                self._pending_ext = None
+                return False
             self._pending_ext = None
         elif pending:
             if text.strip().lower() in ("취소", "취소해줘", "cancel"):
@@ -3517,14 +3654,28 @@ class MainWindow(QMainWindow):
             self._start_wiki_import_async(turn, req)
             return True
         try:
+            from iris.knowledge.wiki_filing import filing_kwargs
+
+            filing = filing_kwargs(
+                db=self._db,
+                base_url=self._settings.ollama_base_url,
+                history_settings=self._model_switch.history_settings,
+                model=(
+                    self._chat.current_model()
+                    or (getattr(self, "_saved_model", None) or "").strip()
+                    or (self._settings.ollama_model or "").strip()
+                ),
+                project_root=self._current_project_root(),
+            )
             result = save_answer_to_wiki(
-                self._iris_wiki, title=req.title or "검색 결과", content=req.content,
+                self._iris_wiki, title=req.title or "검색 결과", content=req.content, **filing,
             ) if req.content else import_to_wiki(
                 self._iris_wiki,
                 source=req.source,
                 title=req.title,
                 mode="raw",
                 rel_path=req.rel_path,
+                **filing,
             )
         except Exception as exc:  # noqa: BLE001
             msg = f"위키 저장 실패: {exc}"
@@ -3649,19 +3800,26 @@ class MainWindow(QMainWindow):
                 f"VOICE turn_dispatched source={turn.source.value} queued={self._turn_dispatcher.pending_count()}"
             )
         text = (text or "").strip()
-        # IDE 아이콘과 동일 동작 — 모델이 도구를 안 써도 Companion이 켜지게
-        if self._try_local_ide_control(text):
-            self._finish_current_turn(turn.id, open_followup=False)
-            return
-        if self._try_local_wiki_save(turn):
-            return
-        if self._try_local_pdf_save(turn):
-            return
-        if self._try_local_extension_install(turn):
-            return
-        if self._try_local_workspace_control(text):
-            self._finish_current_turn(turn.id, open_followup=False)
-            return
+        from iris.runtime.agent_local_gate import hermes_owns_local_intents
+
+        # Hermes가 켜져 있으면 여섯 의도는 모델의 iris_invoke. 꺼져 있을 때만 로컬 정규식.
+        owns = hermes_owns_local_intents(self._use_hermes_backend())
+        if owns:
+            if self._try_local_extension_install(turn, allow_new=False):
+                return
+        else:
+            if self._try_local_ide_control(text):
+                self._finish_current_turn(turn.id, open_followup=False)
+                return
+            if self._try_local_wiki_save(turn):
+                return
+            if self._try_local_pdf_save(turn):
+                return
+            if self._try_local_extension_install(turn, allow_new=True):
+                return
+            if self._try_local_workspace_control(text):
+                self._finish_current_turn(turn.id, open_followup=False)
+                return
         # 메일/캘린더 화면 — 음성·요청을 우측 Iris 패널 챗으로 (메인 채팅은 숨김)
         if self._route_to_workspace_chat(text):
             if turn.source == UserTurnSource.VOICE:
@@ -3726,7 +3884,7 @@ class MainWindow(QMainWindow):
         self._sync_voice_conversation_state()
         self._turn_write_path = ""
         self._suppress_reveal_write = False
-        if self._handle_image_code_pipe(turn, model):
+        if not owns and self._handle_image_code_pipe(turn, model):
             return
 
         # ponytail: 트리거 키워드 체크 없이 항상 후보로 둔다 — 실제 게이트는
@@ -3748,26 +3906,34 @@ class MainWindow(QMainWindow):
         from iris.runtime.past_chats import find_past_chats, should_search
 
         self._pending_past_chats = ""
+        self._pending_wiki_notes = ""
         try:
             settings = self._model_switch.history_settings
             wanted = settings.enabled and settings.reference_past_chats and should_search(text)
         except Exception:  # noqa: BLE001
             wanted = False
-        if not wanted:
+        if not should_search(text):
             launch()
             return
 
         conversation_id = self._conversation_id
         state = {"done": False}
 
-        def proceed(hits) -> None:
+        def proceed(payload) -> None:
             if state["done"]:
                 return
             state["done"] = True
             timer.stop()
             if not self._is_current_turn(turn.id):
-                return  # 멈췄거나 다른 턴으로 넘어갔다
-            self._apply_past_chats(hits or [])
+                return
+            if isinstance(payload, dict):
+                hits = payload.get("past") or []
+                self._pending_wiki_notes = str(payload.get("wiki") or "")
+            else:
+                hits = payload or []
+            if not wanted:
+                hits = []
+            self._apply_past_chats(hits)
             launch()
 
         def keyword_only() -> None:
@@ -3775,7 +3941,14 @@ class MainWindow(QMainWindow):
                 hits = find_past_chats(self._model_switch, text, conversation_id, None)
             except Exception:  # noqa: BLE001
                 hits = []
-            proceed(hits)
+            wiki_block = ""
+            try:
+                from iris.knowledge.wiki_note_index import wiki_prompt_for_query
+
+                wiki_block = wiki_prompt_for_query(self._db, self._iris_wiki, text, None)
+            except Exception:  # noqa: BLE001
+                wiki_block = ""
+            proceed({"past": hits, "wiki": wiki_block})
 
         timer = QTimer(self)
         timer.setSingleShot(True)
@@ -3947,6 +4120,7 @@ class MainWindow(QMainWindow):
         self._pending_handoff = ""
         self._pending_handoff_ctx = None
         self._pending_past_chats = ""
+        self._pending_wiki_notes = ""
         self._chat.set_generating(False)
         if open_followup:
             self._open_voice_followup_window()
@@ -4453,8 +4627,12 @@ class MainWindow(QMainWindow):
             self._chat.append_message_instant("Iris", "IDE 제어면이 아직 준비되지 않았습니다.")
             return
         try:
+            from iris.runtime.agent_local_gate import hermes_owns_local_intents
             from iris.system.project_ops import is_run_request
 
+            run_locally = (not hermes_owns_local_intents(self._use_hermes_backend())) and is_run_request(
+                prompt
+            )
             if state is not None and state.get("started"):
                 # 실시간 스트리밍으로 이미 IDE에 타이핑됐다 — 안 끝났으면 남은 부분만 마저 쓴다.
                 if not state.get("finished"):
@@ -4462,7 +4640,7 @@ class MainWindow(QMainWindow):
                     self._live_vibe_write(state, tail)
                 root = state.get("root", "")
                 rel = state.get("rel", "")
-                if not is_run_request(prompt):
+                if not run_locally:
                     if not state.get("opened"):
                         return
                     from iris.ui.chat.file_write_claim import reveal_line
@@ -4526,7 +4704,7 @@ class MainWindow(QMainWindow):
                     f"IDE에 파일을 쓰지 못했습니다: {written.get('error')}",
                 )
                 return
-            if not is_run_request(prompt):
+            if not run_locally:
                 result = written.get("result") if isinstance(written.get("result"), dict) else {}
                 from iris.ui.chat.file_write_claim import reveal_line
 
@@ -6101,7 +6279,9 @@ class MainWindow(QMainWindow):
         text = (text or "").strip()
         if not text:
             return
-        if self._try_local_workspace_control(text):
+        from iris.runtime.agent_local_gate import hermes_owns_local_intents
+
+        if not hermes_owns_local_intents(self._settings.hermes_enabled) and self._try_local_workspace_control(text):
             return
         panel = self._calendar_page.iris_panel
         if self._calendar_busy:
@@ -6349,8 +6529,9 @@ class MainWindow(QMainWindow):
         text = (text or "").strip()
         if not text:
             return
-        # 기본화면/마이크/화면전환 — MCP 없이 즉시 (메일 패널에서도 동일)
-        if self._try_local_workspace_control(text):
+        from iris.runtime.agent_local_gate import hermes_owns_local_intents
+
+        if not hermes_owns_local_intents(self._settings.hermes_enabled) and self._try_local_workspace_control(text):
             return
         panel = self._email_page.iris_panel
         if self._email_busy:
@@ -6669,6 +6850,11 @@ class MainWindow(QMainWindow):
             "Do NOT invent that Iris has no IDE — Iris controls the preferred IDE via MCP. "
             "Writing code: project.write_file with open=true (opens an empty IDE tab, then streams chunks into the file). "
             "Running code/shell/npm/pip: project.run ONLY — output in IDE integrated terminal; summarize only in chat. "
+            "Diagrams: call diagram.render only when the user asks to see structure, flow, sequence, or architecture, "
+            "or when explaining or summarizing a change that spans multiple modules. One call per turn. "
+            "Do not call it for a single-file edit, a bugfix, or a run result. "
+            "Do not use the Hermes architecture-diagram skill or write a standalone HTML diagram file — "
+            "diagram.render shows the viewer inside the Iris chat column. "
             "When you use ANY web search/browse/fetch tool, the final answer MUST include a "
             "Sources section with markdown links [title](https://url) for each page you relied on. "
             "Never state researched facts without at least one citation link. "
@@ -6678,17 +6864,29 @@ class MainWindow(QMainWindow):
             "markdown ![short label](https://...png|jpg|gif|webp). "
             "Iris shows those images in the chat; users can click to enlarge. "
             "업무 학습(화면 조작 녹화 시작/종료): learning.start / learning.stop. 이미 배운 업무 실행: learning.run. "
-            "위키에 저장 / Iris Wiki에 남기기: PDF·URL·파일은 iris_invoke wiki.import_content "
-            "(source=path or https URL). 여러 페이지·사이트 전체는 wiki.import_pages "
-            "(source 또는 sources, discover=true). 페이지마다 import_content 를 반복하지 말 것. "
-            "저장 성공은 반환의 saved 건수로만 말한다. "
-            "수동 요약만 쓸 때 wiki.write_user_note "
-            "(title + content, optional source_url). 검색 후 저장 요청은 먼저 검색하고, "
-            "결과 본문과 출처 Markdown 링크를 wiki.write_user_note로 함께 저장한다. "
-            "Default path user/inbox/{slug}.md. "
-            "Never claim a wiki save succeeded without that tool returning ok. "
-            "채팅을 PDF 파일로 저장해 달라는 요청은 Iris가 직접 처리한다. "
-            "terminal·pdf_create.py·PyMuPDF·reportlab로 PDF를 만들지 말 것. "
+            "위키에 저장: Hermes가 켜져 있으면 문장 키워드로 가로채지 않는다. "
+            "PDF·URL·파일은 wiki.import_content (source, mode=raw|summarize). "
+            "직전 답변은 wiki.write_user_note (title + content, optional source_url). "
+            "rel_path 를 비우면 임베딩 유사도와 모델 분류로 "
+            "사용자·학습자료·인사이트·projects·research 중 한 곳에 넣는다. "
+            "애매하면 inbox에 남고 ask_folder 가 true다. inbox를 기본 경로로 지정하지 말 것. "
+            "저장된 노트는 wiki.search (query). 대화 History와 다른 출처다. "
+            "위키 발췌에 없는 내용을 위키에 있는 사실처럼 말하지 말 것. "
+            "검색 후 저장은 먼저 검색하고 본문과 출처 링크를 write_user_note에 넣는다. "
+            "여러 페이지는 wiki.import_pages (source 또는 sources, discover=true). "
+            "페이지마다 import_content 를 반복하지 말 것. "
+            "저장 성공은 도구 ok 로만 말한다. "
+            "채팅을 PDF로 저장: note.export_pdf (content, optional path). "
+            "pdf_create.py·PyMuPDF·reportlab 을 직접 돌리지 말 것. "
+            "GitHub MCP 또는 Skill: extension.install_github (url, kind=auto|mcp|skill). "
+            "needs_input 이면 키나 디렉터리를 묻고 비밀은 만들지 말 것. "
+            "사진에서 코드 파일: project.write_image_code (image=첨부 경로, rel_path). "
+            "대상 파일이 없으면 되묻는다. ok 없이 썼다고 말하지 말 것. "
+            "코드 실행은 문장에 실행/print 가 있어서가 아니라 project.run 으로만. "
+            "IDE 켜기/끄기·홈·메일·캘린더·위키 화면·마이크도 도구다: "
+            "ide.enter_companion, ide.exit_companion, workspace.open_assistant, "
+            "workspace.open_email, workspace.open_calendar, workspace.open_obsidian, "
+            "voice.mic_on, voice.mic_off. "
             "메일/이메일 화면: iris_invoke workspace.open_email. "
             "오늘 온 메일·받은편지 요약: email.list_messages (args.today=true 또는 since=YYYY-MM-DD). "
             "본문 읽기: email.read_message (uid). 일정: workspace.open_calendar + calendar.*. "
@@ -6718,10 +6916,25 @@ class MainWindow(QMainWindow):
             # 모델을 막 갈아탔고 원문이 새 컨텍스트에 안 들어간다 — 요약을 얹는다.
             payload.insert(1, {"role": "system", "content": self._pending_handoff})
         past = getattr(self, "_pending_past_chats", "")
+        wiki_notes = getattr(self, "_pending_wiki_notes", "")
+        traits = ""
+        try:
+            from iris.knowledge.wiki_session import traits_prompt_block
+
+            traits = traits_prompt_block(self._iris_wiki)
+        except Exception:
+            traits = ""
+
+        def _before_user(content: str) -> None:
+            if not content:
+                return
+            at = len(payload) - 1 if payload and payload[-1].get("role") == "user" else len(payload)
+            payload.insert(at, {"role": "system", "content": content})
+
+        _before_user(traits)
+        _before_user(wiki_notes)
         if past:
-            # 다른 대화에서 찾은 기록 — 마지막 사용자 말 바로 앞에 둔다.
-            at = len(payload) - 1 if payload[-1].get("role") == "user" else len(payload)
-            payload.insert(at, {"role": "system", "content": past})
+            _before_user(past)
         return payload
 
     def _on_ide_icon(self) -> None:
@@ -8672,8 +8885,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: refresh_snap_button_rect(self))
         self._arm_file_drops(self)
         if sys.platform == "win32":
-            # 가드를 만든 뒤에 OLE 타깃을 등록한다. 오버레이를 나중에 만들면
-            # Qt가 메인 HWND의 IDropTarget을 다시 자기 것으로 바꾼다.
+            # 클릭을 파일 드래그로 오인하지 않게 가드만 준비한다.
+            # 메인 HWND의 Qt IDropTarget은 교체하지 않는다.
             QTimer.singleShot(0, self._arm_win_shell_drop)
         if sys.platform == "win32" and not self._test_mode:
             QTimer.singleShot(0, self._apply_hwnd_branding_safe)
@@ -8690,18 +8903,16 @@ class MainWindow(QMainWindow):
             self._explorer_drop_guard = None
 
     def _arm_win_shell_drop(self) -> None:
-        # Qt IDropTarget은 이 frameless 창에서 탐색기 DragEnter를 이벤트로
-        # 넘기지 않아 커서가 금지 표시로 남는다. CF_HDROP을 동기 Copy로 받는다.
+        # Qt IDropTarget을 RevokeDragDrop으로 갈아끼우면 채팅 입력 때
+        # Qt6Core 0xC0000409로 프로세스가 죽는다. 탐색기 전용 OLE 타깃은
+        # 띄우지 않고, 첨부는 Qt setAcceptDrops만 유지한다.
         try:
-            from iris.ui.window.win_ole_drop import install_explorer_drop_target
-            from iris.ui.window.win_shell_drop import ensure_ole_drop_surface
-
             if not self._test_mode:
                 self._start_explorer_drop_guard()
-            hwnd = int(self.winId())
-            ensure_ole_drop_surface(hwnd)
             self._arm_file_drops(self)
-            install_explorer_drop_target(hwnd, self)
+            from iris.ui.window.win_ole_drop import _log
+
+            _log("skip RegisterDragDrop on main — Qt drop target kept")
         except Exception:
             return
 

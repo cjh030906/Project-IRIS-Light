@@ -134,7 +134,8 @@ class WikiGraphView(QWidget):
             (folder, [(note.rel_path, note.title, note.title) for note in wiki_groups[folder]])
             for folder in wiki_folders
         ]
-        self._add_cluster(root_idx, wiki_hub_groups, "note", hub_dirs, hub_positions)
+        link_to_idx = self._add_cluster(root_idx, wiki_hub_groups, "note", hub_dirs, hub_positions)
+        self._connect_wiki_links(wiki, notes, link_to_idx)
 
         self._stars = self._make_stars(hub_dirs)
         self._clouds = self._make_clouds(hub_positions)
@@ -207,6 +208,20 @@ class WikiGraphView(QWidget):
                 member_idx.append(ni)
 
         return link_to_idx
+
+    def _connect_wiki_links(self, wiki: IrisWiki, notes: list, link_to_idx: dict[str, int]) -> None:
+        """[[노트]] 를 _add_cluster 인덱스로 잇는다."""
+        from iris.knowledge.wiki_links import extend_link_index, link_edges_from_index
+
+        bodies: dict[str, str] = {}
+        for note in notes:
+            try:
+                bodies[note.rel_path] = wiki.read_note(note.rel_path)
+            except (OSError, FileNotFoundError, ValueError):
+                continue
+        index = extend_link_index(link_to_idx, notes)
+        for src, dst in link_edges_from_index(index, notes, bodies):
+            self._edges.append((src, dst, "link", None))
 
     def select(self, rel_path: str) -> None:
         self._selected_rel = rel_path or ""
@@ -481,7 +496,9 @@ class WikiGraphView(QWidget):
             pa, _sa, aa, za = self._project(*self._node_pos(self._nodes[a]))
             pb, _sb, ab, zb = self._project(*self._node_pos(self._nodes[b]))
             alpha = max(4, min(24, int((aa + ab) / 16)))
-            if hub_idx is not None:
+            if kind == "link":
+                pen = QPen(QColor(186, 230, 255, max(36, alpha + 24)), 1.15)
+            elif hub_idx is not None:
                 c = self._hub_colors.get(hub_idx, QColor(226, 232, 240))
                 pen = QPen(QColor(c.red(), c.green(), c.blue(), max(8, alpha)), 0.7)
             else:

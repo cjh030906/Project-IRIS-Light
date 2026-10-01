@@ -14,9 +14,9 @@ from iris.system.hermes_iris_control_sync import hermes_home
 
 
 
-_MARKER = "<!-- iris-control-nudge-v16 -->"
+_MARKER = "<!-- iris-control-nudge-v17 -->"
 
-_BLOCK = """<!-- iris-control-nudge-v16 -->
+_BLOCK = """<!-- iris-control-nudge-v17 -->
 
 ## Iris Light UI control
 
@@ -46,12 +46,14 @@ When the user asks to open IDE / start coding / Companion / "ide 켜줘" / open 
 
 12. After creating/writing code: `project.write_file` with `open=true` (default live write: empty tab → wait visible → stream chunks into the file). Use `typewriter:false` only for instant dump.
 
-13. On run/npm/pip/python/node/shell requests: **only** `project.run` — full output in IDE terminal; chat summary only.
+13. On run/npm/pip/python/node/shell requests: **only** `project.run` — full output in IDE terminal; chat summary only. Keyword auto-run is off while Hermes is on.
 
 14. Calendar / 일정: `workspace.open_calendar`, then `calendar.add_event` / `calendar.list_events` / `calendar.select_day` / `calendar.delete_event` (skill iris-calendar).
 
-15. Wiki / 위키에 저장: Iris may handle locally (file chip + save intent). Else PDF·URL·파일 → `wiki.import_content` (`source`, `mode=raw|summarize`); manual → `wiki.write_user_note`; never claim saved without ok (skill iris-wiki). 여러 페이지·사이트 전체는 `wiki.import_pages` (`source` 또는 `sources`, `discover=true`). 페이지마다 `import_content` 를 반복하지 말 것. 저장 성공은 반환의 saved 건수로만 말한다.
-15b. "PDF로 저장/만들어 줘" (위키 아님): Iris handles it locally. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process.
+15. Wiki / 위키에 저장: no keyword shortcut while Hermes is on. PDF·URL·파일 → `wiki.import_content` (`source`, `mode=raw|summarize`); 직전 답변 → `wiki.write_user_note`; never claim saved without ok (skill iris-wiki). 여러 페이지·사이트 전체는 `wiki.import_pages` (`source` 또는 `sources`, `discover=true`). 페이지마다 `import_content` 를 반복하지 말 것. 저장 성공은 반환의 saved 건수로만 말한다. rel_path 를 비우면 사용자·학습자료·인사이트·projects·research 로 분류된다. inbox 를 기본 경로로 넣지 말 것. 저장된 노트는 `wiki.search`.
+15b. "PDF로 저장/만들어 줘" (위키 아님): `note.export_pdf` with `content` and optional `path`. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process.
+15c. GitHub MCP/Skill URL: `extension.install_github` (`url`, `kind=auto|mcp|skill`). If status is needs_input, ask for the missing key or directory. Do not invent secrets.
+15d. Image attachment → code file: `project.write_image_code` (`image` path, `rel_path`). If the target file is unknown, ask. Never claim the file was written without ok.
 
 16. Email / 메일: `workspace.open_email`, then `email.list_messages` (today=true or since=YYYY-MM-DD) / `email.read_message` / `email.open_compose` / `email.send` (skill iris-email). Never invent inbox contents.
 
@@ -121,9 +123,15 @@ def ensure_memory_nudge() -> str:
 
         and "wiki.import_content" in existing
 
-        and "wiki.import_pages" in existing
+        and "wiki.search" in existing
 
-        and "handle locally" in existing
+        and "note.export_pdf" in existing
+
+        and "extension.install_github" in existing
+
+        and "project.write_image_code" in existing
+
+        and "no keyword shortcut" in existing
 
         and "email.list_messages" in existing
 
@@ -143,7 +151,7 @@ def ensure_memory_nudge() -> str:
 
     path.write_text(text, encoding="utf-8")
 
-    return "memory nudge updated (v16)"
+    return "memory nudge updated (v17)"
 
 
 

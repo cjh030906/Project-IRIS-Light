@@ -30,6 +30,9 @@ _OFF_UI_ACTIONS = frozenset(
         "email.read_message",
         # 터미널 로그 폴링·브리지 왕복이 최대 90초 — UI 스레드면 Windows "응답 없음"
         "project.run",
+        "note.export_pdf",
+        "extension.install_github",
+        "project.write_image_code",
     }
 )
 
@@ -495,6 +498,9 @@ def _self_check() -> None:
     # 긴 액션이 UI 스레드로 돌아가면 Windows "응답 없음"
     assert runs_off_ui_thread("project.run")
     assert runs_off_ui_thread("emulator.start")
+    assert runs_off_ui_thread("note.export_pdf")
+    assert runs_off_ui_thread("extension.install_github")
+    assert runs_off_ui_thread("project.write_image_code")
     assert not runs_off_ui_thread("project.write_file")
     empty, empty_err = parse_invoke_body(b"")
     assert empty == {} and empty_err is None
