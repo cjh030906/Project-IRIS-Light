@@ -50,7 +50,8 @@
     "typescript": "~5.4.5"
   },
   "resolutions": {
-    "@theia/ffmpeg": "file:./vendor/theia-ffmpeg-stub"
+    "@theia/ffmpeg": "file:./vendor/theia-ffmpeg-stub",
+    "drivelist": "file:./vendor/drivelist-stub"
   },
   "scripts": {
     "postinstall": "node scripts/stub-windows-ca-certs.js",

@@ -1,0 +1,7 @@
+{
+  "name": "drivelist",
+  "version": "12.0.2-iris-stub",
+  "description": "JS drive-letter stub for browser-target IRIS IDE (no node-gyp / VS C++).",
+  "license": "Apache-2.0",
+  "main": "js/index.js"
+}

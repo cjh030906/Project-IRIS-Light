@@ -74,7 +74,7 @@ ProgressFn = Callable[[str], None]
 
 
 def _yarn_needs_native_bypass(msg: str) -> bool:
-    """True when yarn failed on Windows native compile (VS C++ / node-gyp / ffmpeg)."""
+    """True when yarn failed on Windows native compile (VS C++ / node-gyp / drivelist)."""
     t = (msg or "").lower()
     needles = (
         "could not find any visual studio",
@@ -83,8 +83,80 @@ def _yarn_needs_native_bypass(msg: str) -> bool:
         "@theia/ffmpeg",
         "node-gyp rebuild",
         "msvs_version not set",
+        "no prebuilt binaries found",
+        "node_modules\\drivelist",
+        "node_modules/drivelist",
     )
     return any(n in t for n in needles)
+
+
+def _yarn_registry_flake(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(n in t for n in ("malformed response", "registry may be down"))
+
+
+def _command_failure_text(text: str) -> str:
+    """Keep error lines at the front so a 240-char UI slice still shows the cause."""
+    raw = text or ""
+    keys = (
+        "could not find any visual studio",
+        "no prebuilt binaries found",
+        "malformed response",
+        "gyp err! find vs",
+        "desktop development with c++",
+    )
+    picked: list[str] = []
+    for line in raw.splitlines():
+        low = line.lower().strip()
+        if not low:
+            continue
+        if low.startswith("error ") or any(k in low for k in keys):
+            picked.append(line.strip())
+    head = "\n".join(picked[-8:])
+    if len(head) > 1500:
+        head = head[-1500:]
+    budget = 12000
+    tail_budget = budget - len(head) - 1 if head else budget
+    tail = raw[-tail_budget:] if tail_budget > 0 else ""
+    if head and not tail.startswith(head):
+        return f"{head}\n{tail}"
+    return tail or "exit"
+
+
+def _yarn_user_message(log: str) -> str:
+    text = log or ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    prefer = (
+        "could not find any visual studio",
+        "no prebuilt binaries found",
+        "drivelist",
+        "malformed response",
+        "registry may be down",
+    )
+    for key in prefer:
+        for ln in lines:
+            low = ln.lower()
+            if key in low and not low.startswith("at "):
+                return ln[:240]
+    for ln in reversed(lines):
+        if ln.lower().startswith("error "):
+            return ln[:240]
+    return (text[-220:] or "yarn install failed")
+
+
+def _drivelist_is_stub(dest: Path) -> bool:
+    pkg = dest / "node_modules" / "drivelist" / "package.json"
+    if not pkg.is_file():
+        return False
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if "iris-stub" in str(data.get("version") or ""):
+        return True
+    scripts = data.get("scripts") or {}
+    install = str(scripts.get("install") or "")
+    return "node-gyp" not in install and "prebuild-install" not in install
 
 
 class IrisIdeRuntimeManager:
@@ -174,27 +246,7 @@ class IrisIdeRuntimeManager:
             shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(src, dest, ignore=shutil.ignore_patterns("node_modules", "lib", ".theia"))
         self._emit(progress, "yarn install…")
-        yarn_ok, yarn_msg = self._run_yarn(dest, ["install", "--frozen-lockfile"], progress, run_streamed)
-        if not yarn_ok:
-            yarn_ok, yarn_msg = self._run_yarn(dest, ["install"], progress, run_streamed)
-        # VS C++ 없는 PC: @theia/ffmpeg node-gyp 실패 → ignore-scripts 후 스텁·재링크
-        if not yarn_ok and _yarn_needs_native_bypass(yarn_msg):
-            self._emit(progress, "native build bypass (no VS C++)…")
-            yarn_ok, yarn_msg = self._run_yarn(
-                dest, ["install", "--ignore-scripts"], progress, run_streamed
-            )
-            if yarn_ok:
-                stub = dest / "scripts" / "stub-windows-ca-certs.js"
-                if stub.is_file():
-                    self._run_cmd(
-                        [node_executable(), str(stub)],
-                        cwd=str(dest),
-                        progress=progress,
-                        run_streamed=run_streamed,
-                        timeout=60.0,
-                    )
-                # prebuild 있는 네이티브만 재설치 (ffmpeg binding.gyp는 스텁이 제거)
-                yarn_ok, yarn_msg = self._run_yarn(dest, ["install"], progress, run_streamed)
+        yarn_ok, yarn_msg = self._install_node_modules(dest, progress, run_streamed)
         if not yarn_ok:
             return False, yarn_msg
         self._emit(progress, "TypeScript compile…")
@@ -646,6 +698,56 @@ class IrisIdeRuntimeManager:
         if progress:
             progress(msg)
 
+    def _install_node_modules(
+        self,
+        dest: Path,
+        progress: ProgressFn | None,
+        run_streamed: Callable[..., Any] | None,
+    ) -> tuple[bool, str]:
+        logs: list[str] = []
+
+        def once(args: list[str]) -> tuple[bool, str]:
+            ok, msg = self._run_yarn(dest, args, progress, run_streamed)
+            logs.append(msg)
+            return ok, msg
+
+        lock = dest / "yarn.lock"
+        first = ["install", "--frozen-lockfile"] if lock.is_file() else ["install"]
+        ok, msg = once(first)
+        if not ok and _yarn_registry_flake(msg):
+            self._emit(progress, "registry retry…")
+            ok, msg = once(first)
+        if not ok and lock.is_file() and not _yarn_needs_native_bypass("\n".join(logs)):
+            ok, msg = once(["install"])
+            if not ok and _yarn_registry_flake(msg):
+                self._emit(progress, "registry retry…")
+                ok, msg = once(["install"])
+        if not ok and _yarn_needs_native_bypass("\n".join(logs)):
+            self._emit(progress, "native build bypass (no VS C++)…")
+            ok, msg = once(["install", "--ignore-scripts"])
+            if ok:
+                stub = dest / "scripts" / "stub-windows-ca-certs.js"
+                if stub.is_file():
+                    self._run_cmd(
+                        [node_executable(), str(stub)],
+                        cwd=str(dest),
+                        progress=progress,
+                        run_streamed=run_streamed,
+                        timeout=60.0,
+                    )
+                ok_scripts, msg_scripts = once(["install"])
+                core = dest / "node_modules" / "@theia" / "core" / "package.json"
+                if ok_scripts:
+                    ok, msg = True, msg_scripts
+                elif _yarn_needs_native_bypass(msg_scripts) and _drivelist_is_stub(dest) and core.is_file():
+                    self._emit(progress, "native scripts skipped…")
+                    ok, msg = True, "ok"
+                else:
+                    ok, msg = False, msg_scripts
+        if not ok:
+            return False, _yarn_user_message(msg)
+        return True, "ok"
+
     def _run_yarn(
         self,
         cwd: Path,
@@ -675,8 +777,7 @@ class IrisIdeRuntimeManager:
             if run_streamed is not None:
                 proc = run_streamed(cmd, cwd=cwd, timeout=timeout, hard_timeout=timeout + 60, hidden=True)
                 if proc.returncode != 0:
-                    tail = (proc.stdout or "")[-240:]
-                    return False, tail or f"exit {proc.returncode}"
+                    return False, _command_failure_text(proc.stdout or "")
                 return True, "ok"
             proc = subprocess.run(
                 cmd,
@@ -689,8 +790,8 @@ class IrisIdeRuntimeManager:
                 check=False,
             )
             if proc.returncode != 0:
-                tail = (proc.stderr or proc.stdout or "")[-240:]
-                return False, tail or f"exit {proc.returncode}"
+                blob = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+                return False, _command_failure_text(blob)
             return True, "ok"
         except (OSError, subprocess.TimeoutExpired) as exc:
             return False, str(exc)

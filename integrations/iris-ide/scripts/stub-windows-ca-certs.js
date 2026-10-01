@@ -49,9 +49,53 @@ function neutralizeTheiaFfmpeg() {
     }
 }
 
+function neutralizeDrivelist() {
+    const dir = path.join(root, 'drivelist');
+    const pkgPath = path.join(dir, 'package.json');
+    if (!fs.existsSync(pkgPath)) {
+        return;
+    }
+    let pkg;
+    try {
+        pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    } catch (_err) {
+        return;
+    }
+    if (String(pkg.version || '').includes('iris-stub')) {
+        const release = path.join(dir, 'build', 'Release');
+        fs.mkdirSync(release, { recursive: true });
+        const nodeFile = path.join(release, 'drivelist.node');
+        if (!fs.existsSync(nodeFile)) {
+            fs.writeFileSync(nodeFile, Buffer.alloc(0));
+        }
+        console.log('[iris-ide] drivelist already stub resolution');
+        return;
+    }
+    const stubMain = path.join(__dirname, '..', 'vendor', 'drivelist-stub', 'js', 'index.js');
+    const destJs = path.join(dir, 'js', 'index.js');
+    fs.mkdirSync(path.dirname(destJs), { recursive: true });
+    fs.copyFileSync(stubMain, destJs);
+    const binding = path.join(dir, 'binding.gyp');
+    if (fs.existsSync(binding)) {
+        fs.unlinkSync(binding);
+    }
+    pkg.main = 'js/index.js';
+    pkg.scripts = Object.assign({}, pkg.scripts, { install: 'node -e "process.exit(0)"' });
+    delete pkg.gypfile;
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), 'utf8');
+    const release = path.join(dir, 'build', 'Release');
+    fs.mkdirSync(release, { recursive: true });
+    const nodeFile = path.join(release, 'drivelist.node');
+    if (!fs.existsSync(nodeFile)) {
+        fs.writeFileSync(nodeFile, Buffer.alloc(0));
+    }
+    console.log('[iris-ide] neutralized drivelist native build');
+}
+
 try {
     stubWindowsCaCerts();
     neutralizeTheiaFfmpeg();
+    neutralizeDrivelist();
 } catch (err) {
     console.warn('[iris-ide] native stub skipped:', err.message);
 }
