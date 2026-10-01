@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -79,9 +80,114 @@ def ensure_ollama_running(base_url: str, *, wait_sec: float = 12.0) -> bool:
     return False
 
 
+def ollama_app_candidates() -> list[Path]:
+    """클라우드 로그인 UI가 있는 Ollama 데스크톱 앱 후보 (CLI ollama.exe 제외)."""
+    home = Path.home()
+    local = Path(os.environ.get("LOCALAPPDATA", str(home / "AppData" / "Local")))
+    base = local / "Programs" / "Ollama"
+    # GUI만 — ollama.exe 는 serve/CLI라 창이 안 뜸
+    return [
+        base / "ollama app.exe",
+        base / "Ollama.exe",
+    ]
+
+
+_OLLAMA_SIGNIN_URL = "https://ollama.com/signin"
+
+
+def open_ollama_app() -> tuple[bool, str]:
+    """Ollama GUI만 띄우고 바로 돌아온다. 서버 대기·창 제목 조회는 하지 않는다.
+
+    실행 파일이 없으면 ``missing:`` 으로 시작한다.
+    """
+    cands = [p for p in ollama_app_candidates() if p.is_file()]
+    if not cands:
+        return False, "missing: Ollama 앱을 찾지 못했습니다 — 설치 후 다시 시도하세요"
+    if sys.platform != "win32":
+        try:
+            subprocess.Popen([str(cands[0])], start_new_session=True, close_fds=True)  # noqa: S603
+            return True, str(cands[0])
+        except OSError as exc:
+            return False, str(exc)[:160]
+    flags = int(getattr(subprocess, "DETACHED_PROCESS", 0)) | int(
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
+    last_err = ""
+    for cand in cands:
+        try:
+            subprocess.Popen(  # noqa: S603
+                [str(cand)],
+                cwd=str(cand.parent),
+                close_fds=True,
+                creationflags=flags,
+            )
+            return True, str(cand)
+        except OSError as exc:
+            last_err = str(exc)[:160]
+    return False, last_err or "Ollama 앱을 시작하지 못했습니다"
+
+
+def begin_ollama_cloud_login() -> tuple[bool, str]:
+    """로그인 버튼 공통 진입. 앱이 없으면 브라우저 signin만 연다."""
+    ok, detail = open_ollama_app()
+    if not ok and detail.startswith("missing"):
+        import webbrowser
+
+        webbrowser.open(_OLLAMA_SIGNIN_URL)
+    return ok, detail
+
+
+def _self_check_open_ollama_app() -> None:
+    """후보가 있으면 Popen만 하고, 서버 대기·sleep은 하지 않는다."""
+    import tempfile
+
+    exe = Path(tempfile.mkdtemp(prefix="iris-ollama-app-")) / "ollama app.exe"
+    exe.write_bytes(b"MZ")
+    pops: list[tuple[list[str], dict]] = []
+    saved = (ollama_app_candidates, subprocess.Popen, time.sleep, ensure_ollama_running)
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("login launch must not block")
+
+    def _popen(cmd: list[str], **kw: object) -> object:
+        pops.append((list(cmd), kw))
+
+        class _Proc:
+            pid = 1
+
+        return _Proc()
+
+    try:
+        globals()["ollama_app_candidates"] = lambda: [exe]
+        globals()["ensure_ollama_running"] = _boom
+        time.sleep = _boom  # type: ignore[method-assign]
+        subprocess.Popen = _popen  # type: ignore[method-assign]
+        ok, detail = open_ollama_app()
+        assert ok is True, detail
+        assert len(pops) == 1
+        if sys.platform == "win32":
+            flags = int(pops[0][1].get("creationflags", 0))
+            detached = int(getattr(subprocess, "DETACHED_PROCESS", 0))
+            group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            assert flags & detached and flags & group
+            assert not (flags & no_window)
+        globals()["ollama_app_candidates"] = lambda: []
+        ok2, detail2 = open_ollama_app()
+        assert ok2 is False and detail2.startswith("missing"), detail2
+    finally:
+        globals()["ollama_app_candidates"] = saved[0]
+        subprocess.Popen = saved[1]  # type: ignore[method-assign]
+        time.sleep = saved[2]  # type: ignore[method-assign]
+        globals()["ensure_ollama_running"] = saved[3]
+        shutil.rmtree(exe.parent, ignore_errors=True)
+
+
 if __name__ == "__main__":
     base = "http://127.0.0.1:11434/v1"
     assert is_ollama_running(base) in (True, False)
     # 잘못된 포트는 반드시 꺼짐으로 감지되어야 함
     assert is_ollama_running("http://127.0.0.1:1/v1", timeout_sec=1.0) is False
+    assert isinstance(ollama_app_candidates(), list)
+    _self_check_open_ollama_app()
     print("ollama_server ok - running:", is_ollama_running(base))

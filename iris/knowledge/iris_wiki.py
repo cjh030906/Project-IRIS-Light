@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from iris.knowledge.obsidian_vault import DEFAULT_VAULT_ROOT, ObsidianVault, VaultNote
@@ -10,12 +12,24 @@ from iris.knowledge.obsidian_vault import DEFAULT_VAULT_ROOT, ObsidianVault, Vau
 WIKI_NAME = "Iris Wiki"
 DOCS_PREFIX = "docs/"
 USER_PREFIX = "user/"
+INBOX_DIR = "inbox"
+HISTORY_DIR = "history"
+IRIS_DIR = "IRIS"
 
 
 def default_user_wiki_root() -> Path:
     base = Path.home() / ".iris-light" / "iris-wiki"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def slugify_note_name(title: str, *, max_len: int = 64) -> str:
+    """제목 → 파일명 슬러그 (한글·영문·숫자·하이픈)."""
+    s = (title or "").strip().lower()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^\w\-가-힣]+", "", s, flags=re.UNICODE)
+    s = re.sub(r"-{2,}", "-", s).strip("-_") or "note"
+    return s[:max_len]
 
 
 @dataclass(frozen=True)
@@ -45,6 +59,11 @@ class IrisWiki:
         (self.user_root / "schedule").mkdir(parents=True, exist_ok=True)
         (self.user_root / "integrations").mkdir(parents=True, exist_ok=True)
         (self.user_root / "learning").mkdir(parents=True, exist_ok=True)
+        (self.user_root / INBOX_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / HISTORY_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / HISTORY_DIR / "episodes").mkdir(parents=True, exist_ok=True)
+        (self.user_root / IRIS_DIR).mkdir(parents=True, exist_ok=True)
+        (self.user_root / IRIS_DIR / "routines").mkdir(parents=True, exist_ok=True)
 
     def list_notes(self) -> list[IrisWikiNote]:
         notes: list[IrisWikiNote] = []
@@ -93,14 +112,59 @@ class IrisWiki:
         return path.read_text(encoding="utf-8")
 
     def write_user_note(self, rel_path: str, content: str) -> Path:
-        rel_path = rel_path.lstrip("/")
+        rel_path = self._normalize_user_rel(rel_path)
         path = (self.user_root / rel_path).resolve()
         root = self.user_root.resolve()
-        if root not in path.parents:
+        if root not in path.parents and path != root:
             raise ValueError("invalid user wiki path")
+        if path.suffix.lower() != ".md":
+            path = path.with_suffix(".md")
+            rel_path = path.relative_to(root).as_posix()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path
+
+    def write_inbox_note(
+        self,
+        title: str,
+        body: str,
+        *,
+        source_url: str = "",
+        rel_path: str | None = None,
+    ) -> tuple[Path, str]:
+        """사용자 wiki에 노트 저장. 반환: (절대경로, user/ 없는 rel)."""
+        title = (title or "").strip() or "untitled"
+        body = (body or "").strip()
+        if not body:
+            raise ValueError("content required")
+        if rel_path:
+            rel = self._normalize_user_rel(rel_path)
+        else:
+            rel = f"{INBOX_DIR}/{slugify_note_name(title)}.md"
+        if not rel.endswith(".md"):
+            rel = f"{rel}.md"
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines = [f"# {title}", ""]
+        if source_url.strip():
+            lines.append(f"- source: {source_url.strip()}")
+            lines.append("")
+        lines.append(body)
+        lines.append("")
+        lines.append(f"> updated: {stamp}")
+        lines.append("")
+        path = self.write_user_note(rel, "\n".join(lines))
+        return path, path.relative_to(self.user_root).as_posix()
+
+    @staticmethod
+    def _normalize_user_rel(rel_path: str) -> str:
+        rel = (rel_path or "").strip().lstrip("/").replace("\\", "/")
+        if rel.startswith(USER_PREFIX):
+            rel = rel[len(USER_PREFIX) :]
+        if rel.startswith(DOCS_PREFIX) or rel == "docs" or ".." in rel.split("/"):
+            raise ValueError("user wiki only — docs/ and .. paths are not allowed")
+        if not rel or rel.endswith("/"):
+            raise ValueError("rel_path required")
+        return rel
 
     def sync_profile_markdown(self, profile: dict[str, str]) -> None:
         lines = [
@@ -230,6 +294,67 @@ class IrisWiki:
                 lines.append(f"- **`{name}`** — {d}")
         lines.append("")
         self.write_user_note("integrations/mcp.md", "\n".join(lines))
+
+    def sync_history_index(
+        self,
+        *,
+        counts: dict[str, int] | None = None,
+        embed_model: str = "",
+        recent_days: list[str] | None = None,
+    ) -> None:
+        """History 칸 표지 — `history/index.md`.
+
+        일별 기록은 `history/YYYY-MM/YYYY-MM-DD.md`, 요약은 `history/episodes/`에
+        쌓인다. 여기서는 무엇이 얼마나 쌓였는지와 검색이 어떤 모드로 도는지만 알린다.
+        """
+        labels = {
+            "chat": "대화",
+            "action": "수행",
+            "artifact": "생성물",
+            "input": "입력",
+            "episode": "요약",
+        }
+        lines = [
+            "# History",
+            "",
+            "> 아이리스와 나눈 대화, 아이리스가 수행한 일, 만들어낸 것, 들어온 데이터가",
+            "> 여기 쌓입니다. 모델을 바꿔도 이 기록에서 맥락을 되찾습니다.",
+            "",
+            "## 검색 방식",
+            "",
+        ]
+        if embed_model:
+            lines.append(f"- 키워드(FTS5) + 의미 검색 — 임베딩 모델 `{embed_model}`")
+        else:
+            lines.append("- 키워드(FTS5)만 — Ollama 임베딩 모델을 설치하면 의미 검색도 켜집니다")
+            lines.append("  (`ollama pull bge-m3` 권장 — 한국어 품질이 가장 낫습니다)")
+        lines.append("")
+        lines.append("## 쌓인 기록")
+        lines.append("")
+        total = sum((counts or {}).values())
+        if not total:
+            lines.append("_아직 기록 없음_")
+        else:
+            for key, label in labels.items():
+                n = int((counts or {}).get(key, 0))
+                if n:
+                    lines.append(f"- {label}: {n}건")
+            lines.append(f"- **합계: {total}건**")
+        lines.append("")
+        lines.append("## 최근 날짜")
+        lines.append("")
+        if recent_days:
+            for day in recent_days[:14]:
+                lines.append(f"- [[{day}]] — `{HISTORY_DIR}/{day[:7]}/{day}.md`")
+        else:
+            lines.append("_없음_")
+        lines.append("")
+        lines.append("## 지우고 싶다면")
+        lines.append("")
+        lines.append("날짜 파일을 지우면 위키에서는 사라지지만 검색 색인은 남습니다.")
+        lines.append("완전히 지우려면 설정 → History에서 삭제하세요.")
+        lines.append("")
+        self.write_user_note(f"{HISTORY_DIR}/index.md", "\n".join(lines))
 
     def sync_learned_workflows(
         self,

@@ -5,12 +5,33 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# 플레이스홀더·데모 키 잔존 → 채팅 401. token_urlsafe(32)는 보통 43자·마커 없음.
+_WEAK_KEY_MARKERS = (
+    "change-me",
+    "changeme",
+    "replace-me",
+    "your-api-key",
+    "todo",
+    "placeholder",
+    "test",
+    "secret",
+)
+
 
 def hermes_home() -> Path:
     local = os.environ.get("LOCALAPPDATA", "").strip()
     if local:
         return Path(local) / "hermes"
     return Path.home() / ".hermes"
+
+
+def is_weak_hermes_api_key(key: str) -> bool:
+    """없거나 짧거나 플레이스홀더면 True. 강한 기존 키는 False(불필요 rotate 금지)."""
+    s = (key or "").strip()
+    if not s or len(s) < 24:
+        return True
+    low = s.lower()
+    return any(m in low for m in _WEAK_KEY_MARKERS)
 
 
 def load_hermes_dotenv() -> dict[str, str]:
@@ -49,5 +70,8 @@ def resolve_hermes_api_key(api_key: str = "") -> str:
 
 
 if __name__ == "__main__":
+    assert is_weak_hermes_api_key("change-me-please")
+    assert is_weak_hermes_api_key("short")
+    assert not is_weak_hermes_api_key("x" * 32)
     assert resolve_hermes_api_key("") == load_hermes_dotenv().get("API_SERVER_KEY", "").strip()
     print("hermes_credentials self-check ok")

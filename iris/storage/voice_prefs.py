@@ -51,6 +51,8 @@ class VoicePreferences:
     stt_speech_rms: float = 0.02  # 연속 청취 발화 임계 RMS
     stt_echo_tail_ms: int = 180
     voice_barge_in_enabled: bool = True
+    # 상단/채팅 마이크 아이콘 ON 여부 — 재시작 후에도 복원
+    mic_listen_preferred: bool = False
     voice_wake_word_enabled: bool = False
     voice_wake_words: str = "아이리스,Iris"
     voice_followup_window_sec: int = 20
@@ -69,6 +71,17 @@ class VoicePreferences:
     # 재생 단계에서만 적용하는 절제된 AI 비서 음향 효과. 원본 보이스 클론은 바꾸지 않는다.
     tts_ai_voice_fx_enabled: bool = True
     tts_ai_voice_fx_intensity: float = 0.75
+    # 재생 단계 피치(반음). PR4 기본 1.5는 스트리밍 청크에서 금속 노이즈 → 평소는 0.
+    tts_pitch_semitones: float = 0.0
+    # 알림·전화 낭독에 얹는 추가 부스트. 평소 말투와 구분돼 주의를 끈다.
+    tts_alert_pitch_boost: float = 2.0
+    # 알림·전화를 음성으로 읽어 줄지
+    alert_speech_enabled: bool = True
+    call_speech_enabled: bool = True
+    # 규칙 기반 음성 명령("전화 받아줘")을 모델보다 먼저 처리할지
+    voice_command_rules_enabled: bool = True
+    # 상황별 문장 힌트를 사이드바에 띄울지
+    voice_hint_visible: bool = True
     # qwen | qwen_custom | gpt_sovits
     tts_engine: str = "qwen"
     tts_custom_speaker: str = "iris"
@@ -126,6 +139,9 @@ def load_voice_preferences(db: Database) -> VoicePreferences:
     prefs.voice_barge_in_enabled = _to_bool(
         data.get("voice_barge_in_enabled"), prefs.voice_barge_in_enabled
     )
+    prefs.mic_listen_preferred = _to_bool(
+        data.get("mic_listen_preferred"), prefs.mic_listen_preferred
+    )
     prefs.voice_wake_word_enabled = _to_bool(
         data.get("voice_wake_word_enabled"), prefs.voice_wake_word_enabled
     )
@@ -137,13 +153,40 @@ def load_voice_preferences(db: Database) -> VoicePreferences:
         )
     except (TypeError, ValueError):
         prefs.voice_followup_window_sec = 20
+    for key, low, high in (
+        ("tts_pitch_semitones", -6.0, 6.0),
+        ("tts_alert_pitch_boost", 0.0, 6.0),
+    ):
+        try:
+            setattr(prefs, key, max(low, min(high, float(data.get(key, getattr(prefs, key))))))
+        except (TypeError, ValueError):
+            pass
+    # ponytail: PR #4 가 넣은 기본 +1.5 피치가 스트리밍 TTS에 금속 노이즈를 냄.
+    # 저장된 값이 그 기본값이면 이전(피치 없음)으로 되돌린다.
+    if abs(float(prefs.tts_pitch_semitones) - 1.5) < 1e-9:
+        prefs.tts_pitch_semitones = 0.0
+    prefs.alert_speech_enabled = _to_bool(
+        data.get("alert_speech_enabled"), prefs.alert_speech_enabled
+    )
+    prefs.call_speech_enabled = _to_bool(
+        data.get("call_speech_enabled"), prefs.call_speech_enabled
+    )
+    prefs.voice_command_rules_enabled = _to_bool(
+        data.get("voice_command_rules_enabled"), prefs.voice_command_rules_enabled
+    )
+    prefs.voice_hint_visible = _to_bool(
+        data.get("voice_hint_visible"), prefs.voice_hint_visible
+    )
     prefs.tts_enabled = _to_bool(data.get("tts_enabled"), prefs.tts_enabled)
     prefs.tts_mode = str(data.get("tts_mode", prefs.tts_mode) or prefs.tts_mode)
     prefs.tts_model = str(data.get("tts_model", prefs.tts_model) or prefs.tts_model)
     prefs.tts_reference_audio = str(data.get("tts_reference_audio", prefs.tts_reference_audio) or "")
     prefs.tts_reference_text = str(data.get("tts_reference_text", prefs.tts_reference_text) or "")
     prefs.tts_voice_prompt_hash = str(data.get("tts_voice_prompt_hash", prefs.tts_voice_prompt_hash) or "")
-    prefs.tts_volume = _to_float(data.get("tts_volume"), prefs.tts_volume)
+    vol = _to_float(data.get("tts_volume"), prefs.tts_volume)
+    if not math.isfinite(vol):
+        vol = prefs.tts_volume
+    prefs.tts_volume = max(0.0, min(1.0, vol))
     prefs.tts_use_voice_profile = _to_bool(
         data.get("tts_use_voice_profile"), prefs.tts_use_voice_profile
     )

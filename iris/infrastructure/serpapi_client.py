@@ -58,14 +58,29 @@ def search(
     engine: str = "google",
     api_key: str | None = None,
     num: int = 5,
+    hl: str = "",
+    gl: str = "",
+    extra: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Call SerpApi. Returns parsed JSON dict (may include top-level ``error``)."""
+    """Call SerpApi. Returns parsed JSON dict (may include top-level ``error``).
+
+    ``hl``/``gl`` set interface language and country (e.g. ``hl="ko"``,
+    ``gl="kr"``) — without them Korean queries come back with US-centric,
+    often stale results.
+    """
     key = (api_key or os.environ.get("SERPAPI_API_KEY") or os.environ.get("SERPAPI_KEY") or "").strip()
     if not key:
         return {"error": "SERPAPI_API_KEY not set"}
     eng = (engine or "google").strip().lower()
     qparam = ENGINE_QUERY_PARAMS.get(eng, "q")
     params = {"engine": eng, "api_key": key, "num": max(1, min(int(num), 100)), qparam: query}
+    if hl.strip():
+        params["hl"] = hl.strip()
+    if gl.strip():
+        params["gl"] = gl.strip()
+    for k, v in (extra or {}).items():
+        if str(v).strip():
+            params[str(k)] = str(v)
     req = Request(
         f"{SERPAPI_ENDPOINT}?{urlencode(params)}",
         headers={"User-Agent": "iris-light-serpapi/1.0"},
@@ -88,4 +103,6 @@ if __name__ == "__main__":
     assert "google" in ENGINE_QUERY_PARAMS
     assert ENGINE_QUERY_PARAMS["yahoo_images"] == "p"
     assert list_engines()[0]
+    # 키가 없어도 인자 검증은 돌아야 한다
+    assert search("x", api_key="")["error"] == "SERPAPI_API_KEY not set"
     print("serpapi_client self-check ok", len(ENGINE_QUERY_PARAMS), "engines")

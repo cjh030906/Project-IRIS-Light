@@ -47,59 +47,90 @@ def _load_endpoint() -> tuple[str, str]:
 
 
 def _http(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-    base, token = _load_endpoint()
-    if not token:
-        return {
-            "ok": False,
-            "action": "http",
-            "result": {},
-            "error": "IRIS_CONTROL_TOKEN missing (set env or ~/.iris-light/control_token). Is Iris running?",
-        }
-    url = f"{base}{path}"
+    import time
+
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
+    last_base = ""
+    last_reason: object = ""
+    # Iris 재기동·gateway 재부착 직후 짧은 공백 — 즉시 실패하지 말고 재시도
+    for attempt in range(3):
+        base, token = _load_endpoint()
+        last_base = base
+        if not token:
+            return {
+                "ok": False,
+                "action": "http",
+                "result": {},
+                "error": "IRIS_CONTROL_TOKEN missing (set env or ~/.iris-light/control_token). Is Iris running?",
+                "transport": True,
+            }
+        url = f"{base}{path}"
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
         try:
-            raw = exc.read().decode("utf-8")
-            return json.loads(raw)
-        except Exception:
+            # email.list_messages IMAP 등 긴 액션 — 기본 60s면 refresh 시 끊길 수 있음
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw = resp.read().decode("utf-8")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return {
+                    "ok": False,
+                    "action": "http",
+                    "result": {},
+                    "error": "invalid JSON from Iris",
+                    "transport": True,
+                }
+            return parsed if isinstance(parsed, dict) else {
+                "ok": False,
+                "error": "bad response",
+                "transport": True,
+            }
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8")
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
             return {
                 "ok": False,
                 "action": "http",
                 "result": {},
                 "error": f"HTTP {exc.code}: Iris control rejected request",
+                "transport": True,
             }
-    except urllib.error.URLError as exc:
-        return {
-            "ok": False,
-            "action": "http",
-            "result": {},
-            "error": f"Iris control unreachable at {base} ({exc.reason}). Start Iris Light first.",
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "action": "http",
-            "result": {},
-            "error": f"Iris control error: {exc}",
-        }
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"ok": False, "action": "http", "result": {}, "error": "invalid JSON from Iris"}
-    return parsed if isinstance(parsed, dict) else {"ok": False, "error": "bad response"}
+        except urllib.error.URLError as exc:
+            last_reason = exc.reason
+            time.sleep(0.35 * (attempt + 1))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "action": "http",
+                "result": {},
+                "error": f"Iris control error: {exc}",
+                "transport": True,
+            }
+    return {
+        "ok": False,
+        "action": "http",
+        "result": {},
+        "error": (
+            f"Iris control unreachable at {last_base} ({last_reason}). "
+            "Start Iris Light first."
+        ),
+        "transport": True,
+    }
 
 
 TOOLS = [
@@ -129,12 +160,17 @@ TOOLS = [
             "NOT for opening folders via terminal — use Iris actions so Companion tiling works. "
             "High-risk actions require args.confirm=true (email.send, email.add_account, "
             "email.remove_account, chat.clear_history). "
-            "Examples: action=project.open_similar args={query}; action=ide.open_folder args={path}; "
-            "action=ide.open_file args={path|rel_path}; "
+            "Chat sessions: chat.new_session / chat.list_sessions / chat.open_session args={id}. "
+            "Examples: action=ide.open_folder args={path} (there is no project.open_folder). "
+            "action=ide.open_file args={path} or {project_root, rel_path}. "
+            "path is relative to the bound IDE workspace from iris_get_state, not the shell cwd. "
+            "List the workspace first (project.list_files). "
+            "If the file is missing, return the error — do not create a substitute file or claim it opened. "
             "action=project.write_file args={rel_path,content,open,stream}; "
             "action=project.run args={file|command}; "
             "action=ide.enter_companion; action=ide.exit_companion; "
-            "action=workspace.open_email; action=workspace.open_calendar; "
+            "action=workspace.open_assistant; action=workspace.open_email; action=workspace.open_calendar; "
+            "action=voice.mic_off; action=voice.mic_on; action=voice.mic_status; "
             "action=calendar.add_event args={title,start_at,note,place}; "
             "action=calendar.list_events; action=calendar.select_day args={date}; "
             "action=ide.set_project_root args={path}; "
@@ -161,11 +197,14 @@ TOOLS = [
 
 
 def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    is_err = not bool(payload.get("ok", True)) and payload.get("error")
+    # Hermes는 isError 응답을 연결 실패로 센다 (mcp_tool.py: "error" in parsed → breaker).
+    # 도구가 답한 실행 오류는 isError를 켜지 않는다. ok는 그대로 false.
+    text = json.dumps(payload, ensure_ascii=True, indent=2)
+    failed = not bool(payload.get("ok", True)) and bool(payload.get("error"))
+    transport = bool(payload.get("transport"))
     return {
         "content": [{"type": "text", "text": text}],
-        "isError": bool(is_err),
+        "isError": bool(failed and transport),
     }
 
 
@@ -226,8 +265,8 @@ def _read_message() -> dict[str, Any] | None:
 
 def _write_message(msg: dict[str, Any]) -> None:
     # stdout must stay clean JSON lines — never log here
-    # Windows console default (cp949) can't encode tool description dashes; write UTF-8 bytes.
-    raw = (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    # ensure_ascii+UTF-8: Windows cp949 텍스트 파이프에서도 깨지지 않게.
+    raw = (json.dumps(msg, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
     sys.stdout.buffer.write(raw)
     sys.stdout.buffer.flush()
 
@@ -265,7 +304,7 @@ def main() -> int:
                 {
                     "protocolVersion": _negotiate_protocol(params),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "iris-control", "version": "0.1.1"},
+                    "serverInfo": {"name": "iris-control", "version": "0.1.2"},
                 },
             )
             continue

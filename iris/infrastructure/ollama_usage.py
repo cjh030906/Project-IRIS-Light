@@ -210,6 +210,57 @@ def fetch_ollama_quotas() -> list[ApiQuota]:
     return []
 
 
+def ollama_cloud_signed_in() -> bool:
+    """로컬 Ollama 데몬이 ollama.com 계정으로 로그인돼 있으면 True."""
+    return _ollama_signed_in()
+
+
+def poll_ollama_cloud_signed_in(
+    *,
+    timeout_sec: float = 180.0,
+    interval_sec: float = 2.0,
+    check=None,
+    sleep=time.sleep,
+    stop=None,
+) -> bool:
+    """앱 로그인 뒤 /api/me 가 True가 될 때까지 기다린다.
+
+    UI 스레드에서 호출하지 말 것. timeout은 로그인 조작 시간(기본 3분).
+    """
+    check = ollama_cloud_signed_in if check is None else check
+    stop = (lambda: False) if stop is None else stop
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        if stop():
+            return False
+        try:
+            if check():
+                return True
+        except Exception:
+            pass
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        wait_end = now + min(float(interval_sec), deadline - now)
+        while time.monotonic() < wait_end:
+            if stop():
+                return False
+            sleep(min(0.25, wait_end - time.monotonic()))
+
+
+def ollama_login_status_message(*, applied: bool) -> str:
+    """로그인 확인 뒤 채팅에 붙일 한 줄."""
+    if applied:
+        return (
+            "Ollama 클라우드 로그인이 확인되어 Iris에 반영했습니다. "
+            "클라우드 모델을 바로 사용할 수 있습니다."
+        )
+    return (
+        "Ollama 로그인은 확인됐지만 이 실행에는 반영되지 않습니다. "
+        "Iris를 다시 시작하면 로그인 상태가 적용됩니다."
+    )
+
+
 def _ollama_signed_in() -> bool:
     try:
         req = Request(
@@ -220,7 +271,18 @@ def _ollama_signed_in() -> bool:
         )
         with urlopen(req, timeout=4.0) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return bool(isinstance(data, dict) and data.get("email"))
+        if not isinstance(data, dict):
+            return False
+        # 스키마 변동 대비: email / user / username / id + signed_in
+        if data.get("email"):
+            return True
+        if data.get("user") or data.get("username"):
+            return True
+        if data.get("id") and data.get("signed_in") is not False:
+            return True
+        if data.get("signed_in") is True or data.get("logged_in") is True:
+            return True
+        return False
     except Exception:
         return False
 
@@ -233,4 +295,26 @@ if __name__ == "__main__":
     assert qs[1].key == "week" and abs(float(qs[1].used) - 4.1) < 0.01
     path = write_usage_cache(session_pct=0.2, weekly_pct=4.1)
     assert read_usage_cache()
+    hits = {"n": 0}
+
+    def _later() -> bool:
+        hits["n"] += 1
+        return hits["n"] >= 3
+
+    assert poll_ollama_cloud_signed_in(
+        timeout_sec=5, interval_sec=0, check=_later, sleep=lambda _s: None
+    )
+    assert (
+        poll_ollama_cloud_signed_in(
+            timeout_sec=0, interval_sec=0, check=lambda: False, sleep=lambda _s: None
+        )
+        is False
+    )
+    assert poll_ollama_cloud_signed_in(
+        timeout_sec=5, interval_sec=0, check=lambda: False, sleep=lambda _s: None, stop=lambda: True
+    ) is False
+    applied = ollama_login_status_message(applied=True)
+    restart = ollama_login_status_message(applied=False)
+    assert "반영했습니다" in applied and "다시 시작" not in applied
+    assert "다시 시작" in restart
     print("ollama_usage self-check ok", path)

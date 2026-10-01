@@ -8,29 +8,36 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 
 
-def _maybe_elevate_for_unrestricted() -> bool:
-    """제한 없음 저장 상태인데 비관리자면 UAC 재실행. True면 현재 프로세스 종료."""
+def _maybe_elevate_on_startup() -> bool:
+    """관리자 재실행이 필요하면 UAC 후 True(현재 프로세스 종료).
+
+    - 제한 없음 권한
+    - 실행 프로토콜(첫 설치·Core 미완료) — winget/Hermes 등이 관리자에서만 정상
+    """
     if sys.platform != "win32":
         return False
     try:
-        from iris.learning.elevation import is_elevated, relaunch_as_admin
-        from iris.storage.database import Database
-        from iris.storage.learning_prefs import load_learning_preferences
+        from iris.learning.elevation import (
+            is_elevated,
+            needs_admin_for_setup,
+            relaunch_as_admin,
+        )
 
         if is_elevated():
             return False
+        from iris.storage.database import Database
+        from iris.storage.learning_prefs import load_learning_preferences
+
         prefs = load_learning_preferences(Database())
-        if prefs.permission_level != "unrestricted":
-            return False
-        if relaunch_as_admin():
-            return True
+        if prefs.permission_level == "unrestricted" or needs_admin_for_setup():
+            return bool(relaunch_as_admin())
     except Exception:
         return False
     return False
 
 
 def main() -> None:
-    if _maybe_elevate_for_unrestricted():
+    if _maybe_elevate_on_startup():
         sys.exit(0)
 
     # GUI 전용 — 단독 콘솔이면 숨기고, 백그라운드 자식도 창 없이
@@ -41,17 +48,23 @@ def main() -> None:
     except Exception:
         pass
 
-    from iris.assets.branding import (
-        APP_DISPLAY_NAME,
-        apply_windows_app_id,
-        load_app_icon,
-    )
+    # Windows 작업표시줄 아이콘 — Qt/QApplication import 전에 AppID 등록
+    if sys.platform == "win32":
+        from iris.assets.windows_taskbar import ensure_windows_taskbar_branding
+
+        ensure_windows_taskbar_branding()
+
+    from iris.ui.qt_bootstrap import ensure_qt_webengine_ready
+
+    ensure_qt_webengine_ready()
+
+    from iris.assets.branding import APP_DISPLAY_NAME, load_app_icon
     from iris.ui.window.main_window import MainWindow
 
-    # QApplication 전에 AppID — 작업표시줄이 python 아이콘으로 묶이지 않게
-    apply_windows_app_id()
-
     app = QApplication(sys.argv)
+    # ponytail: 설정/위저드 등 top-level 다이얼로그만 닫혀도 프로세스 종료 금지 —
+    # 종료는 MainWindow.closeEvent accept 뒤 QApplication.quit()만.
+    app.setQuitOnLastWindowClosed(False)
     app.setOrganizationName(APP_DISPLAY_NAME)
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
@@ -61,7 +74,8 @@ def main() -> None:
     app.setFont(QFont("Noto Sans KR", 10))
     win = MainWindow()
     win.show()
-    app.processEvents()
+    for _ in range(3):
+        app.processEvents()
     sys.exit(app.exec())
 
 

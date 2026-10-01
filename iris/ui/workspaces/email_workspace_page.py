@@ -5,7 +5,6 @@ from __future__ import annotations
 import html
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QDialog,
@@ -18,7 +17,6 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
-    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -27,9 +25,7 @@ from PyQt6.QtWidgets import (
 
 from iris.infrastructure.email_client import MailMessage, MailSummary
 from iris.storage.email_accounts import EmailAccount
-from iris.ui.chat.chat_panel import ChatComposerInput
-from iris.ui.widgets.particle_visualizer import ParticleVisualizer
-from iris.ui.workspaces.workspace_iris_chat import WorkspaceIrisChatLog
+from iris.ui.workspaces.workspace_iris_chat import WorkspaceIrisPanel
 
 _CATEGORY_TABS = ("기본", "프로모션", "소셜", "업데이트")
 
@@ -108,91 +104,6 @@ class _MailRow(QWidget):
         row.addWidget(date, 0)
 
 
-class _EmailIrisPanel(QWidget):
-    """우측 — 아이리스 오브 + 이메일 전용 채팅."""
-
-    chat_send = pyqtSignal(str)
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("EmailIrisPanel")
-
-        col = QVBoxLayout(self)
-        col.setContentsMargins(8, 8, 8, 8)
-        col.setSpacing(8)
-
-        # 구체 영역/위치는 우측 상단으로 유지하되 구체 자체를 크게 렌더링.
-        # ponytail: fit-cap 때문에 슬롯을 키워야 실제로 커진다(오버플로우/클리핑 회피).
-        self.orb = ParticleVisualizer(self)
-        self.orb.setMinimumHeight(300)
-        self.orb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.orb.set_size_scale(3.0)
-        col.addWidget(self.orb, 0)
-
-        self._log = WorkspaceIrisChatLog("EmailChatLog")
-        col.addWidget(self._log, 1)
-
-        input_row = QHBoxLayout()
-        input_row.setSpacing(6)
-        self._input = ChatComposerInput()
-        self._input.setObjectName("EmailChatInput")
-        self._input.setPlaceholderText("이메일 업무를 요청하세요 (예: 이 메일 답장 초안)")
-        self._input.setStyleSheet(
-            """
-            QPlainTextEdit#EmailChatInput {
-                background-color: rgba(15, 23, 42, 0.85);
-                color: #ffffff;
-                border: 1px solid rgba(56, 189, 248, 0.28);
-                border-radius: 16px;
-                padding: 6px 12px;
-            }
-            QPlainTextEdit#EmailChatInput:focus { border-color: rgba(56, 189, 248, 0.6); }
-            """
-        )
-        self._input.submit_requested.connect(self._emit_send)
-        self._send = QPushButton("↑")
-        self._send.setFixedSize(30, 30)
-        self._send.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #4f46e5; color: #fff; border: none;
-                border-radius: 15px; font-size: 15px; font-weight: 700;
-            }
-            QPushButton:hover { background-color: #6366f1; }
-            """
-        )
-        self._send.clicked.connect(self._emit_send)
-        input_row.addWidget(self._input, 1, Qt.AlignmentFlag.AlignBottom)
-        input_row.addWidget(self._send, 0, Qt.AlignmentFlag.AlignBottom)
-        col.addLayout(input_row)
-
-    def _emit_send(self) -> None:
-        text = self._input.text().strip()
-        if not text:
-            return
-        self._input.clear()
-        self.chat_send.emit(text)
-
-    def append_user(self, text: str) -> None:
-        self._log.append_user(text)
-
-    def append_iris_chunk(self, text: str) -> None:
-        self._log.append_iris_chunk(text)
-
-    def end_iris(self, final_text: str | None = None) -> None:
-        self._log.end_iris(final_text)
-
-    def append_iris_tool(self, text: str) -> None:
-        self._log.append_iris_tool(text)
-
-    def append_iris_error(self, text: str) -> None:
-        self._log.append_iris_error(text)
-
-    def set_orb_state(self, state_name: str) -> None:
-        self.orb.set_state(state_name)
-
-
 class EmailWorkspacePage(QWidget):
     """중앙 메일 리스트/리더 + 우측 아이리스 패널."""
 
@@ -219,7 +130,10 @@ class EmailWorkspacePage(QWidget):
 
         splitter.addWidget(self._build_center())
 
-        self.iris_panel = _EmailIrisPanel()
+        self.iris_panel = WorkspaceIrisPanel(
+            name_prefix="Email",
+            placeholder="이메일 업무를 요청하세요 (예: 이 메일 답장 초안)",
+        )
         self.iris_panel.setMinimumWidth(240)
         self.iris_panel.setMaximumWidth(380)
         self.iris_panel.chat_send.connect(self.email_chat_send.emit)
@@ -321,18 +235,29 @@ class EmailWorkspacePage(QWidget):
         self._meta.setObjectName("SectionTitle")
         self._meta.setWordWrap(True)
         reader_lay.addWidget(self._meta)
-        # 실제 브라우저 엔진으로 렌더 → HTML·이미지·상호작용 정상 표시.
-        self._body = QWebEngineView()
-        self._body.setObjectName("EmailPreviewBody")
-        # 배경 흰색 제거 → 사이버스페이스 배경이 비치도록 투명 처리.
-        self._body.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._body.setStyleSheet("background: transparent;")
-        self._body.page().setBackgroundColor(Qt.GlobalColor.transparent)
-        reader_lay.addWidget(self._body, 1)
+        self._body: object | None = None
+        self._body_slot = QWidget()
+        self._body_slot_lay = QVBoxLayout(self._body_slot)
+        self._body_slot_lay.setContentsMargins(0, 0, 0, 0)
+        reader_lay.addWidget(self._body_slot, 1)
         self._stack.addWidget(reader)
 
         lay.addWidget(self._stack, 1)
         return center
+
+    def _ensure_body_view(self):
+        if self._body is not None:
+            return self._body
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+        view = QWebEngineView()
+        view.setObjectName("EmailPreviewBody")
+        view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        view.setStyleSheet("background: transparent;")
+        view.page().setBackgroundColor(Qt.GlobalColor.transparent)
+        self._body_slot_lay.addWidget(view)
+        self._body = view
+        return view
 
     # ---- 외부 API (main_window에서 사용) ----
     def set_current_account(self, account: EmailAccount | None) -> None:
@@ -343,6 +268,9 @@ class EmailWorkspacePage(QWidget):
 
     def current_message(self) -> MailMessage | None:
         return self._current_message
+
+    def current_mails(self) -> list[MailSummary]:
+        return list(self._mails)
 
     def set_loading(self, loading: bool) -> None:
         self._refresh_btn.setEnabled(not loading)
@@ -390,16 +318,18 @@ class EmailWorkspacePage(QWidget):
             f"border-bottom:1px solid rgba(148,163,184,0.25); margin-bottom:12px;'>{header}</div>"
             f"{content}</body></html>"
         )
-        self._body.setHtml(doc)
+        self._ensure_body_view().setHtml(doc)
         self._stack.setCurrentIndex(1)
 
     def show_error(self, text: str) -> None:
         self._status.setText(text)
-        self._body.setHtml("")
+        if self._body is not None:
+            self._body.setHtml("")
 
     def show_empty_inbox_hint(self) -> None:
         self._status.setText("메일이 없습니다.")
-        self._body.setHtml("")
+        if self._body is not None:
+            self._body.setHtml("")
 
     def open_compose(self, account: EmailAccount) -> None:
         dlg = _ComposeDialog(account, self)

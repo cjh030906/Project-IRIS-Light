@@ -21,6 +21,23 @@ HandlerFn = Callable[[dict[str, Any]], dict[str, Any]]
 # 클라이언트가 응답 전에 연결을 끊으면 Windows에서 흔함 (Hermes MCP 타임아웃 등)
 _CLIENT_GONE = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError)
 
+# ponytail: adb/kill sleep·IMAP을 Qt 메인에 올리면 Windows "응답 없음". HTTP 워커에서 실행.
+# 천장: 핸들러가 UI 위젯을 직접 건드리면 안 됨 — control_bindings._call_on_ui 가 마샬함.
+_OFF_UI_PREFIXES = ("emulator.",)
+_OFF_UI_ACTIONS = frozenset(
+    {
+        "email.list_messages",
+        "email.read_message",
+        # 터미널 로그 폴링·브리지 왕복이 최대 90초 — UI 스레드면 Windows "응답 없음"
+        "project.run",
+    }
+)
+
+
+def runs_off_ui_thread(action: str) -> bool:
+    name = (action or "").strip()
+    return name in _OFF_UI_ACTIONS or any(name.startswith(p) for p in _OFF_UI_PREFIXES)
+
 
 def _is_client_gone(exc: BaseException) -> bool:
     if isinstance(exc, _CLIENT_GONE):
@@ -90,14 +107,87 @@ def clear_control_endpoint() -> None:
 
 
 def ok_result(action: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    """성공. result 생략은 {} — 빈 객체는 페이로드 없음이지, 대상 없음·null이 아니다.
+
+    대상 없음은 액션 result 안의 null(예: editor) 또는 빈 목록으로 액션이 적는다.
+    status는 success. 호출은 동기 HTTP다. UI 스레드 액션은 invoker가 마샬하고,
+    runs_off_ui_thread인 액션만 HTTP 워커에서 직접 돈다.
+    """
     return {"ok": True, "action": action, "status": "success", "result": result or {}, "error": None}
 
 
-def err_result(action: str, error: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {"ok": False, "action": action, "status": "failed", "result": result or {}, "error": error}
+def err_result(
+    action: str,
+    error: str,
+    result: dict[str, Any] | None = None,
+    *,
+    status: str = "failed",
+) -> dict[str, Any]:
+    """실패. status=failed는 실행·입력 실패. status=timeout은 UI 스레드 대기 초과.
+
+    status=timeout은 취소도 미실행도 보장하지 않는다. 응답 뒤 큐의 작업이 실행될 수 있다.
+    같은 액션을 다시 호출하지 않는 것은 호출자 계약이다. 모든 호출자가 그렇게 하는지는 보장하지 않는다.
+    다시 호출하면 project.write_file·project.run이 겹칠 수 있다.
+    확인된 사실: MCP _http는 이 JSON(HTTP 400)을 재시도하지 않는다.
+    액션 내부 TimeoutError는 레지스트리가 status=failed로 감싼다.
+    연결 실패는 이 객체가 아니다. 클라이언트가 먼저 끊기면 본문을 쓰지 않는다.
+    status=invalid는 깨진 JSON·비객체 본문이다. 액션은 실행되지 않고, 연결 실패도 아니다.
+    필드 ok/action/result/error는 기존과 같다. status는 failed|timeout|invalid이다.
+    """
+    return {"ok": False, "action": action, "status": status, "result": result or {}, "error": error}
+
+
+def parse_invoke_body(raw: bytes) -> tuple[dict[str, Any] | None, str | None]:
+    """빈 바이트는 {}. 깨진 JSON·배열은 오류. {}는 인자 없음이지 파싱 실패가 아니다."""
+    if not raw:
+        return {}, None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid JSON"
+    if not isinstance(data, dict):
+        return None, "JSON object required"
+    return data, None
+
+
+def call_registered(surface: ControlSurface, action: str, args: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """레지스트리 호출.
+
+    status=timeout은 UiThreadTimeout이다. 대기 포기일 뿐 큐를 취소하지 않는다.
+    같은 액션을 다시 호출하지 않는 것은 호출자 계약이다. 코드가 모든 재시도를 막지는 않는다.
+    MCP _http만 HTTP 400을 재시도하지 않는 것이 확인됐다.
+    UiThreadTimeout만 status=timeout이다. 그 외 TimeoutError와 핸들러 예외는 status=failed다.
+    브리지 대기 초과(BridgeCallTimeout)는 TimeoutError가 아니므로 이 분기에 들어가지 않는다.
+    """
+
+    def _run() -> dict[str, Any]:
+        if surface.booting and action not in ("ping", "get_state", "get_catalog"):
+            return err_result(action or "invoke", "Iris is still booting")
+        return surface.registry.invoke(action, args)
+
+    try:
+        if runs_off_ui_thread(action):
+            return _run()
+        return surface.invoker.run(_run, timeout=timeout)
+    except UiThreadTimeout as exc:
+        return err_result(action or "invoke", str(exc), status="timeout")
+    except TimeoutError as exc:
+        return err_result(action or "invoke", str(exc) or "timeout")
+
+
+class UiThreadTimeout(TimeoutError):
+    """UI 스레드 대기 초과. 큐에 들어간 호출은 취소되지 않는다."""
+
+    def __init__(self) -> None:
+        super().__init__("Iris UI thread timeout")
 
 
 class ActionRegistry:
+    """Control Surface 액션 인터페이스. 이름 → 핸들러.
+
+    기여자는 ``register``로 액션을 올린다. HTTP 서버 구현은 이 클래스 밖이다.
+    """
+
     def __init__(self) -> None:
         self._specs: dict[str, ActionSpec] = {}
         self._handlers: dict[str, HandlerFn] = {}
@@ -111,6 +201,7 @@ class ActionRegistry:
         risk: str = "low",
         confirm_required: bool = False,
     ) -> None:
+        """액션 이름 하나를 등록한다. 같은 이름이면 ``ValueError``."""
         if name in self._specs:
             raise ValueError(f"duplicate control action: {name}")
         self._specs[name] = ActionSpec(
@@ -211,6 +302,15 @@ class ControlSurface:
                 q = urlparse(self.path).query
                 return f"token={surface.token}" in q.split("&") if q else False
 
+            def _cors(self) -> None:
+                # Theia(QWebEngine) → control 포트는 cross-origin — ACAO 없으면 askIris 실패
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type",
+                )
+
             def _json(self, code: int, body: dict[str, Any]) -> None:
                 raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 try:
@@ -218,6 +318,7 @@ class ControlSurface:
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(raw)))
                     self.send_header("Connection", "close")
+                    self._cors()
                     self.end_headers()
                     self.wfile.write(raw)
                 except Exception as exc:  # noqa: BLE001
@@ -225,21 +326,29 @@ class ControlSurface:
                         return
                     raise
 
-            def _read_json(self) -> dict[str, Any]:
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                try:
+                    self.send_response(204)
+                    self._cors()
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                except Exception as exc:  # noqa: BLE001
+                    if _is_client_gone(exc):
+                        return
+                    raise
+
+            def _read_json(self) -> tuple[dict[str, Any] | None, str | None]:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length <= 0:
-                    return {}
+                    return {}, None
                 try:
                     raw = self.rfile.read(length)
                 except Exception as exc:  # noqa: BLE001
                     if _is_client_gone(exc):
-                        return {}
+                        return None, "client disconnected"
                     raise
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    return {}
-                return data if isinstance(data, dict) else {}
+                return parse_invoke_body(raw)
 
             def do_GET(self) -> None:  # noqa: N802
                 if not self._auth_ok():
@@ -256,15 +365,18 @@ class ControlSurface:
                     )
                     return
                 if path == "/v1/catalog":
-                    body = surface.invoker.run(
-                        lambda: ok_result("get_catalog", {"actions": surface.registry.catalog()})
+                    # registry만 — UI 스레드 불필요 (Companion/타일 중 타임아웃 방지)
+                    self._json(
+                        200,
+                        ok_result(
+                            "get_catalog",
+                            {"actions": surface.registry.catalog()},
+                        ),
                     )
-                    self._json(200, body)
                     return
                 if path == "/v1/state":
-                    body = surface.invoker.run(
-                        lambda: surface.registry.invoke("get_state", {})
-                    )
+                    # 실패도 200 — 기존 소비자(urlopen)가 400을 연결 거절로 오인하지 않게
+                    body = call_registered(surface, "get_state", {}, timeout=15.0)
                     self._json(200, body)
                     return
                 self._json(404, err_result("http", f"not found: {path}"))
@@ -274,29 +386,19 @@ class ControlSurface:
                     self._json(401, err_result("auth", "unauthorized"))
                     return
                 path = urlparse(self.path).path.rstrip("/") or "/"
-                payload = self._read_json()
+                payload, read_err = self._read_json()
                 if path == "/v1/invoke":
+                    if read_err or payload is None:
+                        self._json(400, err_result("invoke", read_err or "invalid JSON", status="invalid"))
+                        return
                     action = str(payload.get("action") or "").strip()
                     args = payload.get("args")
                     if not isinstance(args, dict):
                         args = {k: v for k, v in payload.items() if k not in ("action", "args")}
 
-                    def _run() -> dict[str, Any]:
-                        if surface.booting and action not in (
-                            "ping",
-                            "get_state",
-                            "get_catalog",
-                        ):
-                            return err_result(action or "invoke", "Iris is still booting")
-                        if action in ("ping", "get_catalog", "get_state"):
-                            return surface.registry.invoke(action, args)
-                        return surface.registry.invoke(action, args)
-
-                    # ponytail: live file stream / project.run 은 메인스레드에서 길어질 수 있음
+                    # ponytail: live file stream 은 메인스레드에서 길어질 수 있음
                     timeout = 15.0
-                    if action == "project.run":
-                        timeout = float(args.get("timeout_sec") or 60) + 30.0
-                    elif action == "project.write_file":
+                    if action == "project.write_file":
                         # open+live stream 기본 — 작성 연출 대기
                         if bool(args.get("open", True)) and bool(
                             args.get("typewriter", args.get("stream", True))
@@ -304,7 +406,8 @@ class ControlSurface:
                             timeout = 180.0
                         elif bool(args.get("stream")):
                             timeout = 120.0
-                    body = surface.invoker.run(_run, timeout=timeout)
+
+                    body = call_registered(surface, action, args, timeout=timeout)
                     self._json(200 if body.get("ok") else 400, body)
                     return
                 self._json(404, err_result("http", f"not found: {path}"))
@@ -389,6 +492,38 @@ def _self_check() -> None:
     assert denied["ok"] is False
     allowed = high.invoke("email.send", {"confirm": True})
     assert allowed["ok"] is True
+    # 긴 액션이 UI 스레드로 돌아가면 Windows "응답 없음"
+    assert runs_off_ui_thread("project.run")
+    assert runs_off_ui_thread("emulator.start")
+    assert not runs_off_ui_thread("project.write_file")
+    empty, empty_err = parse_invoke_body(b"")
+    assert empty == {} and empty_err is None
+    bad, bad_err = parse_invoke_body(b"[1]")
+    assert bad is None and bad_err == "JSON object required"
+    broken, broken_err = parse_invoke_body(b"{")
+    assert broken is None and broken_err == "invalid JSON"
+
+    class _Boom:
+        def run(self, fn: Callable[[], Any], timeout: float = 15.0) -> Any:
+            raise UiThreadTimeout()
+
+    class _Surface:
+        booting = False
+        registry = reg
+        invoker = _Boom()
+
+    timed = call_registered(_Surface(), "ping", {}, timeout=0.01)  # type: ignore[arg-type]
+    assert timed["ok"] is False and timed["status"] == "timeout"
+    assert timed["error"] == "Iris UI thread timeout"
+
+    class _Disk:
+        def run(self, fn: Callable[[], Any], timeout: float = 15.0) -> Any:
+            raise TimeoutError("disk")
+
+    _Surface.invoker = _Disk()
+    disk = call_registered(_Surface(), "ping", {}, timeout=0.01)  # type: ignore[arg-type]
+    assert disk["status"] == "failed" and disk["error"] == "disk"
+    assert reg.invoke("missing", {})["status"] == "failed"
     print("control_surface self-check ok")
 
 

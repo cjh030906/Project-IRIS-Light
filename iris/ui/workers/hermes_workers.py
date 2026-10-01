@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from iris.infrastructure.hermes_client import HermesClient, host_label_for_hermes
+from iris.ui.workers.chat_attempt import (
+    ChatAttempt,
+    decide_fallback,
+    normalize_attempts,
+)
+from iris.infrastructure.hermes_client import (
+    HermesClient,
+    HermesInferenceTarget,
+    host_label_for_hermes,
+    resolve_hermes_inference,
+)
 from iris.system.hermes_gateway import (
     ensure_hermes_gateway_running,
     ensure_hermes_provider_config,
@@ -50,9 +60,6 @@ class HermesHealthWorker(QThread):
                         f"MCP 점검 실패 {report.mcp_fail_count}개 — 설정·경로를 확인하세요."
                     )
 
-                gateway_up = is_hermes_gateway_running(
-                    self._base_url, api_key=self._api_key
-                )
                 if report.needs_gateway_reload:
                     self.notice.emit("MCP 연결 — Hermes gateway 완전 재기동…")
                     ok = restart_hermes_gateway(
@@ -77,6 +84,10 @@ class HermesHealthWorker(QThread):
                     self.finished_ok.emit(ok)
                     return
 
+                # soft reconnect: config 동일·control live → 강제 재기동 없이 검증만
+                gateway_up = is_hermes_gateway_running(
+                    self._base_url, api_key=self._api_key
+                )
                 if gateway_up:
                     # 이미 떠 있어도 MCP가 죽은 채일 수 있음 → 검증 후 필요 시 재기동
                     mcp_ok, mcp_detail = verify_iris_mcp_tools(command=self._command)
@@ -126,9 +137,16 @@ class HermesHealthWorker(QThread):
                 )
                 ok = mcp_ok
             else:
-                self.notice.emit(
-                    "Hermes gateway를 시작할 수 없습니다. hermes 설치와 API_SERVER_ENABLED를 확인하세요."
-                )
+                from iris.system.hermes_gateway import get_last_gateway_diagnosis
+
+                diag = get_last_gateway_diagnosis()
+                if diag is not None:
+                    self.notice.emit(diag.user_message()[:400])
+                else:
+                    self.notice.emit(
+                        "Hermes gateway를 시작할 수 없습니다. "
+                        "hermes 설치·포트 8642·로그(%LOCALAPPDATA%\\hermes\\logs\\iris-gateway)를 확인하세요."
+                    )
             self.finished_ok.emit(ok)
         except Exception as e:
             self.failed.emit(str(e))
@@ -191,7 +209,7 @@ class HermesControlSyncWorker(QThread):
 
 
 class HermesModelSyncWorker(QThread):
-    """Iris 모델 선택 → Hermes config 동기화."""
+    """Iris 모델 선택 → Hermes config 동기화 (Ollama + 커스텀 API)."""
 
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
@@ -203,6 +221,7 @@ class HermesModelSyncWorker(QThread):
         *,
         api_key: str = "",
         command: str = "hermes",
+        target: HermesInferenceTarget | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -210,6 +229,7 @@ class HermesModelSyncWorker(QThread):
         self._model = model
         self._api_key = api_key
         self._command = command
+        self._target = target
 
     def run(self) -> None:
         try:
@@ -218,20 +238,30 @@ class HermesModelSyncWorker(QThread):
                 api_key=self._api_key,
                 command=self._command,
             )
-            client.set_inference_model(self._model)
+            if self._target is not None:
+                client.set_inference_model(self._target.model, target=self._target)
+            else:
+                client.set_inference_model(self._model)
             self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(str(e))
 
 
 class HermesChatWorker(QThread):
-    """Hermes API 채팅 스트림."""
+    """Hermes API 채팅 스트림.
+
+    후보를 여러 개 받으면 앞의 것이 막혔을 때(할당량 소진·서버 오류) 다음 후보로
+    넘어간다. 후보마다 자기 messages 와 해석된 타깃을 들고 있으므로, 상류
+    프로바이더가 바뀌어도 요청을 그 후보 기준으로 새로 만든다.
+    """
 
     connecting = pyqtSignal(str, str)  # model, host
     tool_progress = pyqtSignal(str)
     content_chunk = pyqtSignal(str)
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
+    # (새 모델, 사유, 이미 흘려보낸 content 가 있었는지)
+    switched = pyqtSignal(str, str, bool)
 
     def __init__(
         self,
@@ -241,6 +271,8 @@ class HermesChatWorker(QThread):
         *,
         api_key: str = "",
         command: str = "hermes",
+        target: HermesInferenceTarget | None = None,
+        attempts: list[ChatAttempt] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -249,45 +281,124 @@ class HermesChatWorker(QThread):
         self._messages = messages
         self._api_key = api_key
         self._command = command
+        self._target = target
         self._cancel = False
+        if not attempts:
+            attempts = [
+                ChatAttempt(
+                    model,
+                    messages,
+                    label=(target.label if target is not None else model),
+                    target=target,
+                )
+            ]
+        self._attempts = normalize_attempts(attempts, model=model, messages=messages)
+        self._final_model = self._attempts[0].model
+
+    @property
+    def final_model(self) -> str:
+        """실제로 답을 만들어낸 모델."""
+        return self._final_model
 
     def request_cancel(self) -> None:
         self._cancel = True
 
+    def _sleep_ms(self, delay_ms: int) -> None:
+        waited = 0
+        while waited < delay_ms and not self._cancel:
+            step = min(100, delay_ms - waited)
+            self.msleep(step)
+            waited += step
+
+    def _ensure_gateway(self) -> str:
+        """게이트웨이 기동 보장. 실패하면 사용자에게 보일 문구를 돌려준다."""
+        if is_hermes_gateway_running(self._base_url, api_key=self._api_key):
+            return ""
+        self.tool_progress.emit("Hermes gateway 기동 중…")
+        if ensure_hermes_gateway_running(
+            self._base_url, api_key=self._api_key, command=self._command
+        ):
+            return ""
+        from iris.system.hermes_gateway import get_last_gateway_diagnosis
+
+        diag = get_last_gateway_diagnosis()
+        if diag is not None:
+            return diag.user_message()[:400]
+        return (
+            "Hermes gateway를 시작할 수 없습니다. "
+            r"설치·포트·%LOCALAPPDATA%\hermes\logs\iris-gateway 로그를 확인하세요."
+        )
+
     def run(self) -> None:
+        # 게이트웨이가 안 뜨면 어느 후보로도 못 간다 — 전환 대상이 아니다.
+        gateway_error = self._ensure_gateway()
+        if gateway_error:
+            self.failed.emit(gateway_error)
+            return
+
         host = host_label_for_hermes(self._base_url)
-        self.connecting.emit(self._model, host)
-        content_parts: list[str] = []
-        try:
-            if not is_hermes_gateway_running(self._base_url, api_key=self._api_key):
-                self.tool_progress.emit("Hermes gateway 기동 중…")
-                if not ensure_hermes_gateway_running(
-                    self._base_url,
-                    api_key=self._api_key,
-                    command=self._command,
-                ):
-                    self.failed.emit(
-                        "Hermes gateway를 시작할 수 없습니다. hermes 설치와 API_SERVER_ENABLED를 확인하세요."
-                    )
-                    return
-            client = HermesClient(
-                self._base_url,
-                api_key=self._api_key,
-                command=self._command,
+        last_error = ""
+        for index, attempt in enumerate(self._attempts):
+            if self._cancel:
+                break
+            self._final_model = attempt.model
+            target = attempt.target
+            display = target.label if target is not None else attempt.label
+            self.connecting.emit(display, host)
+
+            content_parts: list[str] = []
+            try:
+                client = HermesClient(
+                    self._base_url, api_key=self._api_key, command=self._command
+                )
+                if target is not None:
+                    client.set_inference_model(target.model, target=target)
+                    stream_model = target.model
+                else:
+                    client.set_inference_model(attempt.model)
+                    stream_model = attempt.model
+                for ev in client.stream_chat(stream_model, attempt.messages):
+                    if self._cancel:
+                        break
+                    tool = ev.get("tool_progress")
+                    if isinstance(tool, str) and tool:
+                        self.tool_progress.emit(tool)
+                    chunk = ev.get("content")
+                    if isinstance(chunk, str) and chunk:
+                        content_parts.append(chunk)
+                        self.content_chunk.emit(chunk)
+                    if ev.get("done"):
+                        break
+                self.finished_ok.emit("".join(content_parts))
+                return
+            except Exception as e:  # noqa: BLE001
+                last_error = str(e)
+
+            has_next = index + 1 < len(self._attempts)
+            if self._cancel or not has_next:
+                break
+            step = decide_fallback(last_error, index)
+            if step is None:
+                break
+            self._sleep_ms(step.delay_ms)
+            if self._cancel:
+                break
+            nxt = self._attempts[index + 1]
+            self.switched.emit(
+                nxt.model, nxt.reason_hint or step.reason, bool(content_parts)
             )
-            client.set_inference_model(self._model)
-            for ev in client.stream_chat(self._model, self._messages):
-                if self._cancel:
-                    break
-                tool = ev.get("tool_progress")
-                if isinstance(tool, str) and tool:
-                    self.tool_progress.emit(tool)
-                chunk = ev.get("content")
-                if isinstance(chunk, str) and chunk:
-                    content_parts.append(chunk)
-                    self.content_chunk.emit(chunk)
-                if ev.get("done"):
-                    break
-            self.finished_ok.emit("".join(content_parts))
-        except Exception as e:
-            self.failed.emit(str(e))
+
+        if not self._cancel:
+            self.failed.emit(last_error or "모델 응답 실패")
+
+
+# re-export for callers that resolve targets in UI thread
+__all__ = [
+    "HermesHealthWorker",
+    "HermesControlSyncWorker",
+    "HermesModelSyncWorker",
+    "HermesChatWorker",
+    "ChatAttempt",
+    "HermesInferenceTarget",
+    "resolve_hermes_inference",
+]

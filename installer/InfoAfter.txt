@@ -1,0 +1,5 @@
+IRIS is installed. Python venv and packages are already set up.
+
+On first launch, the setup wizard continues with Ollama and Hermes.
+
+Start IRIS from the desktop / Start Menu shortcut.

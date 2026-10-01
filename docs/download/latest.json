@@ -1,0 +1,25 @@
+{
+    "schema":  "iris-setup-release/v1",
+    "filename":  "IRIS-Setup-0.1.18.exe",
+    "display_filename":  "IRIS-Setup-0.1.18.exe",
+    "stable_filename":  "IRIS-Setup.exe",
+    "product_version":  "0.1.18",
+    "tag":  "v2026.09.30.1",
+    "published_at":  "2026-09-30T03:30:13Z",
+    "size_bytes":  27507558,
+    "sha256":  "1d3a8f4454d3ed9bebd8633219a770eda234beba50c7aef2653ed974ecc993f3",
+    "download_url":  "https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup-0.1.18.exe",
+    "stable_download_url":  "https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe",
+    "checksum_url":  "https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup-0.1.18.exe.sha256",
+    "stable_checksum_url":  "https://github.com/kwakminoo/Project-IRIS-Light/releases/latest/download/IRIS-Setup.exe.sha256",
+    "releases_url":  "https://github.com/kwakminoo/Project-IRIS-Light/releases",
+    "site_install_url":  "https://iris-light-site.vercel.app/#install",
+    "code_signed":  false,
+    "notes":  "Primary download is versioned (IRIS-Setup-0.1.18.exe) so browsers save with the version. IRIS-Setup.exe remains as a stable alias.",
+    "requirements":  {
+                         "os":  "Windows 10/11 (x64)",
+                         "ram":  "8GB (권장 16GB)",
+                         "disk":  "약 20GB (첫 설치·모델 포함)",
+                         "gpu":  "불필요 (기본 클라우드 모델)"
+                     }
+}

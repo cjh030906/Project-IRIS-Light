@@ -27,6 +27,8 @@ class OllamaModelInfo:
     # probe 전/실패 시 True — 숨기지 않고 기본(도구 지원) 스타일로 표시
     supports_tools: bool = True
     requires_subscription: bool = False
+    # 커스텀 API 전용 3-상태 (yes|no|unknown). 빈 문자열이면 supports_tools를 씀
+    tool_support: str = ""
 
     def __post_init__(self) -> None:
         if not self.catalog_name:
@@ -48,14 +50,77 @@ def probe_status_from_http_detail(detail: str) -> str:
     return "unavailable"
 
 
+def cleanup_verdict(
+    status: str,
+    *,
+    transient: bool,
+    capabilities: list[str] | None,
+    show_ok: bool,
+) -> tuple[str, str]:
+    """모델 정리 판정 — (state, tool_support).
+
+    state: ok | unverified | unavailable. tool: yes | no | unknown.
+    타임아웃·429·5xx는 unverified라 목록에 남긴다. 구독 전용·대화 거부는 제외.
+    """
+    if transient:
+        return "unverified", "unknown"
+    if status != "ok":
+        return "unavailable", "unknown"
+    if not show_ok:
+        return "ok", "unknown"
+    return "ok", ("yes" if supports_tools_capability(capabilities) else "no")
+
+
+def apply_ollama_cleanup(
+    model: OllamaModelInfo, record: dict[str, str] | None
+) -> OllamaModelInfo | None:
+    """저장된 정리 결과. unavailable이면 None(피커에서 제외)."""
+    if not record:
+        return model
+    if record.get("state") == "unavailable":
+        return None
+    tool = str(record.get("tool") or "")
+    if tool not in ("yes", "no", "unknown"):
+        return model
+    return OllamaModelInfo(
+        name=model.name,
+        catalog_name=model.catalog_name,
+        size=model.size,
+        digest=model.digest,
+        supports_tools=tool != "no",
+        requires_subscription=model.requires_subscription,
+        tool_support=tool,
+    )
+
+
 def display_name_from_runtime(runtime_name: str) -> str:
-    """gemma4:31b-cloud → gemma4:31b"""
-    n = runtime_name.strip()
-    if n.endswith("-cloud"):
-        return n[: -len("-cloud")]
-    if n.endswith(":cloud"):
-        return n[: -len(":cloud")]
-    return n
+    """UI용 짧은 모델명.
+
+    - ``api:{provider_id}:{model}`` → 모델명만
+    - ``google/gemma-…`` / ``models/gemini-…`` → 경로·org 제거
+    - ``gemma4:31b-cloud`` → ``gemma4:31b``
+    - 하이픈 구분 API id → 공백 (``gemini-2.5-flash`` → ``gemini 2.5 flash``)
+    """
+    n = (runtime_name or "").strip()
+    if not n or n == "(unset)":
+        return n
+    # Iris 커스텀 API runtime — provider id 버리고 모델 id만
+    if n.lower().startswith("api:") and ":" in n[4:]:
+        n = n.split(":", 2)[2].strip()
+    for suf in ("-cloud", ":cloud"):
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+            break
+    # org/models/… 경로 → 마지막 세그먼트
+    if "/" in n:
+        n = n.rsplit("/", 1)[-1].strip()
+    if not n:
+        return runtime_name.strip()
+    # Ollama 태그(gemma4:31b)는 그대로
+    if ":" in n:
+        return n
+    # API 스타일 하이픈 id → 읽기 쉬운 공백
+    return n.replace("-", " ").strip()
 
 
 def to_runtime_cloud_name(catalog_name: str) -> str:
@@ -84,6 +149,39 @@ def _native_base(openai_or_native: str) -> str:
     if raw.endswith("/v1"):
         raw = raw[:-3]
     return raw or "http://127.0.0.1:11434"
+
+
+# 임베딩 전용 모델 — Ollama는 용도를 알려주는 API가 없어 이름으로 가른다.
+# 앞일수록 한국어 품질이 좋아 우선 선택된다.
+EMBEDDING_MODEL_PREFERENCE: tuple[str, ...] = (
+    "bge-m3",
+    "qwen3-embedding",
+    "multilingual-e5",
+    "mxbai-embed-large",
+    "snowflake-arctic-embed2",
+    "nomic-embed-text",
+    "all-minilm",
+)
+_EMBEDDING_NAME_HINTS = ("embed", "bge-", "e5-", "gte-")
+
+
+def is_embedding_model_name(name: str) -> bool:
+    """`bge-m3:latest`·`nomic-embed-text` 처럼 임베딩 전용인지 이름으로 판별."""
+    base = (name or "").strip().lower().split(":")[0]
+    if not base:
+        return False
+    if any(base == p or base.startswith(f"{p}-") or base.startswith(f"{p}:") for p in EMBEDDING_MODEL_PREFERENCE):
+        return True
+    return any(hint in base for hint in _EMBEDDING_NAME_HINTS)
+
+
+def embedding_model_rank(name: str) -> tuple[int, str]:
+    """선호 목록 순서 → 정렬 키. 목록에 없으면 뒤로."""
+    base = (name or "").strip().lower().split(":")[0]
+    for idx, pref in enumerate(EMBEDDING_MODEL_PREFERENCE):
+        if base == pref or base.startswith(f"{pref}-"):
+            return (idx, base)
+    return (len(EMBEDDING_MODEL_PREFERENCE), base)
 
 
 def host_label_for_model(model: str, base_url: str) -> str:
@@ -230,8 +328,10 @@ class OllamaClient:
         return supports_tools_capability(data.get("capabilities"))
 
 
-    def probe_model_status(self, runtime_name: str, *, timeout_sec: float = 25.0) -> str:
-        """'ok' | 'subscription' | 'unavailable'."""
+    def probe_model_outcome(
+        self, runtime_name: str, *, timeout_sec: float = 25.0
+    ) -> tuple[str, bool]:
+        """(status, transient). transient면 네트워크·과부하 — 모델 탓으로 빼지 않음."""
         payload = {
             "model": runtime_name,
             "messages": [{"role": "user", "content": "ping"}],
@@ -246,12 +346,36 @@ class OllamaClient:
         try:
             with urlopen(req, timeout=timeout_sec) as resp:
                 json.loads(resp.read().decode("utf-8"))
-            return "ok"
+            return "ok", False
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            return probe_status_from_http_detail(detail)
+            status = probe_status_from_http_detail(detail)
+            code = int(e.code)
+            if status == "subscription":
+                return status, False
+            if code in (401, 429) or code >= 500:
+                return "unavailable", True
+            return status, False
         except (URLError, TimeoutError, json.JSONDecodeError, OSError):
-            return "unavailable"
+            return "unavailable", True
+
+    def probe_model_status(self, runtime_name: str, *, timeout_sec: float = 25.0) -> str:
+        """'ok' | 'subscription' | 'unavailable'."""
+        status, _transient = self.probe_model_outcome(runtime_name, timeout_sec=timeout_sec)
+        return status
+
+    def classify_model(self, runtime_name: str, *, timeout_sec: float = 25.0) -> tuple[str, str]:
+        """모델 정리 1건 — (state, tool_support)."""
+        status, transient = self.probe_model_outcome(runtime_name, timeout_sec=timeout_sec)
+        if transient or status != "ok":
+            return cleanup_verdict(
+                status, transient=transient, capabilities=None, show_ok=False
+            )
+        data = self.show_model(runtime_name)
+        caps = data.get("capabilities") if isinstance(data.get("capabilities"), list) else None
+        return cleanup_verdict(
+            status, transient=False, capabilities=caps, show_ok=bool(data)
+        )
 
     def probe_model_available(self, runtime_name: str, *, timeout_sec: float = 25.0) -> bool:
         """구독 없이 호출 가능하면 True (무료 tier 포함)."""
@@ -278,6 +402,69 @@ class OllamaClient:
             seen.add(m.name)
             out.append(m)
         return out
+    def list_embedding_models(self) -> list[str]:
+        """로컬에 설치된 임베딩 모델만 — 이름으로 판별(별도 API 없음)."""
+        try:
+            local = self.list_models()
+        except Exception:
+            return []
+        return [m.name for m in local if is_embedding_model_name(m.name)]
+
+    def pick_embedding_model(self, preferred: str = "") -> str:
+        """선호 모델 → 설치된 것 중 품질순. 없으면 빈 문자열(키워드 검색만 씀)."""
+        installed = self.list_embedding_models()
+        if not installed:
+            return ""
+        want = (preferred or "").strip()
+        if want:
+            for name in installed:
+                if name == want or name.split(":")[0] == want.split(":")[0]:
+                    return name
+        ranked = sorted(installed, key=embedding_model_rank)
+        return ranked[0]
+
+    def embed(
+        self,
+        model: str,
+        texts: list[str],
+        *,
+        timeout_sec: float = 120.0,
+        keep_alive: str | None = None,
+    ) -> list[list[float]]:
+        """텍스트 배치 → 벡터. 신형 /api/embed, 실패 시 구형 /api/embeddings 폴백.
+
+        `keep_alive` — 모델을 메모리에 붙잡아 둘 시간("30m"). Ollama는 요청마다
+        만료 시각을 그 요청 값(기본 5분)으로 다시 잡으므로 일관되게 넘겨야 한다.
+        """
+        items = [str(t or "") for t in texts]
+        if not items or not (model or "").strip():
+            return []
+        extra = {"keep_alive": keep_alive} if keep_alive else {}
+        try:
+            data = self._post_json(
+                "/api/embed",
+                {"model": model, "input": items, **extra},
+                timeout_sec=timeout_sec,
+            )
+            vectors = data.get("embeddings")
+            if isinstance(vectors, list) and len(vectors) == len(items):
+                return [[float(x) for x in vec] for vec in vectors]
+        except RuntimeError:
+            pass
+        # 구형 데몬 — 한 건씩만 받는다
+        out: list[list[float]] = []
+        for text in items:
+            data = self._post_json(
+                "/api/embeddings",
+                {"model": model, "prompt": text, **extra},
+                timeout_sec=timeout_sec,
+            )
+            vec = data.get("embedding")
+            if not isinstance(vec, list):
+                raise RuntimeError(f"Ollama 임베딩 응답 형식 오류: {model}")
+            out.append([float(x) for x in vec])
+        return out
+
     def stream_chat(
         self,
         model: str,
@@ -374,6 +561,31 @@ class OllamaClient:
         msg = obj.get("message") or {}
         return str(msg.get("content") or "") if isinstance(msg, dict) else ""
 
+    def _post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_sec: float = 60.0,
+    ) -> dict[str, Any]:
+        req = Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with urlopen(req, timeout=min(timeout_sec, self.timeout_sec)) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:400]
+            raise RuntimeError(f"Ollama HTTP {e.code}: {detail or e.reason}") from e
+        except URLError as e:
+            raise RuntimeError(f"Ollama 연결 실패: {e.reason}") from e
+
     def _get_json(self, path: str) -> dict[str, Any]:
         return self._get_json_url(f"{self.base_url}{path}")
 
@@ -401,6 +613,38 @@ if __name__ == "__main__":
     assert probe_status_from_http_detail("requires a subscription to use") == "subscription"
     assert probe_status_from_http_detail("please upgrade your plan") == "subscription"
     assert probe_status_from_http_detail("model not found") == "unavailable"
+    assert cleanup_verdict("ok", transient=True, capabilities=["tools"], show_ok=True) == (
+        "unverified",
+        "unknown",
+    )
+    assert cleanup_verdict("subscription", transient=False, capabilities=None, show_ok=False) == (
+        "unavailable",
+        "unknown",
+    )
+    assert cleanup_verdict("ok", transient=False, capabilities=["tools"], show_ok=True) == (
+        "ok",
+        "yes",
+    )
+    assert cleanup_verdict("ok", transient=False, capabilities=["completion"], show_ok=True) == (
+        "ok",
+        "no",
+    )
+    kept = apply_ollama_cleanup(OllamaModelInfo(name="a"), {"state": "ok", "tool": "no"})
+    assert kept is not None and kept.supports_tools is False and kept.tool_support == "no"
+    assert apply_ollama_cleanup(OllamaModelInfo(name="dead"), {"state": "unavailable"}) is None
     m = OllamaModelInfo(name="x:cloud", supports_tools=False, requires_subscription=True)
     assert m.supports_tools is False and m.requires_subscription is True
+    assert display_name_from_runtime("gemma4:31b-cloud") == "gemma4:31b"
+    assert display_name_from_runtime("api:ab12:models/gemini-2.5-flash") == "gemini 2.5 flash"
+    assert display_name_from_runtime("api:nv:google/gemma-2-9b-it") == "gemma 2 9b it"
+    assert display_name_from_runtime("api:x:meta/llama-3.1-8b-instruct") == "llama 3.1 8b instruct"
+    assert display_name_from_runtime("nvidia/nemotron-3-nano") == "nemotron 3 nano"
+    assert is_embedding_model_name("bge-m3:latest") is True
+    assert is_embedding_model_name("nomic-embed-text") is True
+    assert is_embedding_model_name("mxbai-embed-large:335m") is True
+    assert is_embedding_model_name("qwen3:8b") is False
+    assert is_embedding_model_name("gemma4:31b-cloud") is False
+    assert is_embedding_model_name("") is False
+    assert embedding_model_rank("bge-m3:latest") < embedding_model_rank("nomic-embed-text")
+    assert embedding_model_rank("nomic-embed-text") < embedding_model_rank("weird-vec")
     print("ollama_client self-check ok")

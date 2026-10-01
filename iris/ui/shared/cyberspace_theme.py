@@ -42,7 +42,7 @@ def build_cyberspace_qss() -> str:
             background-color: {t.void_black};
         }}
         QWidget#FramelessShell {{
-            background: transparent;
+            background-color: {t.void_black};
             border: none;
         }}
         CyberspaceBackground {{
@@ -86,7 +86,7 @@ def build_cyberspace_qss() -> str:
         QWidget#ObsidianParticleOrb,
         QWidget#ObsidianDetailPanel,
         QWidget#LeftSidebarPanel,
-        QWidget#WindowListPanel,
+        QWidget#ChatHistoryPanel,
         QWidget#SidebarUtilityPanel,
         QWidget#SystemMetricsPanel,
         QWidget#WorkspaceActionPanel,

@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from xml.etree import ElementTree
 
+from iris.system.android_sdk_install import ensure_sdk, sdk_package_ids
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ANDROID_EMU_DIR = PROJECT_ROOT / "android-emulator"
 AVD_HOME = ANDROID_EMU_DIR / "avd"
@@ -19,6 +21,8 @@ DATA_DIR = ANDROID_EMU_DIR / "data"
 AVD_NAME = "IrisLight_Pixel"
 _SYSTEM_IMAGE = "system-images;android-36;google_apis_playstore_ps16k;x86_64"
 _DEVICE_ID = "pixel_9a"
+# 포인터 .ini 의 target= 값. _SYSTEM_IMAGE 의 API 레벨과 같아야 한다.
+_AVD_TARGET = "android-36"
 _DATA_PARTITION_SIZE = "32G"
 _SDCARD_SIZE = "2048M"
 # ponytail: 신규 AVD는 userdata 32G 생성이라 여유가 필요. 기존 이미지가 있으면 완화.
@@ -35,6 +39,13 @@ _launch_in_progress = False
 _launch_log_handle: object | None = None
 # 우리가 띄운 emulator.exe PID. cmdline이 비어 있는 자식(고스트 창) 추적용.
 _launched_pids: set[int] = set()
+_launched_headless = False
+# ponytail: 콘솔 깜빡이는 CIM 스캔 금지 → psutil+캐시.
+_process_scan_cache: tuple[float, list[tuple[str, int, int, str]]] = (0.0, [])
+_PROCESS_SCAN_TTL_S = 1.5
+# GPU: angle/swiftshader는 이 PC(RTX 50xx + Emulator 36)에서 SwiftShader로
+# 떨어져 검게 남음. host(GLES)가 실제 표시된다. CREATE_NO_WINDOW는 SW_HIDE 없이만.
+_GPU_MODE = "host"
 
 
 def _sdk_root() -> Path:
@@ -62,6 +73,33 @@ def emulator_exe() -> Path:
 
 def adb_exe() -> Path:
     return _sdk_root() / "platform-tools" / ("adb.exe" if sys.platform == "win32" else "adb")
+
+
+def _no_window_kwargs(**extra: object) -> dict:
+    """adb/taskkill/avdmanager — 콘솔 창이 안 뜨게.
+
+    GUI 에뮬 기동에는 쓰지 말 것 — CREATE_NO_WINDOW/SW_HIDE 가
+    UpdateLayeredWindowIndirect 실패(검은 화면)를 낸다.
+    DETACHED + Cascadia/PseudoConsole 표면 숨김.
+    """
+    from iris.system.win_subprocess import no_window_kwargs
+
+    return no_window_kwargs(**extra)  # type: ignore[arg-type]
+
+
+def _capture_output(cmd: list[str], *, timeout: float = 10.0) -> str:
+    """콘솔 창 없이 stdout 캡처. 실패 시 빈 문자열."""
+    try:
+        return subprocess.check_output(
+            cmd,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+            **_no_window_kwargs(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
 
 
 def avdmanager_exe() -> Path:
@@ -98,14 +136,7 @@ def _running_emulator_serials() -> list[str]:
     adb = adb_exe()
     if not adb.is_file():
         return []
-    try:
-        devices = subprocess.check_output(
-            [str(adb), "devices"],
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
+    devices = _capture_output([str(adb), "devices"], timeout=10.0)
     serials: list[str] = []
     for line in devices.splitlines():
         line = line.strip()
@@ -121,14 +152,7 @@ def _serial_avd_name(serial: str) -> str:
     adb = adb_exe()
     if not adb.is_file():
         return ""
-    try:
-        out = subprocess.check_output(
-            [str(adb), "-s", serial, "emu", "avd", "name"],
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return ""
+    out = _capture_output([str(adb), "-s", serial, "emu", "avd", "name"], timeout=10.0)
     # adb emu avd name → "IrisLight_Pixel\nOK"
     for line in out.splitlines():
         name = line.strip()
@@ -141,48 +165,58 @@ def _matching_emulator_serials() -> list[str]:
     return [serial for serial in _running_emulator_serials() if _serial_avd_name(serial) == AVD_NAME]
 
 
-def _scan_processes() -> list[tuple[str, int, int, str]]:
-    """(name, pid, ppid, cmdline) 전체 프로세스 목록."""
-    if sys.platform == "win32":
-        cmd = [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            (
-                "Get-CimInstance Win32_Process | ForEach-Object { "
-                "\"$($_.Name)`t$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" "
-                "}"
-            ),
-        ]
-    else:
-        cmd = ["ps", "-ax", "-o", "pid=,ppid=,command="]
-    try:
-        output = subprocess.check_output(cmd, text=True, timeout=15, errors="replace")
-    except (subprocess.SubprocessError, OSError):
-        return []
+def _pids_alive(pids: set[int]) -> bool:
+    for pid in pids:
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except (OSError, SystemError):
+            continue
+        return True
+    return False
+
+
+def _scan_processes(*, force: bool = False) -> list[tuple[str, int, int, str]]:
+    """(name, pid, ppid, cmdline) — 에뮬/qemu만 (캐시).
+
+    콘솔 서브프로세스 스캔 금지 — 표준 psutil만 사용.
+    """
+    global _process_scan_cache
+    now = time.time()
+    if not force and now - _process_scan_cache[0] < _PROCESS_SCAN_TTL_S:
+        return _process_scan_cache[1]
 
     rows: list[tuple[str, int, int, str]] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if sys.platform == "win32":
-            parts = line.split("\t", 3)
-            if len(parts) < 3:
+    try:
+        import psutil
+    except ImportError:
+        _process_scan_cache = (now, [])
+        return []
+
+    try:
+        # cmdline은 프로세스마다 원격 메모리를 읽어 Windows에서 전체 수집 시 수 초가 걸린다.
+        # 값싼 name으로 먼저 거르고, 매칭된 소수만 cmdline을 읽는다 (get_state 핫패스).
+        for proc in psutil.process_iter(["pid", "ppid", "name"]):
+            try:
+                info = proc.info
+                name = str(info.get("name") or "")
+                if not _is_emulator_binary(name):
+                    continue
+                pid = int(info["pid"])
+                ppid = int(info.get("ppid") or 0)
+                raw_cmd = proc.cmdline() or []
+                if isinstance(raw_cmd, (list, tuple)):
+                    cmdline = " ".join(str(p) for p in raw_cmd)
+                else:
+                    cmdline = str(raw_cmd)
+                rows.append((name, pid, ppid, cmdline))
+            except (psutil.Error, TypeError, ValueError, KeyError):
                 continue
-            name, pid_s, ppid_s = parts[0], parts[1], parts[2]
-            cmdline = parts[3] if len(parts) > 3 else ""
-        else:
-            fields = line.split(None, 2)
-            if len(fields) < 3:
-                continue
-            pid_s, ppid_s, cmdline = fields
-            name = Path(cmdline.split(" ", 1)[0]).name
-        try:
-            pid, ppid = int(pid_s), int(ppid_s)
-        except ValueError:
-            continue
-        rows.append((name, pid, ppid, cmdline))
+    except Exception:
+        rows = []
+
+    _process_scan_cache = (now, rows)
     return rows
 
 
@@ -241,6 +275,8 @@ def _list_emulator_processes() -> list[tuple[str, int, str]]:
 
 
 def is_emulator_headless() -> bool:
+    if _launch_in_progress or _pids_alive(_launched_pids):
+        return bool(_launched_headless)
     for name, _pid, cmdline in _list_emulator_processes():
         lowered = f"{name} {cmdline}".lower()
         if "-no-window" in lowered or "headless" in lowered:
@@ -249,31 +285,86 @@ def is_emulator_headless() -> bool:
 
 
 def is_emulator_running() -> bool:
-    return bool(
-        _launch_in_progress
-        or _matching_emulator_serials()
-        or _list_emulator_processes()
-    )
+    """기동 여부 — adb/추적 PID 우선 (폴링 핫패스에서 PowerShell 최소화)."""
+    if _launch_in_progress:
+        return True
+    if _matching_emulator_serials():
+        return True
+    if _pids_alive(_launched_pids):
+        return True
+    return bool(_list_emulator_processes())
 
 
-def is_emulator_available() -> tuple[bool, str]:
-    """기동 가능 여부 — 현재 켜짐/꺼짐이 아니라 실행 바이너리·AVD 준비 상태.
+def is_emulator_process_up() -> bool:
+    """adb 없이 프로세스/추적 PID만 — get_state UI 핫패스용."""
+    if _launch_in_progress:
+        return True
+    if _pids_alive(_launched_pids):
+        return True
+    return bool(_list_emulator_processes())
 
-    Returns (ok, detail). detail은 UI 한 줄용.
+
+def prepare_emulator() -> tuple[bool, str]:
+    """IRIS 기동 시 AVD·경로·디스크·adb 를 점검/수리한다.
+
+    에뮬 GUI를 띄우지 않는다. 콘솔 창 없이 adb start-server만 워밍한다.
+    Returns (ok, detail) — detail은 알림 한 줄용.
     """
     exe = emulator_exe()
     if not exe.is_file():
         return False, f"emulator 없음 ({exe})"
+    adb = adb_exe()
+    if not adb.is_file():
+        return False, f"adb 없음 ({adb})"
     try:
         _ensure_emulator_disk_space()
     except OSError as exc:
         return False, str(exc)
-    if avd_config_path().is_file():
-        return True, f"실행 가능 (AVD {AVD_NAME})"
-    mgr = avdmanager_exe()
-    if mgr.is_file():
-        return True, "실행 가능 (AVD 자동 생성 가능)"
-    return False, f"AVD·avdmanager 없음 ({mgr})"
+
+    cfg = avd_config_path()
+    if not cfg.is_file():
+        mgr = avdmanager_exe()
+        if mgr.is_file():
+            _warm_adb_server()
+            return True, f"실행 가능 (AVD {AVD_NAME} 자동 생성 가능)"
+        return False, f"AVD·avdmanager 없음 ({mgr})"
+
+    image = system_image_dir()
+    if not image.is_dir():
+        return False, (
+            f"시스템 이미지 없음 — Android Studio SDK Manager에서 "
+            f"'{_SYSTEM_IMAGE}' 설치 필요"
+        )
+
+    notes: list[str] = []
+    if repair_avd_pointer():
+        notes.append("경로 복구")
+    dropped = _drop_foreign_runtime_artifacts()
+    if dropped:
+        notes.append(f"이물질 {len(dropped)}개 정리")
+    try:
+        _patch_avd_storage(cfg)
+        _invalidate_stale_gpu_runtime(cfg)
+    except OSError as exc:
+        return False, f"AVD 설정 패치 실패: {exc}"
+    _warm_adb_server()
+    detail = f"실행 가능 (AVD {AVD_NAME})"
+    if notes:
+        detail = f"{detail} · {' · '.join(notes)}"
+    return True, detail
+
+
+def is_emulator_available() -> tuple[bool, str]:
+    """기동 가능 여부 — prepare_emulator와 동일(경로 수리 포함)."""
+    return prepare_emulator()
+
+
+def _warm_adb_server() -> None:
+    """adb 서버를 콘솔 없이 미리 띄워 이후 폴링 시 창 깜빡임을 줄인다."""
+    adb = adb_exe()
+    if not adb.is_file():
+        return
+    _capture_output([str(adb), "start-server"], timeout=15.0)
 
 
 def _emulator_env() -> dict[str, str]:
@@ -281,21 +372,167 @@ def _emulator_env() -> dict[str, str]:
     env["ANDROID_AVD_HOME"] = str(AVD_HOME)
     env["ANDROID_SDK_ROOT"] = str(_sdk_root())
     env["ANDROID_HOME"] = str(_sdk_root())
+    # ponytail: crash-service 콘솔 플래시 완화 (없으면 무시)
+    env.setdefault("ANDROID_EMU_DISABLE_CRASH_REPORTING", "1")
     return env
+
+
+# emulator.exe 가 띄우는 CUI 헬퍼 — Win11에선 ConsoleWindowClass가 아니라
+# PseudoConsoleWindow(앱 PID) + Cascadia(Windows Terminal)로 뜬다.
+_CONSOLE_HELPER_NAMES = frozenset(
+    {
+        "netsimd.exe",
+        "netsim.exe",
+        "crashpad_handler.exe",
+        "emulator-check.exe",
+        "qemu-system-x86_64.exe",
+        "qemu-system-aarch64.exe",
+        "emulator.exe",
+    }
+)
+# classic conhost / Win11 ConPTY / Windows Terminal 호스트
+_CONSOLE_SURFACE_CLASSES = frozenset(
+    {
+        "ConsoleWindowClass",
+        "PseudoConsoleWindow",
+        "CASCADIA_HOSTING_WINDOW_CLASS",
+    }
+)
+# Cascadia 탭 제목 = 호스팅 중인 exe 경로 (실측)
+_CONSOLE_TITLE_MARKERS = (
+    "\\emulator\\netsimd",
+    "\\emulator\\crashpad_handler",
+    "\\emulator\\emulator.exe",
+    "\\emulator\\emulator-check",
+    "\\emulator\\qemu\\",
+)
+
+
+def _gui_launch_creationflags() -> int:
+    """에뮬 GUI용 CreateProcess 플래그.
+
+    CREATE_NO_WINDOW 금지 — 이 플래그가 있으면 Qt 레이어드 창이
+    UpdateLayeredWindowIndirect 실패로 검은 화면이 된다 (실측 로그 확인).
+    DETACHED|+NEW_GROUP 만으로 부모 콘솔과 분리하고, 뜨는 터미널 표면은
+    PseudoConsole/Cascadia 제목·헬퍼 PID로 숨긴다.
+    """
+    if sys.platform != "win32":
+        return 0
+    flags = int(getattr(subprocess, "DETACHED_PROCESS", 0))
+    flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    return flags
+
+
+def _is_emulator_console_title(title: str) -> bool:
+    """Windows Terminal 탭 제목이 SDK emulator 헬퍼 경로인지."""
+    if not title:
+        return False
+    lowered = title.replace("/", "\\").lower()
+    return any(marker in lowered for marker in _CONSOLE_TITLE_MARKERS)
+
+
+def _hide_emulator_console_surfaces(pids: set[int]) -> int:
+    """에뮬 CUI 터미널만 SW_HIDE — Qt 폰 화면 창은 건드리지 않음.
+
+    Win11 실측: qemu/crashpad/netsimd 콘솔은 ConsoleWindowClass가 아니라
+    PseudoConsoleWindow(프로세스 PID)와 CASCADIA_HOSTING_WINDOW_CLASS
+    (Windows Terminal, 제목=exe 경로)다. 예전 PID+ConsoleWindowClass만
+    보면 창이 그대로 남는다.
+    """
+    if sys.platform != "win32":
+        return 0
+    if not pids and not _CONSOLE_TITLE_MARKERS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return 0
+
+    user32 = ctypes.windll.user32
+    hidden = 0
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @WNDENUMPROC
+    def _each(hwnd: int, _lp: int) -> bool:
+        nonlocal hidden
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        cls_buf = ctypes.create_unicode_buffer(256)
+        if user32.GetClassNameW(hwnd, cls_buf, 256) <= 0:
+            return True
+        if cls_buf.value not in _CONSOLE_SURFACE_CLASSES:
+            return True
+        title_buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title_buf, 512)
+        title = title_buf.value
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        pid_i = int(pid.value)
+        # Cascadia: WT PID라 트리에 없음 → 제목(호스팅 exe 경로)으로만 판별
+        if cls_buf.value == "CASCADIA_HOSTING_WINDOW_CLASS":
+            if not _is_emulator_console_title(title):
+                return True
+        elif pid_i not in pids and not _is_emulator_console_title(title):
+            return True
+        user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        hidden += 1
+        return True
+
+    try:
+        user32.EnumWindows(_each, 0)
+    except Exception:
+        return hidden
+    return hidden
+
+
+def _pids_for_console_hide(root_pid: int) -> set[int]:
+    """에뮬 트리 + netsimd/qemu/crashpad 등 헬퍼 PID."""
+    pids = {root_pid} if root_pid > 0 else set()
+    try:
+        import psutil
+    except ImportError:
+        return pids
+    try:
+        if root_pid > 0:
+            pids |= {c.pid for c in psutil.Process(root_pid).children(recursive=True)}
+    except (psutil.Error, OSError):
+        pass
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            name = str(proc.info.get("name") or "").lower()
+            if name in _CONSOLE_HELPER_NAMES:
+                pids.add(int(proc.info["pid"]))
+    except (psutil.Error, TypeError, ValueError):
+        pass
+    return pids
+
+
+def _schedule_console_hide(root_pid: int) -> None:
+    """netsimd/qemu Cascadia·PseudoConsole — 부팅(~2분) 동안 반복 숨김."""
+
+    def _run() -> None:
+        # full startup toast 구간까지 netsimd/Cascadia 가 늦게 뜰 수 있다.
+        deadline = time.time() + 120.0
+        while time.time() < deadline:
+            _hide_emulator_console_surfaces(_pids_for_console_hide(root_pid))
+            time.sleep(0.35)
+
+    threading.Thread(target=_run, daemon=True, name="iris-emu-hide-console").start()
 
 
 def _patch_avd_storage(cfg: Path) -> None:
     if not cfg.is_file():
         return
     lines = cfg.read_text(encoding="utf-8").splitlines()
-    # hw.keyboard=yes: PC 키보드. GPU host: Windows 성능·config/qemu 정합.
+    # hw.keyboard=yes: PC 키보드. GPU: host (angle/swiftshader는 이 PC에서 검정).
     patches = {
         "disk.dataPartition.size": _DATA_PARTITION_SIZE,
         "sdcard.size": _SDCARD_SIZE,
         "hw.ramSize": "4096",
         "hw.keyboard": "yes",
         "hw.gpu.enabled": "yes",
-        "hw.gpu.mode": "host",
+        "hw.gpu.mode": _GPU_MODE,
     }
     seen = set()
     out: list[str] = []
@@ -315,7 +552,7 @@ def _patch_avd_storage(cfg: Path) -> None:
         q_patches = {
             "hw.keyboard": "hw.keyboard = true",
             "hw.gpu.enabled": "hw.gpu.enabled = true",
-            "hw.gpu.mode": "hw.gpu.mode = host",
+            "hw.gpu.mode": f"hw.gpu.mode = {_GPU_MODE}",
         }
         q_lines = qemu.read_text(encoding="utf-8").splitlines()
         q_out: list[str] = []
@@ -358,13 +595,102 @@ def _ensure_emulator_disk_space() -> None:
         )
 
 
+def avd_pointer_path() -> Path:
+    """AVD_HOME/<이름>.ini — 에뮬레이터가 .avd 폴더를 찾는 포인터."""
+    return AVD_HOME / f"{AVD_NAME}.ini"
+
+
+def system_image_dir() -> Path:
+    """config.ini 가 요구하는 시스템 이미지 경로."""
+    return _sdk_root() / Path(*_SYSTEM_IMAGE.replace(";", "/").split("/"))
+
+
+def repair_avd_pointer() -> bool:
+    """포인터 .ini 의 path 를 이 PC 기준으로 다시 쓴다.
+
+    저장소에 커밋된 `IrisLight_Pixel.ini` 에는 만든 사람 PC의 절대경로가
+    박혀 있다. 다른 PC에서 clone 하면 에뮬레이터가 config.ini 를 못 읽고
+    기본값(arm)으로 떨어져서 이렇게 죽는다:
+
+        CPU Architecture 'arm' is not supported by the QEMU2 emulator
+
+    원인이 경로라는 걸 알 방법이 메시지에 없다. 매 기동 전에 고쳐 둔다.
+    """
+    avd_dir = AVD_HOME / f"{AVD_NAME}.avd"
+    if not avd_dir.is_dir():
+        return False
+    pointer = avd_pointer_path()
+    desired = (
+        "avd.ini.encoding=UTF-8\n"
+        f"path={avd_dir}\n"
+        f"path.rel=avd/{AVD_NAME}.avd\n"
+        f"target={_AVD_TARGET}\n"
+    )
+    try:
+        if pointer.is_file() and pointer.read_text(encoding="utf-8") == desired:
+            return False
+        pointer.write_text(desired, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _stale_runtime_artifacts() -> list[Path]:
+    """다른 PC 경로가 박힌 채 굳어 버리는 런타임 산출물.
+
+    에뮬레이터가 기동할 때마다 다시 만드는 파일들인데, 저장소에 커밋돼
+    있으면 남의 SDK/AVD 경로를 그대로 물고 들어온다.
+    """
+    avd_dir = AVD_HOME / f"{AVD_NAME}.avd"
+    names = (
+        "hardware-qemu.ini",
+        "emulator-user.ini",
+        "quickbootChoice.ini",
+        "read-snapshot.txt",
+        "version_num.cache",
+    )
+    return [avd_dir / name for name in names if (avd_dir / name).is_file()]
+
+
+def _drop_foreign_runtime_artifacts() -> list[str]:
+    """이 PC 것이 아닌 경로를 담은 런타임 산출물만 지운다."""
+    marker = str(_sdk_root()).lower()
+    dropped: list[str] = []
+    for path in _stale_runtime_artifacts():
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if marker in body:
+            continue  # 이 PC에서 만들어진 것 — 그대로 둔다
+        try:
+            path.unlink()
+            dropped.append(path.name)
+        except OSError:
+            pass
+    return dropped
+
+
 def ensure_avd() -> str:
-    """프로젝트 AVD가 없으면 생성하고 저장 용량을 늘린다."""
+    """프로젝트 AVD가 없으면 생성하고, 경로·저장 용량을 이 PC 기준으로 맞춘다."""
     AVD_HOME.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cfg = avd_config_path()
     if cfg.is_file():
+        repair_avd_pointer()
+        _drop_foreign_runtime_artifacts()
+        image = system_image_dir()
+        if not image.is_dir():
+            raise FileNotFoundError(
+                f"시스템 이미지 없음: {image}\n"
+                f"Android Studio > SDK Manager 에서 '{_SYSTEM_IMAGE}' 를 설치하거나,\n"
+                f"sdkmanager \"{_SYSTEM_IMAGE}\" 로 내려받으세요.\n"
+                "(설치돼 있지 않으면 에뮬레이터가 arm 으로 잘못 떨어져 "
+                "\"CPU Architecture 'arm' is not supported\" 로 죽습니다.)"
+            )
         _patch_avd_storage(cfg)
+        # hardware-qemu.ini 가 옛 gpu mode를 물고 있으면 -gpu CLI를 무시한다.
+        _invalidate_stale_gpu_runtime(cfg)
         return AVD_NAME
 
     avd_mgr = avdmanager_exe()
@@ -388,9 +714,34 @@ def ensure_avd() -> str:
         env=_emulator_env(),
         check=True,
         timeout=180,
+        **_no_window_kwargs(),
     )
     _patch_avd_storage(cfg)
+    _invalidate_stale_gpu_runtime(cfg)
     return AVD_NAME
+
+
+def _invalidate_stale_gpu_runtime(cfg: Path) -> None:
+    """config.ini GPU와 다른 hardware-qemu.ini 는 지워 재생성하게 한다.
+
+    에뮬이 기동마다 다시 쓰므로, 옛 swiftshader 값이 남으면 host CLI보다
+    우선해 검은 화면이 날 수 있다.
+    """
+    qemu = cfg.with_name("hardware-qemu.ini")
+    if not qemu.is_file():
+        return
+    try:
+        body = qemu.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return
+    want = f"hw.gpu.mode = {_GPU_MODE}"
+    # 공백 유무 모두 허용
+    if want in body or f"hw.gpu.mode={_GPU_MODE}" in body:
+        return
+    try:
+        qemu.unlink()
+    except OSError:
+        pass
 
 
 def _clear_launch_flag_later() -> None:
@@ -411,7 +762,7 @@ def _clear_launch_flag_later() -> None:
 
 def launch_emulator(*, headless: bool = False) -> subprocess.Popen[bytes]:
     """에뮬레이터를 프로젝트 android-emulator/data 에 userdata로 실행."""
-    global _launch_in_progress, _launch_log_handle
+    global _launch_in_progress, _launch_log_handle, _launched_headless, _process_scan_cache
 
     if not emulator_exe().is_file():
         raise FileNotFoundError(f"emulator 없음: {emulator_exe()}")
@@ -441,22 +792,36 @@ def launch_emulator(*, headless: bool = False) -> subprocess.Popen[bytes]:
             "-datadir",
             str(DATA_DIR),
             "-gpu",
-            "host",
+            _GPU_MODE,
             # ponytail: config.ini 패치 후 깨진 quickboot 스냅샷이 adb offline을 유발할 수 있음
             "-no-snapshot-load",
+            # Vulkan host ICD + 레이어드 창 충돌 회피
+            "-feature",
+            "-Vulkan",
+            # netsimd 웹UI 소음 축소 (터미널 표면은 _schedule_console_hide)
+            "-netsim-args",
+            "--no-web-ui",
         ]
         if headless:
             cmd.append("-no-window")
         _launch_log_handle.write(f"cmd: {' '.join(cmd)}\n")  # type: ignore[union-attr]
         _launch_log_handle.flush()  # type: ignore[union-attr]
+        # CREATE_NO_WINDOW 금지 → UpdateLayeredWindowIndirect 실패(검은 화면).
+        # DETACHED + Win11 Cascadia/PseudoConsole(제목·헬퍼 PID) 숨김.
+        env = _emulator_env()
         proc = subprocess.Popen(
             cmd,
-            env=_emulator_env(),
+            env=env,
+            stdin=subprocess.DEVNULL,
             stdout=_launch_log_handle,
             stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+            creationflags=_gui_launch_creationflags(),
+            close_fds=False,
         )
         _launched_pids.add(proc.pid)
+        _launched_headless = bool(headless)
+        _process_scan_cache = (0.0, [])
+        _schedule_console_hide(proc.pid)
         _clear_launch_flag_later()
         return proc
     except Exception:
@@ -508,8 +873,6 @@ def adb_run(
         cmd.extend(["-s", serial])
     cmd.extend(args)
     try:
-        from iris.system.win_subprocess import no_window_kwargs
-
         proc = subprocess.run(
             cmd,
             capture_output=True,
@@ -519,7 +882,7 @@ def adb_run(
             errors="replace",
             timeout=timeout,
             env=_emulator_env(),
-            **no_window_kwargs(),
+            **_no_window_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise AdbError(f"adb timeout ({timeout}s): {' '.join(args)}") from exc
@@ -538,9 +901,10 @@ def require_serial() -> str:
         raise AdbError(
             f"AVD {AVD_NAME} serial 없음 (다른 에뮬만 실행 중: {', '.join(all_serials)})"
         )
-    if _list_emulator_processes() or _launch_in_progress:
+    # ponytail: CallMonitor 폴링에서 PowerShell 스캔을 돌리면 콘솔이 깜빡인다.
+    if _launch_in_progress:
         raise AdbError(
-            f"AVD {AVD_NAME} 프로세스는 있으나 adb device 대기 중 — 부팅 후 다시 시도"
+            f"AVD {AVD_NAME} 기동 중 — adb device 대기 (부팅 후 다시 시도)"
         )
     raise AdbError(f"에뮬레이터 미실행 (AVD {AVD_NAME})")
 
@@ -623,6 +987,31 @@ def emulator_status() -> dict:
     }
 
 
+def emulator_status_fast() -> dict:
+    """adb 프로브 없음 — get_state가 UI에서 멈춤 방지."""
+    procs = _list_emulator_processes()
+    if _launch_in_progress and not procs:
+        phase = "starting"
+    elif procs or _pids_alive(_launched_pids):
+        phase = "booting"
+    else:
+        phase = "stopped"
+    return {
+        "running": phase != "stopped",
+        "phase": phase,
+        "adb_ready": False,
+        "boot_completed": False,
+        "serials": [],
+        "serial": None,
+        "headless": is_emulator_headless() if phase != "stopped" else False,
+        "avd": AVD_NAME,
+        "adb": str(adb_exe()),
+        "adb_ok": adb_exe().is_file(),
+        "launch_log": str(launch_log_path()),
+        "keyboard_hint": _KEYBOARD_HINT_KO,
+    }
+
+
 def _force_kill_pid(pid: int) -> bool:
     if sys.platform == "win32":
         kill_cmd = ["taskkill", "/PID", str(pid), "/F", "/T"]
@@ -635,6 +1024,7 @@ def _force_kill_pid(pid: int) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,
+            **_no_window_kwargs(),
         )
         return True
     except (subprocess.SubprocessError, OSError):
@@ -666,7 +1056,7 @@ def _kill_targets(procs: list[tuple[str, int, int, str]]) -> list[int]:
 
 def kill_emulator() -> bool:
     """프로젝트 AVD 인스턴스 종료 — 창(qemu UI)까지 사라진 것을 확인한다."""
-    global _launch_in_progress
+    global _launch_in_progress, _launched_headless, _process_scan_cache
     killed = False
     adb = adb_exe()
     for serial in _matching_emulator_serials():
@@ -677,6 +1067,7 @@ def kill_emulator() -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
+                **_no_window_kwargs(),
             )
             killed = True
         except (subprocess.SubprocessError, OSError):
@@ -692,7 +1083,7 @@ def kill_emulator() -> bool:
             time.sleep(1.0)
 
     for _attempt in range(3):
-        procs = _scan_processes()
+        procs = _scan_processes(force=True)
         targets = _kill_targets(procs)
         if not targets:
             break
@@ -704,6 +1095,8 @@ def kill_emulator() -> bool:
     with _launch_lock:
         _launch_in_progress = False
     _launched_pids.clear()
+    _launched_headless = False
+    _process_scan_cache = (0.0, [])
     return killed
 
 
@@ -1182,6 +1575,7 @@ if __name__ == "__main__":
         text = cfg.read_text(encoding="utf-8")
         assert "hw.keyboard=yes" in text
         assert "hw.gpu.enabled=yes" in text
+        assert f"hw.gpu.mode={_GPU_MODE}" in text
         assert "hw.gpu.mode=host" in text
     # UI 인식: bounds 파싱 → 중심 좌표, 설치 버튼 라벨 매칭
     assert resolve_package("인스타그램") == "com.instagram.android"
@@ -1217,6 +1611,9 @@ if __name__ == "__main__":
         raise AssertionError("non-ascii input_text should fail")
     except AdbError as exc:
         assert "non-ASCII" in str(exc) or "IME" in str(exc)
+    from iris.system.android_sdk_install import _self_check_ensure_sdk
+
+    _self_check_ensure_sdk()
     if not adb_exe().is_file():
         print("android_emulator ok (adb missing — skip device checks)")
         raise SystemExit(0)

@@ -105,6 +105,20 @@ def find_similar_projects(
                 score = max(score, 0.4 + 0.5 * overlap)
             if score >= min_score:
                 scored.append((score, child))
+    # Iris Light: Project-IRIS-Light-main 을 짧은 "iris light" 쿼리에서 최우선
+    if "iris" in q and "light" in q:
+        boosted: list[tuple[float, Path]] = []
+        for score, child in scored:
+            nn = _norm_name(child.name)
+            if nn.endswith("-main") and "iris" in nn and "light" in nn:
+                score = max(score, 0.98)
+            elif nn in {"iris", "project-iris"} or (
+                "iris" in nn and "light" not in nn and "hud" not in nn
+            ):
+                # 구 Project---IRIS / IRIS 폴더는 Light와 혼동 금지
+                score = min(score, 0.34)
+            boosted.append((score, child))
+        scored = boosted
     scored.sort(key=lambda x: (-x[0], x[1].name.lower()))
     # path 중복 제거
     seen: set[str] = set()
@@ -217,6 +231,30 @@ def create_scaffold(
     return {"path": str(root), "name": safe, "files": files, "template": tmpl}
 
 
+def workspace_rel_for_open(workspace_root: str | Path, path: str) -> str:
+    """상대 경로는 워크스페이스 기준. cwd로 풀지 않는다. 밖과 .. 는 거절."""
+    import os
+
+    raw_text = str(path or "").strip()
+    if not raw_text or ".." in Path(raw_text.replace("\\", "/")).parts:
+        raise ValueError("path escapes workspace")
+    root = Path(workspace_root).expanduser().resolve()
+    raw = Path(raw_text)
+    target = raw if raw.is_absolute() else (root / raw)
+    try:
+        target = target.resolve()
+    except OSError as exc:
+        raise ValueError("path escapes workspace") from exc
+    root_key = os.path.normcase(str(root))
+    target_key = os.path.normcase(str(target))
+    if target_key != root_key and not target_key.startswith(root_key + os.sep):
+        raise ValueError("path escapes workspace")
+    rel = Path(os.path.relpath(str(target), str(root)))
+    if not rel.parts or rel.parts[0] == "..":
+        raise ValueError("path escapes workspace")
+    return rel.as_posix()
+
+
 def resolve_under_root(project_root: str | Path, rel_path: str) -> tuple[Path, Path, str]:
     """(root, abs_path, rel). path escape 검증."""
     root = Path(project_root).expanduser().resolve()
@@ -238,29 +276,105 @@ def write_project_file(project_root: str | Path, rel_path: str, content: str) ->
     return {"path": str(path), "rel_path": rel, "bytes": len(content.encode("utf-8"))}
 
 
-def is_code_reveal_request(text: str) -> bool:
-    s = (text or "").lower()
-    code_words = ("코드", "프로그램", "파일", "script", "code", "program", "app")
-    make_words = ("만들", "작성", "짜", "구현", "생성", "write", "create", "make", "build")
-    if is_run_request(s) or "구구단" in s:
-        return True
-    return any(w in s for w in make_words) and any(w in s for w in code_words)
-
-
 def is_run_request(text: str) -> bool:
     s = (text or "").lower()
     return any(w in s for w in ("실행", "출력", "돌려", "run", "execute", "print"))
 
 
-def extract_first_code_block(text: str) -> dict | None:
-    match = re.search(r"```([^\n`]*)\n(.*?)```", text or "", flags=re.DOTALL)
-    if not match:
+_FENCE_LANGS = tuple(
+    sorted(
+        {
+            "python", "py", "javascript", "js", "typescript", "ts", "tsx", "jsx",
+            "bash", "sh", "shell", "json", "html", "css", "cpp", "c", "java",
+            "go", "rust", "rs", "ruby", "rb", "php", "sql", "markdown", "md",
+            "yaml", "yml", "xml", "text", "plaintext", "kotlin", "swift", "lua",
+            "csharp", "cs",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _fence_header(line: str) -> tuple[str, str] | None:
+    """펜스 첫 줄 → (lang, 같은 줄에 붙은 코드).
+
+    None 이면 언어 태그가 아직 덜 옴(다음 청크를 기다린다).
+    인라인 코드가 비면 본문은 다음 줄부터다.
+    """
+    raw = line or ""
+    s = raw.strip()
+    if not s:
+        return "", ""
+    low = s.lower()
+    if any(lang.startswith(low) and lang != low for lang in _FENCE_LANGS):
         return None
-    info = (match.group(1) or "").strip()
-    code = (match.group(2) or "").strip("\n")
+    for lang in _FENCE_LANGS:
+        if (
+            low == lang
+            or low.startswith(lang + " ")
+            or low.startswith(lang + "\t")
+            or low.startswith(lang + ":")
+        ):
+            return lang, ""
+        if not low.startswith(lang):
+            continue
+        if any(other.startswith(low) and len(other) > len(lang) for other in _FENCE_LANGS):
+            continue
+        rest = s[len(lang) :]
+        if rest[:1].isalnum() or rest[:1] == "_":
+            return lang, rest
+    token = s.split()[0]
+    if re.fullmatch(r"[A-Za-z0-9_+#.\-]{1,32}", token) and (
+        " " in s or ":" in s or token == s
+    ):
+        return token.lower(), ""
+    return "", s
+
+
+def code_fence_body_start(raw: str) -> tuple[str, int] | None:
+    """첫 펜스가 열렸으면 (lang, 코드 시작 인덱스). 없거나 헤더가 덜 오면 None."""
+    text = raw or ""
+    idx = text.find("```")
+    if idx < 0:
+        return None
+    after = idx + 3
+    rest = text[after:]
+    nl = rest.find("\n")
+    close = rest.find("```")
+    if nl < 0 or (close >= 0 and close < nl):
+        chunk = rest[:close] if close >= 0 else rest
+        parts = _fence_header(chunk)
+        if parts is None:
+            return None
+        lang, inline = parts
+        if not inline.strip():
+            return None
+        lead = len(chunk) - len(chunk.lstrip())
+        return lang, after + lead + (len(chunk.strip()) - len(inline))
+    line = rest[:nl]
+    parts = _fence_header(line)
+    if parts is None:
+        return None
+    lang, inline = parts
+    if inline:
+        lead = len(line) - len(line.lstrip())
+        return lang, after + lead + (len(line.strip()) - len(inline))
+    return lang, after + nl + 1
+
+
+def extract_first_code_block(text: str) -> dict | None:
+    opened = code_fence_body_start(text or "")
+    if opened is None:
+        return None
+    lang, start = opened
+    tail = (text or "")[start:]
+    end = tail.find("```")
+    if end < 0:
+        return None
+    code = tail[:end].strip("\n")
     if not code.strip():
         return None
-    lang = (info.split() or [""])[0].lower()
     return {"lang": lang, "code": code}
 
 
@@ -345,28 +459,50 @@ def _smooth_text_chunks(text: str, size: int) -> list[str]:
 
 
 _IRIS_TASK_LABEL = "Iris: Run"
+_IRIS_EXIT_RE = __import__("re").compile(r"(?m)^IRIS_EXIT:(-?\d+)\s*$")
 
 
-def build_iris_terminal_command(argv: list[str]) -> str:
-    """명령을 통합 터미널에 보여 주면서 .iris/last_run.log에도 tee.
+def _cmd_quote(arg: str) -> str:
+    if arg == "":
+        return '""'
+    if any(ch in arg for ch in ' \t&|<>^%!"'):
+        return '"' + arg.replace('"', '""') + '"'
+    return arg
 
-    이중 실행 없음 — 터미널 1회만. Iris는 로그를 읽어 채팅 요약.
-    Windows: PowerShell. macOS/Linux: bash(PIPESTATUS로 종료코드 보존).
+
+def build_iris_terminal_command(argv: list[str], *, shell: str = "") -> str:
+    """명령을 통합 터미널에 보여 주면서 .iris/last_run.log에 출력과 IRIS_EXIT를 남긴다.
+
+    shell이 비어 있으면 태스크용 기본값이다. Windows 태스크는 powershell.exe를
+    고정하므로 PowerShell. IRIS IDE 통합 터미널은 실제 셸을 넘겨야 한다.
     """
     if not argv:
         raise ValueError("empty argv")
-    if sys.platform == "win32":
+    kind = (shell or "").strip().lower()
+    if not kind:
+        kind = "powershell" if sys.platform == "win32" else "sh"
+    if kind in {"cmd", "cmd.exe"}:
+        quoted = " ".join(_cmd_quote(str(a)) for a in argv)
+        return (
+            "if not exist .iris mkdir .iris\n"
+            "del /f /q .iris\\last_run.log 2>nul\n"
+            f"{quoted} > .iris\\last_run.log 2>&1\n"
+            "echo IRIS_EXIT:%ERRORLEVEL% >> .iris\\last_run.log\n"
+            "type .iris\\last_run.log\n"
+        )
+    if kind in {"powershell", "pwsh", "powershell.exe"}:
         parts: list[str] = []
         for a in argv:
             s = str(a).replace("'", "''")
             parts.append(f"'{s}'")
         invoke = "& " + " ".join(parts)
-        # $LASTEXITCODE: native 명령 종료코드
         return (
             "New-Item -ItemType Directory -Force -Path .iris | Out-Null; "
             "Remove-Item -Force -ErrorAction SilentlyContinue .iris\\last_run.log; "
-            f"$out = {invoke} 2>&1 | Tee-Object -FilePath .iris\\last_run.log; "
-            "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 0 }"
+            f"{invoke} 2>&1 | Tee-Object -FilePath .iris\\last_run.log; "
+            "$code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }; "
+            "Add-Content -Path .iris\\last_run.log -Value \"IRIS_EXIT:$code\"; "
+            "exit $code"
         )
     import shlex
 
@@ -374,7 +510,8 @@ def build_iris_terminal_command(argv: list[str]) -> str:
     return (
         "mkdir -p .iris; rm -f .iris/last_run.log; "
         f"{{ {cmd}; }} 2>&1 | tee .iris/last_run.log; "
-        "exit ${PIPESTATUS[0]}"
+        'code=${PIPESTATUS[0]}; printf "IRIS_EXIT:%s\\n" "$code" >> .iris/last_run.log; '
+        'exit "$code"'
     )
 
 
@@ -500,13 +637,14 @@ def result_from_terminal_log(
     cwd: str,
     elapsed_sec: float,
 ) -> dict:
-    """tee 로그 텍스트를 run_project_command 결과 형태로."""
-    # stderr 구분 없이 tee 됨 — 전체를 stdout으로, 실패 추정은 비어있음/traceback
-    low = (log_text or "").lower()
-    failed = "traceback (most recent call last)" in low or "error:" in low
+    """로그의 IRIS_EXIT 줄이 있을 때만 종료 코드를 확정한다."""
+    match = _IRIS_EXIT_RE.search(log_text or "")
+    body = _IRIS_EXIT_RE.sub("", log_text or "").strip()
+    confirmed = match is not None
     return {
-        "exit_code": 1 if failed and "traceback" in low else 0,
-        "stdout": log_text or "",
+        "exit_code": int(match.group(1)) if match else None,
+        "confirmed": confirmed,
+        "stdout": body,
         "stderr": "",
         "elapsed_sec": round(float(elapsed_sec), 3),
         "argv": argv,
@@ -551,7 +689,81 @@ def build_run_command(
         return ["cmd", "/c", rel]
     if suffix in (".js", ".mjs"):
         return ["node", rel]
-    raise ValueError(f"unsupported file type for auto-run: {suffix or '(none)'}")
+    if suffix in (".html", ".htm"):
+        raise ValueError(f"use browser preview for static web file: {rel}")
+        raise ValueError(
+            f"[PROJECT_AUTORUN_UNSUPPORTED_TYPE] 자동 실행에 지원하지 않는 파일 형식입니다: "
+            f"{suffix or '(none)'}. Windows Setup 다운로드와 무관합니다."
+        )
+
+
+def is_static_web_file(file: str) -> bool:
+    rel = (file or "").replace("\\", "/").lstrip("/")
+    return Path(rel).suffix.lower() in (".html", ".htm")
+
+
+def static_web_file_uri(project_root: str | Path, file: str) -> str:
+    """프로젝트 상대 HTML → file:// URI."""
+    root = Path(project_root).expanduser().resolve()
+    rel = (file or "").replace("\\", "/").lstrip("/")
+    path = (root / rel).resolve()
+    if root not in path.parents and path != root:
+        raise ValueError(f"file escapes project_root: {file}")
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    return path.as_uri()
+
+
+def infer_dev_server_url(argv: list[str]) -> str | None:
+    """터미널 실행 argv에서 흔한 로컬 미리보기 URL 추론."""
+    if not argv:
+        return None
+    parts = [str(a) for a in argv]
+    joined = " ".join(parts).lower()
+    port: int | None = None
+    for i, p in enumerate(parts):
+        pl = p.lower()
+        if pl in ("--port", "-p", "--listen") and i + 1 < len(parts):
+            try:
+                port = int(parts[i + 1])
+            except ValueError:
+                pass
+        if pl.startswith("--port="):
+            try:
+                port = int(pl.split("=", 1)[1])
+            except ValueError:
+                pass
+        # python -m http.server 8080
+        if i > 0 and parts[i - 1].lower() == "http.server":
+            try:
+                port = int(p)
+            except ValueError:
+                pass
+    if "http.server" in joined:
+        return f"http://127.0.0.1:{port or 8000}"
+    if "vite" in joined:
+        return f"http://127.0.0.1:{port or 5173}"
+    if "next" in joined or "react-scripts" in joined:
+        return f"http://127.0.0.1:{port or 3000}"
+    if "npm" in joined and "start" in joined:
+        return f"http://127.0.0.1:{port or 3000}"
+    if "npx" in joined and "serve" in joined:
+        return f"http://127.0.0.1:{port or 3000}"
+    if "live-server" in joined:
+        return f"http://127.0.0.1:{port or 8080}"
+    return None
+
+
+def open_preview_in_browser(url: str) -> bool:
+    url = (url or "").strip()
+    if not url:
+        return False
+    try:
+        import webbrowser
+
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 def run_project_command(
@@ -632,6 +844,53 @@ def format_run_log(result: dict) -> str:
     return "\n".join(lines)
 
 
+_LIST_SKIP_DIRS = frozenset({"node_modules", "__pycache__", "venv", "dist", "build", "out", "target"})
+
+# ponytail: 5만 항목이면 query를 좁히라는 뜻 — 트리 전체 인덱싱은 천장 밖이다.
+_LIST_SCAN_CAP = 50_000
+
+
+def list_workspace_files(
+    project_root: str | Path,
+    *,
+    query: str = "",
+    limit: int = 200,
+) -> dict:
+    """워크스페이스 파일 상대경로 목록. query는 부분일치(대소문자 무시)."""
+    import os
+
+    root = Path(project_root).expanduser()
+    if not root.is_dir():
+        raise NotADirectoryError(str(project_root))
+    needle = (query or "").strip().lower().replace("\\", "/")
+    cap = max(1, min(int(limit), 1000))
+    files: list[str] = []
+    scanned = 0
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _LIST_SKIP_DIRS]
+        for name in filenames:
+            scanned += 1
+            rel = os.path.relpath(os.path.join(dirpath, name), root).replace("\\", "/")
+            if needle and needle not in rel.lower():
+                continue
+            files.append(rel)
+            if len(files) >= cap:
+                truncated = True
+                break
+        if truncated or scanned >= _LIST_SCAN_CAP:
+            truncated = True
+            break
+    return {
+        "root": str(root.resolve()),
+        "query": needle,
+        "files": files,
+        "count": len(files),
+        "scanned": scanned,
+        "truncated": truncated,
+    }
+
+
 def summarize_run(result: dict, *, max_tail_lines: int = 12) -> dict:
     """채팅용 짧은 요약 + tail (전문은 log/터미널)."""
     stdout = result.get("stdout") or ""
@@ -678,4 +937,11 @@ if __name__ == "__main__":
         assert _smooth_text_chunks("abc def\nghi", 8) == ["abc def\n", "ghi"]
         cmd = build_run_command(file="hello.py")
         assert cmd[0] == "python"
+        (parent / "pkg").mkdir()
+        (parent / "pkg" / "Iris_adt.py").write_text("x", encoding="utf-8")
+        (parent / "node_modules").mkdir()
+        (parent / "node_modules" / "Iris_adt.py").write_text("x", encoding="utf-8")
+        listed = list_workspace_files(parent, query="iris_adt")
+        assert listed["files"] == ["pkg/Iris_adt.py"], listed
+        assert list_workspace_files(parent, limit=1)["truncated"] is True
     print("project_ops ok", hits[0]["name"], hits[0]["score"], reason)

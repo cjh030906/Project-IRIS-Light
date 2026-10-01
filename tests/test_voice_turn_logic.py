@@ -60,6 +60,11 @@ class VoiceTurnLogicTests(TestCase):
         )
         self.h._sync_voice_conversation_state = lambda: None
         self.h._tts_busy = lambda: False
+        self.h._in_tts_echo_tail = lambda: MainWindow._in_tts_echo_tail(self.h)
+        self.h._tts_blocks_voice_input = lambda: MainWindow._tts_blocks_voice_input(self.h)
+        self.h._cancel_stt_pending_ux = lambda **kwargs: None
+        self.h._stop_stt_ux_timer = lambda: None
+        self.h._mic_listen_active = True
         self.h._split_voice_wake_words = lambda: MainWindow._split_voice_wake_words(self.h)
         self.h._normalize_voice_text = lambda text: MainWindow._normalize_voice_text(self.h, text)
         self.h._should_dedupe_voice_text = lambda text, session_id: MainWindow._should_dedupe_voice_text(
@@ -69,6 +74,10 @@ class VoiceTurnLogicTests(TestCase):
         self.h._is_self_echo_transcript = lambda text: MainWindow._is_self_echo_transcript(self.h, text)
         self.h._is_voice_stop_intent = lambda text: MainWindow._is_voice_stop_intent(self.h, text)
         self.h._voice_followup_open = lambda: MainWindow._voice_followup_open(self.h)
+        # 상황별 규칙 명령 단계. 스텁이 아니라 실제 구현을 붙여서, 평상시(IDLE)에는
+        # 일반 발화를 가로채지 않는다는 것까지 여기서 같이 지킨다.
+        self.h._voice_context = lambda: MainWindow._voice_context(self.h)
+        self.h._handle_voice_command = lambda text: MainWindow._handle_voice_command(self.h, text)
         self.ready: list[object] = []
         self.h._turn_dispatcher.turn_ready.connect(self.ready.append)
 
@@ -111,11 +120,35 @@ class VoiceTurnLogicTests(TestCase):
         MainWindow._submit_voice_turn(self.h, "현재 서울의 날씨는 맑음입니다", session_id=1)
         self.assertEqual(len(self.ready), 0)
 
+    def test_barge_in_off_blocks_tts_period_input(self) -> None:
+        self.h._voice_prefs.voice_barge_in_enabled = False
+        self.h._tts_active_play = True
+        MainWindow._submit_voice_turn(self.h, "완전히 다른 명령", session_id=1)
+        self.assertEqual(len(self.ready), 0)
+        self.assertTrue(any("tts_echo_blocked" in line for line in self.h._live_activity.lines))
+
     def test_barge_in_requests_cancel_and_keeps_voice_turn(self) -> None:
         self.h._busy = True
         MainWindow._submit_voice_turn(self.h, "아니 그거 말고 부산", session_id=1)
         self.assertEqual(self.h._cancel_calls, [("voice_barge_in", True)])
         self.assertEqual(self.ready[0].text, "아니 그거 말고 부산")
+
+    def test_barge_in_during_tts_only_still_cancels(self) -> None:
+        self.h._busy = False
+        self.h._tts_active_play = True
+        MainWindow._submit_voice_turn(self.h, "잠깐만", session_id=1)
+        self.assertEqual(self.h._cancel_calls, [("voice_barge_in", True)])
+        self.assertEqual(self.ready[0].text, "잠깐만")
+
+    def test_barge_in_disabled_skips_cancel_while_busy(self) -> None:
+        self.h._busy = True
+        self.h._voice_prefs.voice_barge_in_enabled = False
+        # dispatcher busy 시뮬레이션 — active turn이 있어야 queue 로그 경로
+        first = self.h._turn_dispatcher.submit(text="이전", source="voice", session_id=0)
+        self.assertIsNotNone(first)
+        MainWindow._submit_voice_turn(self.h, "다음 말", session_id=1)
+        self.assertEqual(self.h._cancel_calls, [])
+        self.assertTrue(any("barge_in" in line for line in self.h._live_activity.lines))
 
     def test_open_voice_followup_window_uses_preferences(self) -> None:
         self.h._voice_prefs.voice_followup_window_sec = 3
