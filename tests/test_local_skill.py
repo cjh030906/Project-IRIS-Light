@@ -233,3 +233,48 @@ class WindowOffsetTests(TestCase):
                          x=1200, y=850, win_rect=[1000, 100, 1400, 900])
         with mock.patch.object(ex, "_process_windows", return_value=[(7, "다른 방")]):
             self.assertIsNone(ex.find_by_window_offset(step))
+
+
+class FieldTypingTests(TestCase):
+    def _run(self, parts: list[str], hangul: bool = False) -> str:
+        b = TypingBuffer(hangul=hangul, started=True)
+        for i, part in enumerate(parts):
+            if i:
+                b.toggle_hangul()
+            for ch in part:
+                b.add(ch)
+        return b.resolve(None, "RICHEDIT50W").text
+
+    def test_kakao_reports_english_mode_but_text_is_korean(self) -> None:
+        self.assertEqual(self._run(["enqjsWo shrghk"]), "두번째 녹화")
+
+    def test_english_stays_english(self) -> None:
+        self.assertEqual(self._run(["hello world"]), "hello world")
+        self.assertEqual(self._run(["meeting at 3"]), "meeting at 3")
+
+    def test_hangul_english_toggle_segments(self) -> None:
+        self.assertEqual(self._run(["IRIS ", "xptmxm"]), "IRIS 테스트")
+        self.assertEqual(self._run(["dlqfurckd ", "test"]), "입력창 test")
+
+    def test_placeholder_text_does_not_replace_typed_text(self) -> None:
+        b = TypingBuffer(started=True)
+        for ch in "dkssud":
+            b.add(ch)
+        self.assertEqual(b.resolve("메시지 입력", "RICHEDIT50W").text, "안녕")
+
+
+class TypeAfterClickTests(TestCase):
+    def test_type_after_clicking_field_clears_it_and_idle_focus_is_dropped(self) -> None:
+        events = [
+            ev(0.0, "context", "python.exe", "IRIS"),
+            ev(1.0, "window_change", metadata={"exe": "k.exe"}),
+            ev(2.0, "click", title="최지호", x=10, y=10),
+            ev(3.0, "type_text", title="최지호", text="안녕"),
+            ev(3.1, "hotkey", title="최지호", key="enter"),
+            # 녹화를 끄러 IRIS 로 돌아가는 순간 포커스가 비었다
+            ev(5.0, "window_change", "", ""),
+            ev(5.1, "click", "", "", x=1301, y=889),
+        ]
+        steps = build_steps(events)
+        self.assertEqual([s.kind for s in steps], ["activate_app", "click", "type", "hotkey"])
+        self.assertTrue(steps[2].clear_first)

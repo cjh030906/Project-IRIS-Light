@@ -3726,6 +3726,30 @@ class MainWindow(QMainWindow):
         self._ext_context = None
         self._reply_extension(turn_id, f"MCP/Skill 설치 실패: {err}")
 
+    def _try_local_pinned_status(self, turn: UserTurn) -> bool:
+        """'고정한 창 지금 어때?' — 감시 결과를 모델 없이 그대로 답한다 (지어낼 일이 없게)."""
+        import re
+
+        text = (turn.text or "").strip()
+        if not re.search(r"(고정|핀|📌|감시|모니터링).{0,12}(창|화면|어때|상태|어떻|뭐)", text):
+            return False
+        monitor = getattr(self, "_pinned_monitor", None)
+        if monitor is None:
+            return False
+        lines = monitor.status_lines()
+        if lines:
+            msg = "고정한 창 상태예요 (30초마다 화면을 보고 갱신해요).\n" + "\n".join(lines)
+            monitor.analyze_soon()
+        else:
+            msg = "고정한 창이 없어요. 모니터 패널에서 창 카드의 📌를 누르면 그 창을 지켜볼게요."
+        display = self._format_user_turn_content(turn)
+        self._chat.append_message_instant("You", display)
+        self._record_history("user", display)
+        self._chat.append_message_instant("Iris", msg)
+        self._record_history("assistant", msg)
+        self._finish_current_turn(turn.id, open_followup=False)
+        return True
+
     def _try_local_skill_run(self, turn: UserTurn) -> bool:
         """'나와의 채팅에 "안녕"이라고 보내줘' → 배운 스킬을 확인 창을 거쳐 실행."""
         from iris.learning.skill_router import SkillInfo, match_skill
@@ -3975,6 +3999,8 @@ class MainWindow(QMainWindow):
 
         # 배운 업무(스킬) — Hermes 가 연결돼 있으면 모델이 learning.run 을 부르고,
         # 꺼져 있거나 죽어 있으면 여기서 이름으로 바로 고른다 (실제로 Hermes 가 죽어 실행 못 함)
+        if self._try_local_pinned_status(turn):
+            return
         if not (self._use_hermes_backend() and self._hermes_online):
             if self._try_local_skill_run(turn):
                 return

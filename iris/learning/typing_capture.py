@@ -19,6 +19,8 @@ from iris.learning.hangul import compose
 
 VK_BACK, VK_TAB, VK_RETURN, VK_ESCAPE, VK_SPACE = 0x08, 0x09, 0x0D, 0x1B, 0x20
 VK_HANGUL = 0x15
+VK_RMENU = 0xA5  # 노트북 자판은 오른쪽 Alt 가 한/영 키
+TOGGLE = "\x00"  # TypingBuffer.keys 안에서 한/영 전환 자리
 _SHIFT = {0x10, 0xA0, 0xA1}
 _CTRL = {0x11, 0xA2, 0xA3}
 _ALT = {0x12, 0xA4, 0xA5}
@@ -73,6 +75,16 @@ def is_text_field_class(class_name: str) -> bool:
     return "edit" in c or c.startswith("richedit")
 
 
+def looks_hangul(composed: str) -> bool:
+    """두벌식으로 조합한 결과가 한글 문장 같은지.
+
+    한글로 친 글자는 거의 다 완성된 글자가 되고, 영어 단어는 홀로 남는 자모가 섞인다
+    ('hello world' → 'ㅗ디ㅣㅐ 재깅'). 완성 글자가 홀로 남은 자모의 두 배 이상이면 한글."""
+    syllables = sum(1 for c in composed if "가" <= c <= "힣")
+    stray = sum(1 for c in composed if "ㄱ" <= c <= "ㅣ")
+    return syllables >= 1 and syllables >= 2 * stray
+
+
 @dataclass
 class TypedText:
     text: str
@@ -87,8 +99,8 @@ class TypedText:
 class TypingBuffer:
     """한 번의 연속 입력. flush 하면 TypedText 가 나온다."""
 
-    keys: list[str] = field(default_factory=list)
-    hangul: bool = False
+    keys: list[str] = field(default_factory=list)  # TOGGLE 은 한/영 키를 누른 자리
+    hangul: bool = False  # 입력을 시작할 때 IME 가 알려 준 모드 (카톡 등은 늘 False)
     focus_hwnd: int = 0
     started: bool = False
 
@@ -97,34 +109,63 @@ class TypingBuffer:
 
     def backspace(self) -> None:
         # 두벌식에서 백스페이스는 자모 하나를 지운다 — 키 하나를 지우면 같다
-        if self.keys:
-            self.keys.pop()
+        for i in range(len(self.keys) - 1, -1, -1):
+            if self.keys[i] != TOGGLE:
+                del self.keys[i]
+                return
 
     def toggle_hangul(self) -> None:
-        self.hangul = not self.hangul
+        self.keys.append(TOGGLE)
 
     def reset(self) -> None:
         self.keys = []
         self.focus_hwnd = 0
         self.started = False
 
+    def raw(self) -> str:
+        return "".join("[한/영]" if k == TOGGLE else k for k in self.keys)
+
+    def _mixed(self) -> str:
+        """한/영 키로 나뉜 구간마다 한글·영문을 정해 붙인다.
+
+        처음 모드를 IME 가 정확히 알려 주지 않으므로 '영문으로 시작'과 '한글로 시작'
+        두 경우를 다 맞춰 보고, 구간 글자가 그 모드다운 쪽을 고른다."""
+        segs = "".join(self.keys).split(TOGGLE)
+        if len(segs) == 1:
+            seg = segs[0]
+            return compose(seg) if (self.hangul or looks_hangul(compose(seg))) else seg
+
+        def build(start_hangul: bool) -> tuple[int, str]:
+            score, out = 0, []
+            for n, seg in enumerate(segs):
+                mode = start_hangul if n % 2 == 0 else not start_hangul
+                fits = looks_hangul(compose(seg)) == mode
+                score += len(seg) if fits else 0
+                out.append(compose(seg) if mode else seg)
+            return score, "".join(out)
+
+        a, b = build(False), build(True)
+        if a[0] == b[0]:
+            return b[1] if self.hangul else a[1]
+        return a[1] if a[0] > b[0] else b[1]
+
     def resolve(self, control_text: str | None, focus_class: str = "") -> TypedText | None:
-        raw = "".join(self.keys)
+        raw = "".join(k for k in self.keys if k != TOGGLE)
         if not raw.strip() and not (control_text or "").strip():
             return None
         latin = raw
         hangul = compose(raw)
-        guess = hangul if self.hangul else latin
+        guess = self._mixed()
         read = (control_text or "").strip() if is_text_field_class(focus_class) else ""
         if read and len(read) <= 2000:
-            for cand, src in ((hangul, "hangul"), (latin, "latin")):
+            for cand, src in ((guess, "keys"), (hangul, "hangul"), (latin, "latin")):
                 if cand.strip() and cand.strip() in read:
                     return TypedText(cand.strip(), raw, src, focus_class, read)
             # 친 글자가 입력창 글자에 없다 — 카톡 입력창은 비어 있을 때 안내 문구 "메시지 입력"을
             # 글자로 돌려준다 (실제 사례). 이때는 키로 조합한 글자를 믿는다.
         if not guess.strip():
             return None
-        return TypedText(guess.strip(), raw, "hangul" if self.hangul else "latin", focus_class)
+        return TypedText(guess.strip(), raw, "keys", focus_class)
 
 
 # ----------------------------------------------------------------------

@@ -24,6 +24,7 @@ from iris.learning.typing_capture import (
     MODIFIER_VKS,
     VK_BACK,
     VK_HANGUL,
+    VK_RMENU,
     TypingBuffer,
     control_class,
     focused_control,
@@ -96,7 +97,9 @@ def _foreground_info() -> tuple[str, str, int]:
         try:
             import psutil
 
-            proc = psutil.Process(int(pid.value)).name()
+            # 포커스가 잠깐 비면 pid 0 → 'System Idle Process'. 앱이 아니다 (실제 사례)
+            if int(pid.value) > 0:
+                proc = psutil.Process(int(pid.value)).name()
         except Exception:
             proc = ""
         return proc, title, hwnd
@@ -155,6 +158,7 @@ class DemonstrationRecorder:
         self._drag_path: list[tuple[float, float]] = []
         # 입력 글자 복원 — 눌린 수식키(vk)와 지금 이어지는 입력
         self._mods: set[int] = set()
+        self._ralt_solo = False
         self._typing = TypingBuffer()
         # 클릭 순간 화면 — 영상 스레드가 계속 갈아 끼우는 최신 프레임
         self._latest_frame = None
@@ -455,14 +459,22 @@ class DemonstrationRecorder:
     def _track_typing(self, event_type: str, vk: int, proc: str, title: str, pwd: bool) -> None:
         if vk in MODIFIER_VKS:
             if event_type == "key_down":
+                if vk == VK_RMENU and vk not in self._mods:
+                    self._ralt_solo = True
                 self._mods.add(vk)
             else:
                 self._mods.discard(vk)
+                if vk == VK_RMENU and self._ralt_solo and self._typing.started:
+                    self._typing.toggle_hangul()  # 오른쪽 Alt 만 눌렀다 뗌 = 한/영
+                self._ralt_solo = False
             return
+        if event_type == "key_down":
+            self._ralt_solo = False
         if event_type != "key_down":
             return
         if vk == VK_HANGUL:
-            self._typing.toggle_hangul()
+            if self._typing.started:
+                self._typing.toggle_hangul()
             return
         shift = bool(self._mods & {0x10, 0xA0, 0xA1})
         combo = [m for m, vks in (("ctrl", {0x11, 0xA2, 0xA3}), ("alt", {0x12, 0xA4, 0xA5}),
@@ -503,7 +515,7 @@ class DemonstrationRecorder:
         focus = buf.focus_hwnd or focused_control(fg)
         sensitive = _is_password_control() or looks_like_credential_window(title, proc)
         control_text = None if sensitive else read_control_text(focus)
-        raw_keys, hangul_mode = "".join(buf.keys), buf.hangul
+        raw_keys, hangul_mode = buf.raw(), buf.hangul
         typed = buf.resolve(control_text, control_class(focus))
         buf.reset()
         if typed is None:

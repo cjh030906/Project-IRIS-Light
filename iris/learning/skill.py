@@ -255,9 +255,13 @@ def build_steps(events: Iterable[LearningEvent]) -> list[SkillStep]:
                               text=field_text, clear_first=True, timestamp=e.timestamp)
                 )
             else:
+                prev = steps[-1] if steps else None
+                # 입력창을 누르고 바로 친 글자 — 실행할 땐 남아 있던 글자를 지우고 넣는다
+                # (안 지우면 전에 쳐 둔 글자까지 같이 보내진다, 실제 사례)
+                clear = prev is not None and prev.kind == "click" and prev.process == e.process_name
                 steps.append(
                     SkillStep(kind="type", process=e.process_name, title=e.window_title,
-                              text=e.text or "", timestamp=e.timestamp)
+                              text=e.text or "", clear_first=clear, timestamp=e.timestamp)
                 )
             continue
         if et == "hotkey":
@@ -331,7 +335,12 @@ def _drop_repeat_clicks(steps: list[SkillStep]) -> list[SkillStep]:
     return out
 
 
+_NO_APP = {"", "system idle process", "system"}
+
+
 def _trim(steps: list[SkillStep], start_process: str) -> list[SkillStep]:
+    # 포커스가 비어 있던 순간의 클릭 (어느 앱인지 모름) — 다시 할 수 없다
+    steps = [s for s in steps if s.kind not in {"activate_app", "click"} or s.process.lower() not in _NO_APP]
     # 녹화를 끄러 처음 창(터미널·IRIS)으로 돌아간 뒤의 단계
     if start_process:
         cut = len(steps)
