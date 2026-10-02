@@ -20,6 +20,8 @@ from iris.infrastructure.ollama_client import OllamaClient, _native_base
 
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
 DEFAULT_VISION_MODEL_SIZE_GB = 3.2
+# 화면 분석 호출의 컨텍스트 — 기본값이면 6GB GPU 에서 CPU 로 밀려 수십 배 느려진다
+VISION_NUM_CTX = 8192
 
 _CACHE_TTL_SEC = 120.0
 _cache_lock = threading.Lock()
