@@ -10,7 +10,7 @@ from iris.core.markdown_text import (
     markdown_to_plain,
     markdown_to_plain_partial,
 )
-from iris.ui.shared.theme_tokens import TOKENS
+from iris.ui.chat.typography import TOKENS
 
 _IRIS_PREFIX = re.compile(r"^\s*Iris\s*:\s*", re.IGNORECASE)
 

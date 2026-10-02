@@ -44,6 +44,7 @@ class ChatMessage:
     role: str
     content: str
     created_at: str
+    model_content: str = ""
 
 
 def _now() -> str:
@@ -328,6 +329,14 @@ def ensure_chat_schema(db: Database) -> None:
         "UPDATE chat_conversations SET title = ? WHERE title = ? AND title_locked = 0",
         (DEFAULT_TITLE, summarize_reply(INTERRUPTED_NOTE)),
     )
+    message_cols = {
+        str(row["name"])
+        for row in db._execute("PRAGMA table_info(chat_messages)").fetchall()
+    }
+    if "model_content" not in message_cols:
+        db._execute(
+            "ALTER TABLE chat_messages ADD COLUMN model_content TEXT NOT NULL DEFAULT ''"
+        )
     db._commit()
 
 
@@ -446,7 +455,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
     ensure_chat_schema(db)
     rows = db._execute(
         """
-        SELECT id, conversation_id, role, content, created_at
+        SELECT id, conversation_id, role, content, created_at, model_content
           FROM chat_messages
          WHERE conversation_id = ?
          ORDER BY id ASC
@@ -460,6 +469,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
             role=str(row["role"] or ""),
             content=str(row["content"] or ""),
             created_at=str(row["created_at"] or ""),
+            model_content=str(row["model_content"] or ""),
         )
         for row in rows
     ]
@@ -467,7 +477,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
 
 def history_dicts(db: Database, conversation_id: int) -> list[dict[str, str]]:
     return [
-        {"role": m.role, "content": m.content}
+        {"role": m.role, "content": m.content, **({"model_content": m.model_content} if m.model_content else {})}
         for m in list_messages(db, conversation_id)
         if m.role in ("user", "assistant")
     ]
@@ -543,15 +553,15 @@ def rename_conversation(db: Database, conversation_id: int, title: str) -> str:
     return name
 
 
-def append_message(db: Database, conversation_id: int, role: str, content: str) -> int:
+def append_message(db: Database, conversation_id: int, role: str, content: str, *, model_content: str = "") -> int:
     ensure_chat_schema(db)
     stamp = _now()
     cur = db._execute(
         """
-        INSERT INTO chat_messages(conversation_id, role, content, created_at)
-        VALUES(?, ?, ?, ?)
+        INSERT INTO chat_messages(conversation_id, role, content, created_at, model_content)
+        VALUES(?, ?, ?, ?, ?)
         """,
-        (int(conversation_id), str(role or ""), str(content or ""), stamp),
+        (int(conversation_id), str(role or ""), str(content or ""), stamp, model_content),
     )
     db._execute(
         "UPDATE chat_conversations SET updated_at = ? WHERE id = ?",

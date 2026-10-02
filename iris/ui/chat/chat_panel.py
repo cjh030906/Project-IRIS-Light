@@ -622,14 +622,29 @@ class ChatLogTextEdit(QTextEdit):
         attach_image_loader(self)
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-        font = QFont()
-        font.setFamilies(["Noto Sans KR", "Malgun Gothic", "Segoe UI Variable", "Segoe UI"])
-        font.setPixelSize(15)
-        self.setFont(font)
-        self.document().setDefaultFont(font)
+        from iris.ui.chat.typography import font, manager
+        self.setFont(font())
+        self.document().setDefaultFont(font())
+        manager.changed.connect(self._update_typography)
         self.document().setDocumentMargin(6)
         # HTML insertion / setHtml can reset the document's root margins.
         self.document().contentsChanged.connect(self._apply_reading_measure)
+        self._normalizing_heading_fonts = False
+        self.document().contentsChanged.connect(self._normalize_heading_fonts)
+
+    def _normalize_heading_fonts(self) -> None:
+        if self._normalizing_heading_fonts:
+            return
+        from iris.ui.chat.typography import normalize_headings
+        self._normalizing_heading_fonts = True
+        try:
+            normalize_headings(self)
+        finally:
+            self._normalizing_heading_fonts = False
+
+    def _update_typography(self, old, new) -> None:
+        from iris.ui.chat.typography import update_document
+        update_document(self, old, new)
 
     def _apply_reading_measure(self) -> None:
         """넓은 창에서도 한 줄이 약 720px를 넘지 않게 좌우 여백을 준다."""
@@ -1114,6 +1129,7 @@ class _ChatInputBar(QWidget):
     def _wire_plus_menu(self, menu: ComposerPlusMenu) -> None:
         menu.add_photos.connect(self._pick_photos)
         menu.add_files.connect(self._pick_files)
+        menu.add_folder.connect(self._pick_folder)
         menu.skill_chosen.connect(self._on_skill)
         menu.mcp_chosen.connect(self._on_mcp)
         menu.open_skills_panel.connect(self._open_skills_dialog)
@@ -1171,6 +1187,11 @@ class _ChatInputBar(QWidget):
         if not clean:
             return
         self.files_attached.emit(clean)
+
+    def _pick_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Add Folder")
+        if path:
+            self._on_paths_attached([path])
 
     def _on_skill(self, name: str) -> None:
         token = f"/{name} "
@@ -1539,6 +1560,8 @@ class ChatPanel(QWidget):
         from iris.ui.window.file_drop import log_drag_line
 
         clean, errors = validate_files(list(paths or []))
+        from iris.runtime.attachment_context import trace
+        trace("selection", paths=clean, errors=len(errors))
         log_drag_line(f"normalized_paths={clean}")
         for item in clean:
             log_drag_line(f"filename={attachment_filename(item)}")
@@ -1557,12 +1580,8 @@ class ChatPanel(QWidget):
             if item.startswith("@"):
                 chips.append(item.split()[0])
                 continue
-            suffix = Path(item).suffix.lower()
-            if suffix in _IMAGE_SUFFIXES:
-                chips.append(item)
-                continue
-            ref = self._path_to_at_ref(item)
-            chips.append(ref if ref else item)
+            # Preserve the host path internally. A display @reference is not file data.
+            chips.append(item)
         if chips:
             self._input_area.attachment_strip.add_paths(chips)
             log_drag_line("attach_success")
@@ -3005,24 +3024,14 @@ class ChatPanel(QWidget):
         t = self._input.text().strip()
         if not t and not paths:
             return
-        refs: list[str] = []
-        images: list[str] = []
-        for raw in paths:
-            item = raw.split()[0] if raw.startswith("@") else raw
-            if item.startswith("@"):
-                refs.append(_quote_at_ref(item))
-            elif Path(item).suffix.lower() in _IMAGE_SUFFIXES:
-                images.append(item)
-            else:
-                ref = self._path_to_at_ref(item)
-                if ref:
-                    refs.append(_quote_at_ref(ref))
-        ref_line = " ".join(refs)
-        if ref_line:
-            t = f"{ref_line} {t}".strip() if t else ref_line
+        from iris.ui.chat.composer_attachments import chip_fs_path
+
+        attachments = [str(chip_fs_path(p, workspace_root=self._workspace_root) or p) for p in paths]
+        from iris.runtime.attachment_context import trace
+        trace("composer_send", paths=attachments, text_chars=len(t))
         self._input.clear()
         self._input_area.sync_height_to_contents()
-        self.send_clicked.emit(t, images)
+        self.send_clicked.emit(t, attachments)
 
 
 if __name__ == "__main__":

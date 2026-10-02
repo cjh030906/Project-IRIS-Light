@@ -710,6 +710,8 @@ class HermesClient:
             "messages": messages,
             "stream": True,
         }
+        from iris.runtime.attachment_context import trace_payload
+        trace_payload("hermes", payload)
         headers = {**self._headers(json_body=True)}
         # urllib HTTP 헤더는 latin-1 — 한글 상태문구/모델라벨이 오면 요청 자체가 터진다
         try:

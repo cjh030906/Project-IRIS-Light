@@ -45,6 +45,9 @@ class UserTurnDispatcher(QObject):
     ) -> UserTurn | None:
         body = (text or "").strip()
         att = tuple(str(p).strip() for p in attachments if str(p).strip())
+        if att:
+            from iris.runtime.attachment_context import trace
+            trace("user_turn", paths=list(att), text_chars=len(body), source=str(source))
         if not body and not att:
             return None
         turn = UserTurn(

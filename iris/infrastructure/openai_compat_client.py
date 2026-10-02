@@ -302,6 +302,8 @@ def stream_chat(
         "messages": messages,
         "stream": True,
     }
+    from iris.runtime.attachment_context import trace_payload
+    trace_payload("openai_compat", body)
     data = json.dumps(body).encode("utf-8")
     req = Request(
         f"{root}/chat/completions",

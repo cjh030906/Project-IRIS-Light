@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from iris.ui.chat.chat_syntax import highlight_code
-from iris.ui.shared.theme_tokens import TOKENS
+from iris.ui.chat.typography import TOKENS
 
 if TYPE_CHECKING:
     from PyQt6.QtWidgets import QTextEdit

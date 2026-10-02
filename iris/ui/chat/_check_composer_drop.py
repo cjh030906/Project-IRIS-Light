@@ -37,7 +37,7 @@ def main() -> None:
     )
     chips = panel._input_area.attachment_strip.paths()
     assert ref in chips, chips
-    assert folder_ref in chips, chips
+    assert str(root / "iris" / "ui" / "chat") in chips, chips
     assert composer_chip_label(ref) == "chat_panel.py", composer_chip_label(ref)
     assert composer_chip_label(folder_ref) == "chat", composer_chip_label(folder_ref)
     win = "@C:/Users/serin/network_security.pdf"
@@ -137,8 +137,9 @@ def main() -> None:
         panel._emit_send()
         assert sent and "첨부 확인" in sent[0][0], sent
         assert any(str(p).endswith("iris_icon.png") for p in sent[0][1]), sent
-        payload = sent[0][0]
-        assert "iris_drop_sample.pdf" in payload and '@"' in payload, payload
+        assert set(sent[0][1]) == {str(png), str(pdf), str(doc)}, sent
+        assert sent[0][0] == "첨부 확인", sent
+        payload = sent[0][0] + '\n@"iris_drop_sample.pdf"\n@"iris_drop_sample.txt"'
         html_doc = render_user_message(payload)
         assert "iris_drop_sample.pdf" in html_doc
         assert "iris_drop_sample.txt" in html_doc
