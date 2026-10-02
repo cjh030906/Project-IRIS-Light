@@ -231,7 +231,7 @@ def wrap_document_html(inner: str) -> str:
     """공통 body 색·line-height."""
     t = TOKENS
     return (
-        f'<span style="color:{t.chat_body};'
+        f'<span style="font-weight:400;color:{t.chat_body};'
         f'line-height:{t.chat_line_height};font-size:{t.chat_font_size};'
         f'font-family:{t.chat_ui_font};">'
         f"{inner}</span>"

@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QMessageBox,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -616,6 +617,7 @@ class ChatLogTextEdit(QTextEdit):
         self.viewport().setAcceptDrops(True)
         self.viewport().installEventFilter(self)
         self._tool_blocks: dict[str, ToolShellBlock] = {}
+        self._error_details: dict[str, str] = {}
         attach_image_loader(self)
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
@@ -625,6 +627,8 @@ class ChatLogTextEdit(QTextEdit):
         self.setFont(font)
         self.document().setDefaultFont(font)
         self.document().setDocumentMargin(6)
+        # HTML insertion / setHtml can reset the document's root margins.
+        self.document().contentsChanged.connect(self._apply_reading_measure)
 
     def _apply_reading_measure(self) -> None:
         """넓은 창에서도 한 줄이 약 720px를 넘지 않게 좌우 여백을 준다."""
@@ -693,6 +697,15 @@ class ChatLogTextEdit(QTextEdit):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         # 앵커(도구 접기·재생·링크·파일 chip·citation·복사·이미지)가 항상 우선
         anchor = self.anchorAt(event.pos()) or ""
+        if anchor.startswith("iris-error://"):
+            detail = self._error_details.get(anchor.removeprefix("iris-error://"), "")
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("오류 상세 정보")
+            dialog.setText("요청 처리 중 오류가 발생했습니다.")
+            dialog.setDetailedText(detail)
+            dialog.exec()
+            event.accept()
+            return
         if anchor.startswith("iris-collapse://"):
             if handle_tool_collapse_click(self, self._tool_blocks, anchor):
                 event.accept()
@@ -2346,6 +2359,7 @@ class ChatPanel(QWidget):
         self._tool_seq = 0
         self._block_buffer.reset()
         self._log._tool_blocks.clear()
+        self._log._error_details.clear()
         self._log.clear()
 
     def restore_messages(self, messages: list[dict[str, str]]) -> None:
@@ -2431,6 +2445,21 @@ class ChatPanel(QWidget):
         self._append_trailing_blank_line()
         self._scroll_log_to_bottom()
 
+    def append_error_message(self, summary: str, detail: str) -> None:
+        """Separate operational diagnostics from ordinary assistant prose."""
+        from iris.core.activity_privacy import redact_secrets
+        from iris.ui.chat.chat_renderer import render_error_inline
+
+        self.finish_typing()
+        key = str(len(self._log._error_details) + 1)
+        self._log._error_details[key] = redact_secrets(detail)
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(render_error_inline(summary))
+        cursor.insertHtml(f'<a href="iris-error://{key}">자세히 보기</a>')
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
     def insert_tool_block(
         self,
         *,
@@ -2498,7 +2527,6 @@ class ChatPanel(QWidget):
 
     def append_stream_chunk(self, text: str) -> None:
         """스트리밍 청크 — speech_sync면 버퍼만, 아니면 누적 본문을 즉시 표시."""
-        text = prepare_chat_text(text)
         if not text:
             return
         if not self._stream_active:
@@ -2508,10 +2536,7 @@ class ChatPanel(QWidget):
         has_fixed_block = any(o.kind != RenderOpKind.REPLACE_PROSE for o in ops)
         if not self._typing_speech_sync:
             self._typing_index = prose_char_count(self._typing_text)
-            if has_fixed_block:
-                self._flush_stream_ui()
-            else:
-                self._schedule_stream_ui_flush()
+            self._schedule_stream_ui_flush()
         elif has_fixed_block:
             self._flush_stream_ui()
 
@@ -2723,15 +2748,17 @@ class ChatPanel(QWidget):
 
     def _iris_paint_html(self, body: str) -> str:
         """스트리밍·타이핑 중 화면. 원문 버퍼는 바꾸지 않는다."""
-        streaming = bool(self._stream_active)
-        visible = assistant_visible_text(body, streaming=streaming)
-        raw_prose = prose_char_count(self._typing_text or body)
-        if raw_prose > self._typing_index:
-            keep = len(visible) * self._typing_index // raw_prose
-            visible = visible[:keep]
-        if not visible.strip():
-            return ""
-        return render_iris_message(visible)
+        # Segment rendering keeps unfinished code in its card and never cuts
+        # generated HTML or fence delimiters at the typing cursor.
+        from iris.core.chat_block_parser import streaming_body_segments, ProseSegment
+
+        # Keep Markdown context across fences (e.g. lists containing code).
+        segments = streaming_body_segments(parse_chat_segments(body), self._typing_index)
+        source = "".join(seg.text if isinstance(seg, ProseSegment)
+                         else f"\n\n```{seg.language}\n{seg.code}\n```\n\n"
+                         for seg in segments if hasattr(seg, "text") or hasattr(seg, "code"))
+        visible = assistant_visible_text(source, streaming=bool(self._stream_active))
+        return render_iris_message(visible) if visible.strip() else ""
 
     def _replace_typing_body(self) -> None:
         """타이핑 본문 — Iris 는 요약 정책, 그 외는 기존 세그먼트 표시."""

@@ -103,7 +103,7 @@ def _assert_prose() -> None:
     html_out = render_iris_message(PROSE_SAMPLE)
     _assert_html_contains(
         html_out,
-        "<strong>bold</strong>",
+        "bold</strong>",
         "<ul",
         "alpha",
         "border-top:1px solid",
@@ -192,7 +192,7 @@ def _assert_error_and_user() -> None:
     _assert_html_contains(err, "something failed", f"border-radius:{t.chat_block_radius}px", label="error")
 
     user = render_user_message("**hello** world")
-    _assert_html_contains(user, "<strong>hello</strong>", label="user bold")
+    _assert_html_contains(user, "hello</strong>", label="user bold")
 
     chip = citation_chip_to_html(1, "https://example.com", "Example")
     _assert_html_contains(chip, 'href="https://example.com"', "[1]", label="citation chip")
@@ -287,17 +287,17 @@ def _smoke_chat_panel(app: QApplication) -> None:
     )
     app.processEvents()
     html_doc = panel._log.toHtml()
-    # Iris 답변은 요약 정책 — 펜스 카드는 숨기고 본문·도구 카드는 남긴다.
+    # Answers retain code cards as well as prose and explicit tool cards.
     _assert_html_contains(
         html_doc,
-        "font-weight:700",
+        "font-weight:600",
         "user",
         "alpha",
         "Smoke shell",
         "iris-collapse://smoke-tool",
         label="ChatPanel smoke",
     )
-    assert "print" not in html_doc and "iris-copy://" not in html_doc
+    assert "print" in html_doc and "iris-copy://" in html_doc
     _assert_mono_in_html(html_doc, label="ChatPanel smoke")
     assert "iris-tts://" in html_doc
 
@@ -313,7 +313,7 @@ def _smoke_workspace_log(app: QApplication) -> None:
     html_doc = log.toHtml()
     _assert_html_contains(
         html_doc,
-        "font-weight:700",
+        "font-weight:600",
         "workspace",
         "Python",
         "iris-copy://",

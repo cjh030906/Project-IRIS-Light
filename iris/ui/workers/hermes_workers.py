@@ -322,7 +322,7 @@ class HermesChatWorker(QThread):
 
                     diag = get_last_gateway_diagnosis()
                     self.failed.emit(
-                        diag.user_message()[:400]
+                        diag.detailed_message()
                         if diag is not None
                         else (
                             "Hermes gateway를 시작할 수 없습니다. "

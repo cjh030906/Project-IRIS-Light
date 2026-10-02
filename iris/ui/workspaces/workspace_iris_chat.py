@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QMouseEvent, QPalette, QTextCursor
 from PyQt6.QtWidgets import (
     QSizePolicy,
@@ -12,10 +12,9 @@ from PyQt6.QtWidgets import (
 )
 
 from iris.core.activity_privacy import prepare_chat_text, strip_emoji
-from iris.core.chat_block_parser import ChatBlockBuffer, parse_chat_segments, prose_char_count
+from iris.core.chat_block_parser import ChatBlockBuffer
 from iris.ui.chat.chat_display import (
     normalize_chat_body,
-    streaming_segments_html,
 )
 from iris.ui.chat.chat_renderer import (
     render_error_inline,
@@ -32,12 +31,14 @@ from iris.ui.chat.chat_blocks import (
     ToolShellBlock,
     handle_tool_collapse_click,
 )
-from iris.ui.chat.chat_panel import _ChatInputArea
+from iris.ui.chat.chat_panel import ChatLogTextEdit, _ChatInputArea
+from iris.ui.chat.message_regions import speaker_prefix_html
+from iris.ui.shared.theme_tokens import TOKENS
 from iris.ui.widgets.particle_visualizer import ParticleVisualizer
 from iris.ui.workspaces.ide_companion_page import EMAIL_ORB_SCALE
 
 
-class WorkspaceIrisChatLog(QTextEdit):
+class WorkspaceIrisChatLog(ChatLogTextEdit):
     """우측 Iris 패널 로그 — ChatLog와 동일 투명/패딩 + 마크다운."""
 
     def __init__(self, object_name: str, parent=None) -> None:
@@ -53,15 +54,13 @@ class WorkspaceIrisChatLog(QTextEdit):
         transparent.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0, 0))
         transparent.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
         self.setPalette(transparent)
-        self.document().setDocumentMargin(8.0)
-        self.document().setDefaultFont(self.font())
         self.setStyleSheet(
             f"""
             QTextEdit#{object_name} {{
                 background: transparent;
                 border: none;
-                color: #e2e8f0;
-                padding: 8px 10px;
+                color: {TOKENS.chat_body};
+                padding: 12px 16px;
             }}
             """
         )
@@ -72,6 +71,10 @@ class WorkspaceIrisChatLog(QTextEdit):
         self._block_buffer = ChatBlockBuffer()
         self._tool_blocks: dict[str, ToolShellBlock] = {}
         self._tool_seq = 0
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(48)
+        self._render_timer.timeout.connect(self._render_iris_buffer)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         anchor = self.anchorAt(event.pos())
@@ -103,19 +106,20 @@ class WorkspaceIrisChatLog(QTextEdit):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         html_body = render_user_message(body)
         prefetch_chat_html_images(self, html_body)
-        cursor.insertHtml(f"<p><b>You</b>: {html_body}</p>")
+        cursor.insertHtml(speaker_prefix_html("You"))
+        cursor.insertHtml(html_body)
         self.setTextCursor(cursor)
         self._append_trailing_blank()
         self._scroll_bottom()
 
     def append_iris_chunk(self, text: str) -> None:
-        chunk = prepare_chat_text(text or "")
+        chunk = text or ""
         if not chunk:
             return
         if not self._iris_active:
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertHtml("<p><b>Iris</b>: </p>")
+            cursor.insertHtml(speaker_prefix_html("Iris"))
             self._iris_body_start = cursor.position()
             self.setTextCursor(cursor)
             self._iris_active = True
@@ -123,14 +127,14 @@ class WorkspaceIrisChatLog(QTextEdit):
             self._block_buffer.reset()
         self._iris_buf += chunk
         self._block_buffer.feed(chunk)
-        self._replace_iris_body(
-            streaming_segments_html(
-                parse_chat_segments(self._iris_buf),
-                prose_char_count(self._iris_buf),
-                render_markdown=True,
-                tool_blocks=self._tool_blocks,
-            )
-        )
+        if not self._render_timer.isActive():
+            self._render_timer.start()
+
+    def _render_iris_buffer(self) -> None:
+        from iris.ui.chat.chat_display import assistant_visible_text
+
+        visible = assistant_visible_text(self._iris_buf, streaming=True)
+        self._replace_iris_body(render_iris_message(visible))
 
     def _replace_iris_body(self, html_body: str) -> None:
         if self._iris_body_start is None:
@@ -147,6 +151,7 @@ class WorkspaceIrisChatLog(QTextEdit):
         self._scroll_bottom()
 
     def end_iris(self, final_text: str | None = None) -> None:
+        self._render_timer.stop()
         if not self._iris_active and final_text is None:
             return
         if final_text is not None:
@@ -155,7 +160,7 @@ class WorkspaceIrisChatLog(QTextEdit):
             if not self._iris_active:
                 cursor = self.textCursor()
                 cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertHtml("<p><b>Iris</b>: </p>")
+                cursor.insertHtml(speaker_prefix_html("Iris"))
                 self._iris_body_start = cursor.position()
                 self.setTextCursor(cursor)
                 self._iris_active = True

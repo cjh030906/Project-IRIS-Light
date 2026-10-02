@@ -62,12 +62,14 @@ def speaker_prefix_html(who: str, msg_id: str = "") -> str:
     name = html.escape(who or "")
     you = (who or "").strip().lower() == "you"
     color = TOKENS.chat_user_name if you else TOKENS.chat_iris_name
-    label = f'<b style="color:{color};font-size:{TOKENS.chat_font_size};">{name}</b>'
+    label = f'<b style="color:{color};font-size:12px;font-weight:600;">{name}</b>'
     key = (msg_id or "").strip()
     if not key:
-        return f"{label}: "
+        if you:
+            return f'{label}: <span style="font-weight:400;"> </span>'
+        return f'<p style="margin-top:8px;margin-bottom:8px;">{label}: <br></p>'
     anchor = html.escape(message_anchor_name(key), quote=True)
-    return f'<a name="{anchor}">{label}</a>: '
+    return f'<p style="margin-top:8px;margin-bottom:8px;"><a name="{anchor}">{label}</a>: <br></p>'
 
 
 def scan_message_regions(document: QTextDocument) -> list[MessageRegion]:

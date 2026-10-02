@@ -951,9 +951,13 @@ class MainWindow(QMainWindow):
     def _on_intro_finished(self) -> None:
         if getattr(self, "_control_surface", None) is None:
             start_control_surface(self)
+        self._boot_ready_pending = bool(self._settings.hermes_enabled)
         self._refresh_hermes_health()
         mark_control_ready(self)
-        self._chat.append_message("Iris", self._ready_status_message())
+        if self._boot_ready_pending:
+            self._chat.append_message_instant("Iris", "Hermes 연결 준비를 확인하고 있습니다…")
+        else:
+            self._chat.append_message("Iris", self._ready_status_message())
         if sys.platform == "win32":
             QTimer.singleShot(800, self._repair_taskbar_pins)
             QTimer.singleShot(15000, self._repair_taskbar_pins)
@@ -1114,6 +1118,18 @@ class MainWindow(QMainWindow):
             if model:
                 self._sync_hermes_model(model)
         self._hermes_health_worker = None
+        if getattr(self, "_boot_ready_pending", False):
+            self._boot_ready_pending = False
+            if self._hermes_online:
+                self._chat.append_message_instant("Iris", self._ready_status_message())
+            else:
+                from iris.system.hermes_gateway import get_last_gateway_diagnosis
+
+                diagnosis = get_last_gateway_diagnosis()
+                self._chat.append_error_message(
+                    "Hermes 연결 준비가 완료되지 않았습니다.",
+                    diagnosis.detailed_message() if diagnosis else "Gateway 준비 확인에 실패했습니다.",
+                )
 
     def _on_hermes_health_failed(self, _err: str) -> None:
         self._hermes_online = False
@@ -1122,6 +1138,9 @@ class MainWindow(QMainWindow):
             hermes_online=False,
         )
         self._hermes_health_worker = None
+        if getattr(self, "_boot_ready_pending", False):
+            self._chat.append_error_message("Hermes 연결 준비를 확인하지 못했습니다.", _err)
+        self._boot_ready_pending = False
 
     def _sync_hermes_model(self, model: str) -> None:
         if not self._settings.hermes_enabled:
@@ -4664,7 +4683,11 @@ class MainWindow(QMainWindow):
         if is_cloud_auth_user_message(err):
             self._chat.append_ollama_cloud_login_prompt(f"{label} 오류: {err}")
         else:
-            self._chat.append_message_instant("Iris", f"{label} 오류: {err}")
+            from iris.system.hermes_gateway import get_last_gateway_diagnosis
+
+            diagnosis = get_last_gateway_diagnosis() if label == "Hermes" else None
+            summary = diagnosis.chat_message() if diagnosis is not None and not diagnosis.ok else f"{label} 요청을 완료하지 못했습니다."
+            self._chat.append_error_message(summary, err)
         self._chat_worker = None
         self._maybe_refresh_ollama_quota()
         self._finish_current_turn(open_followup=False)
