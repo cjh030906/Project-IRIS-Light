@@ -10,6 +10,7 @@ from iris.core.markdown_text import (
     markdown_to_plain,
     markdown_to_plain_partial,
 )
+from iris.ui.shared.theme_tokens import TOKENS
 
 _IRIS_PREFIX = re.compile(r"^\s*Iris\s*:\s*", re.IGNORECASE)
 
@@ -29,10 +30,8 @@ def normalize_chat_body(who: str, text: str) -> str:
     return strip_speaker_prefix(who, prepare_chat_text(text))
 
 
-# 요약만 표시 — 적용 조건은 메인 채팅 Iris 답변뿐이다.
-# 시스템 프롬프트의 "summarize only in chat" 를 화면에서 강제한다.
-# 사용자 메시지·위키·오류 전용 렌더·워크스페이스 패널은 호출하지 않는다.
-# 원문(코드 펜스)은 IDE 트리거가 그대로 소비한다. 여기선 성공 문구를 만들지 않는다.
+# Keep explanatory Markdown and code in the chat; internal tool markers and
+# private paths are filtered independently without modifying the raw buffer.
 _TOOL_MARK = "IRIS_TOOL_"
 _URL_RE = re.compile(r"https?://[^\s<>)\]]+", re.IGNORECASE)
 # ponytail: 청크 끝의 슬래시 토큰은 경로로 보고 보류한다. and/or 도 다음 청크·종료 전까지 숨는다.
@@ -47,20 +46,21 @@ _HOLD_PATH = re.compile(
 def assistant_visible_text(raw: str, *, streaming: bool) -> str:
     """Iris 답변 원문 → 화면용 텍스트.
 
-    코드 펜스·도구 블록·불필요한 경로는 뺀다. 요약 문장·오류 설명·
-    결과 안내·http(s) 링크·파일 이름만은 남긴다.
-    streaming 이면 청크 끝에 걸친 펜스·경로·도구 표식은 아직 그리지 않는다.
+    설명과 코드 펜스는 유지하고, 내부 도구 표식과 불필요한 경로를 정리한다.
+    미완성 코드도 닫힌 표시용 펜스로 감싸 원문 기호 노출을 막는다.
     """
-    from iris.core.chat_block_parser import ProseSegment, parse_chat_segments
+    from iris.core.chat_block_parser import CodeSegment, ProseSegment, parse_chat_segments
 
     parts: list[str] = []
     for seg in parse_chat_segments(raw or ""):
         if isinstance(seg, ProseSegment):
-            parts.append(seg.text)
-    text = _drop_dangling_tool("".join(parts))
-    if streaming:
-        text = _streaming_head(text)
-    return _tidy(_replace_unnecessary_paths(text))
+            prose = _drop_dangling_tool(seg.text)
+            if streaming:
+                prose = _streaming_head(prose)
+            parts.append(_replace_unnecessary_paths(prose))
+        elif isinstance(seg, CodeSegment):
+            parts.append(f"\n\n```{seg.language}\n{seg.code}\n```\n\n")
+    return "".join(parts).strip()
 
 
 def _drop_dangling_tool(text: str) -> str:
@@ -202,7 +202,10 @@ def visible_typing_text(
 def typing_body_to_html(text: str) -> str:
     """타이핑 중 본문 HTML — 공백·줄바꿈이 HTML 접힘 없이 그대로 보이게 한다."""
     escaped = html.escape(text or "")
-    return f'<span style="color:#e8f0fe;white-space:pre-wrap;">{escaped}</span>'
+    return (
+        f'<span style="color:{TOKENS.chat_body};line-height:{TOKENS.chat_line_height};'
+        f'font-size:{TOKENS.chat_font_size};white-space:pre-wrap;">{escaped}</span>'
+    )
 
 
 # 타이핑 속도 기본값 (speech_sync 없을 때)
@@ -290,8 +293,11 @@ def streaming_segments_html(
             remaining -= len(take)
             if not take:
                 continue
-            visible = visible_typing_text(take, len(take), render_markdown=render_markdown)
-            parts.append(typing_body_to_html(visible))
+            if render_markdown:
+                from iris.ui.chat.chat_renderer import render_iris_message
+                parts.append(render_iris_message(take))
+            else:
+                parts.append(typing_body_to_html(take))
             if len(take) < len(seg.text):
                 break
         elif isinstance(seg, CodeSegment):

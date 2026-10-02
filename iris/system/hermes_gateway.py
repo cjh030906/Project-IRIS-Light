@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+from functools import wraps
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -60,6 +62,17 @@ _POLLUTION_ENV_KEYS = (
 _GATEWAY_PORT_DEFAULT = 8642
 _log = logging.getLogger(__name__)
 
+_GATEWAY_LIFECYCLE_LOCK = threading.RLock()
+
+
+def _serialized_lifecycle(function):
+    """Health/model/chat workers share one gateway; never start it concurrently."""
+    @wraps(function)
+    def serialized(*args, **kwargs):
+        with _GATEWAY_LIFECYCLE_LOCK:
+            return function(*args, **kwargs)
+    return serialized
+
 
 @dataclass
 class GatewayDiagnosis:
@@ -86,6 +99,23 @@ class GatewayDiagnosis:
     chat_auth: str = ""
     ready_detail: str = ""
     timestamp: str = ""
+
+    def chat_message(self) -> str:
+        """Concise chat summary; full command and logs stay in diagnostics."""
+        return f"Hermes를 시작하지 못했습니다.\n{self.message} [{self.code}]"
+
+    def detailed_message(self) -> str:
+        """Developer details, including complete saved stdout/stderr."""
+        from iris.core.activity_privacy import redact_secrets
+
+        parts = [self.copy_text()]
+        for label, path in (("stdout", self.stdout_log), ("stderr", self.stderr_log)):
+            if path:
+                try:
+                    parts.append(f"{label}:\n" + Path(path).read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    parts.append(f"{label}: 로그 파일을 읽을 수 없습니다.")
+        return redact_secrets("\n\n".join(parts))
 
     def user_message(self) -> str:
         """설치 UI용 짧은 문구 (시크릿 없음). command/exit/stdout·stderr를 앞에 둔다."""
@@ -662,6 +692,7 @@ def hermes_runtime_report(*, command: str = "hermes") -> str:
     return text
 
 
+@_serialized_lifecycle
 def start_hermes_gateway(command: str = "hermes") -> bool:
     """`hermes gateway run`을 창 없이 백그라운드로 기동. 실행 파일이 없으면 False."""
     global _LAST_CMD
@@ -728,6 +759,7 @@ def start_hermes_gateway(command: str = "hermes") -> bool:
         return False
 
 
+@_serialized_lifecycle
 def stop_hermes_gateway(
     command: str = "hermes",
     *,
@@ -1409,6 +1441,7 @@ def _apply_ollama_options_guard_now() -> bool:
         return False
 
 
+@_serialized_lifecycle
 def ensure_hermes_gateway_running(
     base_url: str,
     *,
@@ -1551,6 +1584,7 @@ def ensure_hermes_gateway_running(
     )
 
 
+@_serialized_lifecycle
 def restart_hermes_gateway(
     base_url: str,
     *,

@@ -59,10 +59,12 @@ def _keep_text_symbol(ch: str, code: int) -> bool:
     # Block Elements (▀ ▄ █ …) — 구분선/다이어그램
     if 0x2580 <= code <= 0x259F:
         return True
+    if 0x2190 <= code <= 0x21FF:
+        return True
     return False
 
 
-def strip_emoji(text: str) -> str:
+def strip_emoji(text: str, *, preserve_whitespace: bool = False) -> str:
     """이모지·이모티콘·장식 심볼을 항상 제거. 일반 한글/영문/문장부호는 유지."""
     if not text:
         return text
@@ -88,7 +90,8 @@ def strip_emoji(text: str) -> str:
             continue
         out.append(ch)
     cleaned = "".join(out)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    if not preserve_whitespace:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned
 
 
@@ -128,7 +131,11 @@ def prepare_chat_text(raw: str) -> str:
     if not raw:
         return ""
     t = _CTRL_RE.sub(" ", raw)
-    return strip_emoji(t)
+    # Preserve indentation and literal symbols in code, including incomplete
+    # streaming fences. Prose filtering must not rewrite Python's whitespace.
+    parts = re.split(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)", t)
+    return "".join(part if i % 2 else strip_emoji(part, preserve_whitespace=True)
+                   for i, part in enumerate(parts))
 
 
 def summarize_tool_params(tool: str, params: dict[str, Any] | None) -> str:

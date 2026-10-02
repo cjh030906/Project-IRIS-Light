@@ -15,13 +15,13 @@ from PyQt6.QtGui import (
     QCursor,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QGuiApplication,
     QImage,
     QKeyEvent,
     QMouseEvent,
     QPainter,
     QPalette,
-    QPen,
     QTextBlockFormat,
     QTextCursor,
     QTextOption,
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QMessageBox,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -146,6 +147,24 @@ def _save_clipboard_image(image: QImage) -> str | None:
     except OSError:
         return None
     return None
+
+
+def _quote_at_ref(ref: str) -> str:
+    """공백·드라이브 절대경로는 따옴표로 감싸 파일명이 잘리지 않게 한다."""
+    body = (ref or "").strip()
+    if body.startswith("@"):
+        body = body[1:].strip()
+    if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
+        body = body[1:-1]
+    needs = (
+        bool(len(body) >= 2 and body[0].isalpha() and body[1] == ":")
+        or any(ch.isspace() for ch in body)
+        or "(" in body
+        or ")" in body
+    )
+    if needs:
+        return '@"' + body.replace('"', "") + '"'
+    return f"@{body}" if body else ""
 
 
 def _looks_like_path_line(text: str) -> bool:
@@ -599,7 +618,39 @@ class ChatLogTextEdit(QTextEdit):
         self.viewport().setAcceptDrops(True)
         self.viewport().installEventFilter(self)
         self._tool_blocks: dict[str, ToolShellBlock] = {}
+        self._error_details: dict[str, str] = {}
         attach_image_loader(self)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        font = QFont()
+        font.setFamilies(["Noto Sans KR", "Malgun Gothic", "Segoe UI Variable", "Segoe UI"])
+        font.setPixelSize(15)
+        self.setFont(font)
+        self.document().setDefaultFont(font)
+        self.document().setDocumentMargin(6)
+        # HTML insertion / setHtml can reset the document's root margins.
+        self.document().contentsChanged.connect(self._apply_reading_measure)
+
+    def _apply_reading_measure(self) -> None:
+        """넓은 창에서도 한 줄이 약 720px를 넘지 않게 좌우 여백을 준다."""
+        view_w = max(1, self.viewport().width())
+        side = max(12, (view_w - 720) // 2)
+        frame = self.document().rootFrame().frameFormat()
+        if int(frame.leftMargin()) == side and int(frame.rightMargin()) == side:
+            return
+        frame.setLeftMargin(float(side))
+        frame.setRightMargin(float(side))
+        frame.setTopMargin(6)
+        frame.setBottomMargin(8)
+        self.document().rootFrame().setFrameFormat(frame)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_reading_measure()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._apply_reading_measure()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
         forwarded = _forward_viewport_drag(self, watched, event)
@@ -647,6 +698,15 @@ class ChatLogTextEdit(QTextEdit):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         # 앵커(도구 접기·재생·링크·파일 chip·citation·복사·이미지)가 항상 우선
         anchor = self.anchorAt(event.pos()) or ""
+        if anchor.startswith("iris-error://"):
+            detail = self._error_details.get(anchor.removeprefix("iris-error://"), "")
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("오류 상세 정보")
+            dialog.setText("요청 처리 중 오류가 발생했습니다.")
+            dialog.setDetailedText(detail)
+            dialog.exec()
+            event.accept()
+            return
         if anchor.startswith("iris-collapse://"):
             if handle_tool_collapse_click(self, self._tool_blocks, anchor):
                 event.accept()
@@ -1278,14 +1338,12 @@ class ChatPanel(QWidget):
         # 첫 글자(Iris의 I, 한글 자모 가로획)가 좌측 가장자리에서 잘리지 않게
         # 문서 자체 여백도 확보한다. HTML inline 앞부분은 stylesheet padding만으로는
         # 플랫폼별 클리핑이 남을 수 있다.
-        self._log.document().setDocumentMargin(8.0)
-        self._log.document().setDefaultFont(self.font())
         self._log.setMinimumHeight(80)
         self._log.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self._apply_log_fill(False)
+        self._apply_log_fill()
         self._typing_timer = QTimer(self)
         self._typing_timer.setInterval(TYPING_INTERVAL_MS)
         self._typing_timer.timeout.connect(self._type_next_chunk)
@@ -1469,7 +1527,8 @@ class ChatPanel(QWidget):
         if ws:
             try:
                 rel = path.relative_to(Path(ws).expanduser().resolve())
-                return f"@{rel.as_posix()}"
+                if rel.parts and rel != Path("."):
+                    return f"@{rel.as_posix()}"
             except ValueError:
                 pass
         return f"@{path.as_posix()}"
@@ -1596,28 +1655,28 @@ class ChatPanel(QWidget):
             + 8
         )
 
-    def _apply_log_fill(self, opaque: bool) -> None:
-        fill = TOKENS.space_navy if opaque else "transparent"
+    def _apply_log_fill(self) -> None:
+        """로그·패널은 항상 투명. 입력창·메시지 칩 배경은 각자의 스타일을 유지한다."""
         self._log.setStyleSheet(
             f"""
             QTextEdit#ChatLog {{
-                background: {fill};
+                background: transparent;
                 border: none;
-                color: {TOKENS.text_primary};
-                padding: 8px 10px;
+                color: {TOKENS.chat_body};
+                padding: 12px 16px;
                 selection-background-color: {TOKENS.chat_selection_bg};
                 selection-color: {TOKENS.chat_selection_fg};
             }}
             """
         )
-        bg = QColor(TOKENS.space_navy) if opaque else QColor(0, 0, 0, 0)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not opaque)
-        self.setAutoFillBackground(opaque)
+        bg = QColor(0, 0, 0, 0)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Window, bg)
         pal.setColor(QPalette.ColorRole.Base, bg)
         self.setPalette(pal)
-        self._log.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not opaque)
+        self._log.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         log_pal = self._log.palette()
         log_pal.setColor(QPalette.ColorRole.Base, bg)
         log_pal.setColor(QPalette.ColorRole.Window, bg)
@@ -1699,8 +1758,8 @@ class ChatPanel(QWidget):
             self._restore_above()
             self._above_snap = []
             self.setMinimumHeight(self._natural_min_height())
-            self._apply_log_fill(False)
             self._activate_parent()
+            self._sync_orb_fade()
             return
         remaining = extra
         for widget, rest, _omin, _omax in self._above_snap:
@@ -1711,25 +1770,26 @@ class ChatPanel(QWidget):
             widget.setVisible(new_h > 0)
             remaining -= take
         self.setMinimumHeight(max(self._natural_min_height(), self._rest_h + extra))
-        if prev <= 0:
-            self._apply_log_fill(True)
         self._activate_parent()
+        self._sync_orb_fade()
+
+    def _sync_orb_fade(self) -> None:
+        """채팅 상단을 구체 페이드 경계로. 단색 스크림은 그리지 않는다."""
+        window = self.window()
+        viz = getattr(window, "_viz", None)
+        core = getattr(viz, "particle_core", None)
+        particle = core() if callable(core) else None
+        if particle is None or not hasattr(particle, "set_chat_fade_y"):
+            return
+        if self._extra_h <= 0:
+            particle.set_chat_fade_y(None)
+            return
+        top = self.mapToGlobal(self.rect().topLeft())
+        local = viz.mapFromGlobal(top)
+        particle.set_chat_fade_y(float(local.y()))
 
     def _is_fully_expanded(self) -> bool:
         return self._extra_h > 0 and self._extra_h >= self._max_extra()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        if self._extra_h > 0:
-            painter = QPainter(self)
-            painter.fillRect(self.rect(), QColor(TOKENS.space_navy))
-            if self._is_fully_expanded():
-                pen = QPen(QColor(56, 189, 248, 90))
-                pen.setWidth(1)
-                painter.setPen(pen)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-            painter.end()
-        super().paintEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1741,6 +1801,7 @@ class ChatPanel(QWidget):
             if self._extra_h > cap:
                 self._apply_chat_extra(cap)
         self._sync_diagram_card_height()
+        self._sync_orb_fade()
 
     def get_tts_text(self, token: str) -> str:
         key = (token or "").strip()
@@ -2356,6 +2417,7 @@ class ChatPanel(QWidget):
         self._tool_seq = 0
         self._block_buffer.reset()
         self._log._tool_blocks.clear()
+        self._log._error_details.clear()
         self._log.clear()
 
     def restore_messages(self, messages: list[dict[str, str]]) -> None:
@@ -2434,7 +2496,24 @@ class ChatPanel(QWidget):
         if msg_id:
             self._insert_iris_body(cursor, body, msg_id)
         else:
-            cursor.insertHtml(render_user_message(body))
+            html_body = render_user_message(body)
+            prefetch_chat_html_images(self._log, html_body)
+            cursor.insertHtml(html_body)
+        self._log.setTextCursor(cursor)
+        self._append_trailing_blank_line()
+        self._scroll_log_to_bottom()
+
+    def append_error_message(self, summary: str, detail: str) -> None:
+        """Separate operational diagnostics from ordinary assistant prose."""
+        from iris.core.activity_privacy import redact_secrets
+        from iris.ui.chat.chat_renderer import render_error_inline
+
+        self.finish_typing()
+        key = str(len(self._log._error_details) + 1)
+        self._log._error_details[key] = redact_secrets(detail)
+        cursor = self._begin_chat_message_cursor()
+        cursor.insertHtml(render_error_inline(summary))
+        cursor.insertHtml(f'<a href="iris-error://{key}">자세히 보기</a>')
         self._log.setTextCursor(cursor)
         self._append_trailing_blank_line()
         self._scroll_log_to_bottom()
@@ -2578,7 +2657,6 @@ class ChatPanel(QWidget):
 
     def append_stream_chunk(self, text: str) -> None:
         """스트리밍 청크 — speech_sync면 버퍼만, 아니면 누적 본문을 즉시 표시."""
-        text = prepare_chat_text(text)
         if not text:
             return
         if not self._stream_active:
@@ -2588,10 +2666,7 @@ class ChatPanel(QWidget):
         has_fixed_block = any(o.kind != RenderOpKind.REPLACE_PROSE for o in ops)
         if not self._typing_speech_sync:
             self._typing_index = prose_char_count(self._typing_text)
-            if has_fixed_block:
-                self._flush_stream_ui()
-            else:
-                self._schedule_stream_ui_flush()
+            self._schedule_stream_ui_flush()
         elif has_fixed_block:
             self._flush_stream_ui()
 
@@ -2803,15 +2878,17 @@ class ChatPanel(QWidget):
 
     def _iris_paint_html(self, body: str) -> str:
         """스트리밍·타이핑 중 화면. 원문 버퍼는 바꾸지 않는다."""
-        streaming = bool(self._stream_active)
-        visible = assistant_visible_text(body, streaming=streaming)
-        raw_prose = prose_char_count(self._typing_text or body)
-        if raw_prose > self._typing_index:
-            keep = len(visible) * self._typing_index // raw_prose
-            visible = visible[:keep]
-        if not visible.strip():
-            return ""
-        return render_iris_message(visible)
+        # Segment rendering keeps unfinished code in its card and never cuts
+        # generated HTML or fence delimiters at the typing cursor.
+        from iris.core.chat_block_parser import streaming_body_segments, ProseSegment
+
+        # Keep Markdown context across fences (e.g. lists containing code).
+        segments = streaming_body_segments(parse_chat_segments(body), self._typing_index)
+        source = "".join(seg.text if isinstance(seg, ProseSegment)
+                         else f"\n\n```{seg.language}\n{seg.code}\n```\n\n"
+                         for seg in segments if hasattr(seg, "text") or hasattr(seg, "code"))
+        visible = assistant_visible_text(source, streaming=bool(self._stream_active))
+        return render_iris_message(visible) if visible.strip() else ""
 
     def _replace_typing_body(self) -> None:
         """타이핑 본문 — Iris 는 요약 정책, 그 외는 기존 세그먼트 표시."""
@@ -2933,13 +3010,13 @@ class ChatPanel(QWidget):
         for raw in paths:
             item = raw.split()[0] if raw.startswith("@") else raw
             if item.startswith("@"):
-                refs.append(item)
+                refs.append(_quote_at_ref(item))
             elif Path(item).suffix.lower() in _IMAGE_SUFFIXES:
                 images.append(item)
             else:
                 ref = self._path_to_at_ref(item)
                 if ref:
-                    refs.append(ref)
+                    refs.append(_quote_at_ref(ref))
         ref_line = " ".join(refs)
         if ref_line:
             t = f"{ref_line} {t}".strip() if t else ref_line

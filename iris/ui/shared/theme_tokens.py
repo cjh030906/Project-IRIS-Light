@@ -88,6 +88,14 @@ class ThemeTokens:
     font_size_micro: str = "10px"
     font_size_input: str = "14px"
 
+    # 채팅 본문 — HUD 13px와 분리. 대비·줄간격은 읽기 우선.
+    chat_font_size: str = "15px"
+    chat_line_height: str = "165%"
+    chat_body: str = "#f8fafc"
+    chat_user_name: str = "#7dd3fc"
+    chat_iris_name: str = "#c4b5fd"
+    chat_user_bubble: str = "rgba(56, 189, 248, 0.10)"
+
     # 채팅 블록 (Cursor식 prose / code / tool) — 채팅창 배경과의 명도 차이를 크게
     # 벌리지 않는 차분한 다크 네이비, 테두리도 은은하게.
     chat_block_bg: str = "#141b2e"
@@ -103,17 +111,17 @@ class ThemeTokens:
     # 반드시 작은따옴표만 사용한다.
     chat_block_mono_font: str = "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace"
     chat_block_code_weight: int = 500
-    chat_block_line_height: str = "1.6"
+    chat_block_line_height: str = "150%"
     # 코드 블록 헤더(언어명·복사)용 일반 UI 폰트 — font_family와 동일한 스택이지만
     # 위와 같은 이유로 작은따옴표를 사용한다.
     chat_ui_font: str = "'Segoe UI Variable', 'Segoe UI', 'Noto Sans KR', 'Malgun Gothic'"
 
     # 채팅 인라인 코드 — 배경 대비를 약하게 해 문장 흐름을 방해하지 않도록.
-    chat_inline_code_bg: str = "rgba(148, 163, 184, 0.08)"
+    chat_inline_code_bg: str = "#202b3d"
     chat_inline_code_color: str = "#9fb3d9"
 
     # 채팅 표(table) — border-bottom은 위와 같은 이유로 불투명 hex를 사용한다.
-    chat_table_header_bg: str = "rgba(148, 163, 184, 0.10)"
+    chat_table_header_bg: str = "#1b2535"
     chat_table_row_border: str = "#26314a"
 
     # 채팅 로그 텍스트 선택(드래그 선택) 색상 — 시스템 강조색 대신 테마에 맞는 은은한 톤

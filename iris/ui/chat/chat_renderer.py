@@ -93,9 +93,61 @@ def render_wiki_document(text: str) -> str:
     return render_markdown_document(text, citations=True)
 
 
+_ATTACH_TOKEN = "\ue010{}\ue011"
+_LOCAL_ATTACH = re.compile(
+    r'@"([^"]+)"'
+    r"|@'([^']+)'"
+    r"|@([A-Za-z]:[\\/][^\s<>]+)"
+    r"|`([A-Za-z]:[\\/][^`\n]+)`"
+    r"|`(\\\\[^`\n]+)`"
+)
+
+
+def _swap_attachment_prose(text: str, chips: list[str]) -> str:
+    from iris.ui.chat.composer_attachments import attachment_chip_html
+
+    def repl(match: re.Match[str]) -> str:
+        raw = next(group for group in match.groups() if group)
+        chips.append(attachment_chip_html(raw))
+        return _ATTACH_TOKEN.format(len(chips) - 1)
+
+    return _LOCAL_ATTACH.sub(repl, text)
+
+
+def _swap_local_attachments(text: str) -> tuple[str, list[str]]:
+    """절대경로·백틱 경로는 칩 토큰으로. 코드 펜스 안은 그대로."""
+    chips: list[str] = []
+    parts: list[str] = []
+    pos = 0
+    source = text or ""
+    while pos < len(source):
+        fence = source.find(_FENCE, pos)
+        if fence < 0:
+            parts.append(_swap_attachment_prose(source[pos:], chips))
+            break
+        if fence > pos:
+            parts.append(_swap_attachment_prose(source[pos:fence], chips))
+        close = source.find(_FENCE, fence + 3)
+        if close < 0:
+            parts.append(source[fence:])
+            break
+        parts.append(source[fence : close + 3])
+        pos = close + 3
+    return "".join(parts), chips
+
+
 def render_user_message(text: str) -> str:
-    """사용자 메시지 — markdown (인용 칩 제외)."""
-    return render_markdown_document(text, citations=False)
+    """사용자 메시지 — markdown. 로컬 첨부는 파일명 칩."""
+    source, chips = _swap_local_attachments(text or "")
+    rendered = render_markdown_document(source, citations=False)
+    for index, chip in enumerate(chips):
+        rendered = rendered.replace(_ATTACH_TOKEN.format(index), chip)
+    # QTextDocument does not support rounded CSS bubbles. A quiet inset card
+    # uses native paragraph margins instead of a dark, rectangular table.
+    return (
+        '<div style="margin-left:24px;margin-right:12px;">'
+        f"{rendered}</div>"
+    )
 
 
 def render_error_inline(text: str) -> str:
@@ -236,18 +288,46 @@ def _upgrade_inline_code_file_chips(html_body: str) -> str:
 
 
 def _markdown_body_to_html(text: str) -> str:
-    source = _inject_file_chips_in_source(text)
+    from iris.ui.chat.markdown_normalization import normalize_markdown_source
+
+    source = _inject_file_chips_in_source(_normalize_prose_symbols(normalize_markdown_source(text)))
     try:
         import markdown as md
 
         rendered = md.markdown(source, extensions=list(_MARKDOWN_EXTENSIONS))
-    except Exception:
-        return wrap_document_html(_plain_to_chat_html(source))
+    except ImportError:
+        # Qt's built-in GitHub dialect also supports tables and fenced code.
+        # A missing optional parser must not silently show Markdown as plain text.
+        from PyQt6.QtGui import QTextDocument
+
+        document = QTextDocument()
+        document.setMarkdown(source, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+        return document.toHtml()
 
     rendered = _sanitize_chat_html(rendered)
     rendered = _upgrade_fenced_pre_to_cards(rendered)
     rendered = _upgrade_inline_code_file_chips(rendered)
     return wrap_document_html(_style_chat_html(rendered))
+
+
+def _normalize_prose_symbols(text: str) -> str:
+    """Show common math arrows in prose; preserve fenced and inline code."""
+    symbols = {"rightarrow": "→", "leftarrow": "←", "leftrightarrow": "↔",
+               "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔",
+               "times": "×", "cdot": "·", "leq": "≤", "geq": "≥", "neq": "≠"}
+    chunks = re.split(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)", text)
+    for i in range(0, len(chunks), 2):
+        chunks[i] = re.sub(r"\\(" + "|".join(symbols) + r")(?![A-Za-z])",
+                           lambda m: symbols[m.group(1)], chunks[i])
+        chunks[i] = re.sub(r"(?:\$|\\\()\s*([→←↔⇒⇐⇔])\s*(?:\$|\\\))", r"\1", chunks[i])
+        def math_text(match: re.Match[str]) -> str:
+            value = match[1]
+            if not ("\\" in value or re.fullmatch(r"[\w=+*/().<>≤≥≠-]+", value)):
+                return match[0]
+            value = re.sub(r"\\text\{([^{}]+)\}", r"\1", value)
+            return re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1) / (\2)", value)
+        chunks[i] = re.sub(r"(?<!\\)\$([^$\n]+)(?<!\\)\$", math_text, chunks[i])
+    return "".join(chunks)
 
 
 def _upgrade_fenced_pre_to_cards(html_body: str) -> str:
@@ -266,7 +346,9 @@ def _upgrade_fenced_pre_to_cards(html_body: str) -> str:
 def _plain_to_chat_html(text: str) -> str:
     escaped = html.escape(text)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    return escaped.replace("\n", "<br>")
+    escaped = re.sub(r"^#{1,6}\s+(.+)$", r"<h3>\1</h3>", escaped, flags=re.MULTILINE)
+    return "".join("<p>" + part.replace("\n", "<br>") + "</p>"
+                   for part in escaped.split("\n\n") if part.strip())
 
 
 def _sanitize_chat_html(html_body: str) -> str:
@@ -317,12 +399,12 @@ def _style_table_cell(match: re.Match[str]) -> str:
     if tag == "th":
         style = (
             f"background-color:{t.chat_table_header_bg};color:{t.text_primary};"
-            f"font-weight:600;padding:6px 12px;border:none;"
+            f"font-weight:600;padding:8px 12px;border:none;"
             f"border-bottom:1px solid {t.chat_table_row_border};text-align:left;"
         )
     else:
         style = (
-            f"color:{t.text_primary};padding:6px 12px;border:none;"
+            f"color:{t.text_primary};padding:8px 12px;border:none;"
             f"border-bottom:1px solid {t.chat_table_row_border};text-align:left;"
         )
     return f"<{tag}{_merge_cell_style(attrs, style)}>"
@@ -342,7 +424,7 @@ def _style_tables(html_body: str) -> str:
 
 def _style_chat_html(html_body: str) -> str:
     t = TOKENS
-    body = f"color:{t.text_primary};"
+    body = f"color:{t.chat_body};line-height:{t.chat_line_height};font-size:{t.chat_font_size};"
     shell = (
         f"background-color:{t.chat_block_bg};"
         f"border:1px solid {t.chat_block_border};"
@@ -352,10 +434,9 @@ def _style_chat_html(html_body: str) -> str:
     out = html_body
     out = re.sub(
         r"<p>",
-        f'<span style="display:block;margin:0 0 4px 0;{body}">',
+        f'<p style="margin-top:0;margin-bottom:14px;{body}">',
         out,
     )
-    out = re.sub(r"</p>", "</span>", out)
     out = re.sub(
         r"<hr\s*/?>",
         f'<hr style="border:none;border-top:1px solid {t.text_muted};margin:8px 0;height:0;" />',
@@ -373,12 +454,15 @@ def _style_chat_html(html_body: str) -> str:
         out,
     )
     out = _style_tables(out)
-    out = re.sub(
-        r"<h([1-6])>",
-        f'<span style="display:block;font-weight:700;margin:6px 0 4px 0;{body}">',
-        out,
-    )
-    out = re.sub(r"</h[1-6]>", "</span>", out)
+    out = re.sub(r"<h([1-6])>", lambda m: (
+        f'<h{m[1]} style="color:{t.text_primary};font-size:{(24,21,18,16,15,15)[int(m[1])-1]}px;'
+        'font-weight:600;margin-top:20px;margin-bottom:10px;">'), out)
+    out = re.sub(r"<(ul|ol)>", r'<\1 style="margin-top:4px;margin-bottom:16px;margin-left:20px;">', out)
+    out = out.replace("<li>", f'<li style="margin-bottom:8px;{body}">')
+    out = out.replace("<blockquote>",
+        f'<blockquote style="margin-left:18px;margin-right:12px;margin-top:12px;'
+        f'margin-bottom:16px;color:{t.text_secondary};">')
+    out = out.replace("<strong>", f'<strong style="font-weight:600;color:{t.text_primary};">')
     out = re.sub(
         r'<a(?![^>]*\bstyle=)(?=[^>]*href="(?!iris-(?!wiki://)))',
         '<a style="color:#60a5fa;" ',

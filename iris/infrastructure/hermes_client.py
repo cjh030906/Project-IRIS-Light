@@ -866,7 +866,9 @@ def _should_emit_assistant_content(chunk: str, choice: dict[str, Any]) -> bool:
         return False
     if _looks_like_tool_args_json(chunk):
         return False
-    return bool((chunk or "").strip())
+    # Whitespace deltas carry Markdown structure and code indentation. Dropping
+    # them joins headings/table rows/fences and can split numeric HTML entities.
+    return bool(chunk)
 
 
 if __name__ == "__main__":
