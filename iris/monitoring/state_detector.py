@@ -42,7 +42,7 @@ _PROMPT = """이 창의 화면을 보고 현재 작업 상태를 판정하세요
 - UNKNOWN: 화면만으로 판단이 어려움
 
 JSON 형식 (이것만 출력):
-{{"category": "...", "confidence": 0.0~1.0, "reason": "한국어 한 문장", "recommended_action": "한국어 한 문장"}}
+{{"category": "...", "confidence": 0.0~1.0, "summary": "화면에 무엇이 보이는지 한국어 한 문장", "reason": "판정 근거 한국어 한 문장", "recommended_action": "한국어 한 문장"}}
 
 reason에는 화면에서 실제로 보이는 근거를 쓰세요. 근거가 없으면 UNKNOWN에
 confidence를 낮게 주세요. 추측으로 문제를 지어내지 마세요."""
@@ -97,6 +97,7 @@ def parse_detection(text: str) -> DetectionResult:
         confidence=confidence,
         reason=str(obj.get("reason") or "").strip()[:400],
         recommended_action=str(obj.get("recommended_action") or "").strip()[:200],
+        summary=str(obj.get("summary") or "").strip()[:300],
     )
 
 

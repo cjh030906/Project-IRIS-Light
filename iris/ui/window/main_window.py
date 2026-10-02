@@ -38,7 +38,7 @@ from iris.audio.workers import (
     TTSWarmupWorker,
 )
 from iris.config.settings import load_settings
-from iris.core.activity_sink import register_activity_sink
+from iris.core.activity_sink import push_activity_line, register_activity_sink
 from iris.core.state_machine import AppState, StateMachine
 from iris.infrastructure.ollama_client import OllamaModelInfo, apply_ollama_cleanup
 from iris.knowledge.iris_wiki import IrisWiki
@@ -224,6 +224,24 @@ _PAST_CHATS_WAIT_MS = 3000
 _EMBED_REWARM_SEC = 600
 _ASSISTANT_RIGHT_MIN = 220
 _ASSISTANT_CENTER_MIN = 340
+
+
+def _pinned_status_block(window: object) -> str:
+    """고정(📌)해서 감시 중인 창의 최신 분석 — "고정한 창 지금 어때?"에 답하려고."""
+    monitor = getattr(window, "_pinned_monitor", None)
+    if monitor is None:
+        return ""
+    try:
+        lines = monitor.status_lines()
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+    return (
+        "[고정 창 감시 현황] 사용자가 📌로 고정한 창을 IRIS가 30초마다 화면으로 "
+        "분석한 최신 결과다. 고정한 창·감시 중인 창·모니터링에 대해 물으면 이걸로 답하고, "
+        "여기 없는 내용을 화면에서 본 것처럼 지어내지 마라.\n" + "\n".join(lines)
+    )
 
 
 class MainWindow(QMainWindow):
@@ -686,6 +704,8 @@ class MainWindow(QMainWindow):
         self._monitor.pin_changed.connect(self._on_pin_changed)
         self._pinned_monitor.updated.connect(self._monitor.rerender_pins)
         self._pinned_monitor.report.connect(self._on_pinned_report)
+        self._pinned_monitor.vision_missing.connect(self._on_monitor_vision_missing)
+        self._vision_pull_running = False
         self._pinned_monitor.start()
 
         # 알림·전화 낭독 — 채팅 TTS와 분리된 저지연 경로
@@ -2951,18 +2971,83 @@ class MainWindow(QMainWindow):
 
         return False
 
+    def _pin_target_id(self, title: str) -> int:
+        """고정 창의 targets 행 id — 알림 쿨다운을 창마다 따로 세려고 쓴다."""
+        key = (title or "").strip().lower()
+        try:
+            for row in self._db.list_targets(True):
+                if str(row["title"] or "").strip().lower() == key:
+                    return int(row["id"])
+        except Exception:
+            pass
+        return 0
+
+    def _on_monitor_vision_missing(self, reason: str) -> None:
+        """고정 감시에 쓸 '화면을 보는' 모델이 없다 — 받을지 묻는다."""
+        if self._vision_pull_running:
+            return
+        from PyQt6.QtWidgets import QMessageBox
+
+        from iris.infrastructure.local_vision import (
+            DEFAULT_VISION_MODEL_SIZE_GB,
+            preferred_vision_model,
+        )
+
+        model = preferred_vision_model()
+        box = QMessageBox(self)
+        box.setWindowTitle("화면 분석 모델 필요")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("고정한 창을 분석하려면 화면을 볼 수 있는 로컬 모델이 필요해요.")
+        box.setInformativeText(
+            f"{model} (약 {DEFAULT_VISION_MODEL_SIZE_GB:.0f}GB)을 Ollama로 받을까요?\n"
+            "받는 동안에도 IRIS는 그대로 쓸 수 있어요. 업무 학습도 이 모델을 같이 써요."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            self._live_activity.append_instant_line("화면 분석 모델 설치를 건너뜀")
+            return
+        self._start_vision_model_pull(model)
+
+    def _start_vision_model_pull(self, model: str) -> None:
+        import threading
+
+        from iris.infrastructure.local_vision import pull_model
+
+        self._vision_pull_running = True
+        self._live_activity.append_instant_line(f"{model} 받는 중…")
+
+        def progress(status: str, pct: object) -> None:
+            if isinstance(pct, int) and pct % 10 == 0:
+                push_activity_line(f"{model} 받는 중 {pct}%")
+
+        def run() -> None:
+            err = pull_model(self._settings.ollama_base_url, model, progress)
+            self._vision_pull_running = False
+            if err:
+                push_activity_line(f"{model} 설치 실패: {err}")
+                self._pinned_monitor.allow_vision_prompt_again()
+            else:
+                push_activity_line(f"{model} 설치 완료 — 고정 창 분석을 시작해요")
+                self._pinned_monitor.allow_vision_prompt_again()
+                self._pinned_monitor._rerun_requested.emit()
+
+        threading.Thread(target=run, daemon=True, name="iris-vision-pull").start()
+
     def _on_pinned_report(self, title: str, category: str, headline: str, detail: str) -> None:
         """감시 중인 창의 상태가 주의 필요로 바뀐 순간 — 알림 패널에 띄운다."""
+        # 쿨다운은 창마다 — 한 창의 에러 알림이 다른 창의 에러 알림을 막지 않게
+        target_id = self._pin_target_id(title)
         suppressed = None
         try:
-            # target_id 0 = 고정 감시(테이블 등록 대상 아님) — 카테고리 쿨다운만 적용
-            suppressed = self._notif_policy.should_suppress(0, category)
+            suppressed = self._notif_policy.should_suppress(target_id, category)
         except Exception:
             suppressed = None
         if suppressed:
             return
         self._notes.try_add_alert(
-            target_id=0,
+            target_id=target_id,
             category=category,
             title=f"{headline} — {title[:40]}",
             message=detail or headline,
@@ -2972,8 +3057,10 @@ class MainWindow(QMainWindow):
         self._speak_alert(notification_announcement(headline, title[:40]))
         self._refresh_voice_hint()
         try:
-            self._notif_policy.mark_shown(0, category)
-            self._notif_policy.log_notification(0, 0, category, title, detail or headline)
+            self._notif_policy.mark_shown(target_id, category)
+            self._notif_policy.log_notification(
+                target_id or None, 0, category, title, detail or headline
+            )
         except Exception:
             pass
 
@@ -7043,6 +7130,7 @@ class MainWindow(QMainWindow):
             payload.insert(at, {"role": "system", "content": content})
 
         _before_user(traits)
+        _before_user(_pinned_status_block(self))
         _before_user(wiki_notes)
         if past:
             _before_user(past)

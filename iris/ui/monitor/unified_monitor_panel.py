@@ -321,7 +321,7 @@ class UnifiedMonitorPanel(QWidget):
         rows: list[tuple[_WindowSnap, Optional[_MonitorMeta], Optional[PinnedTarget], tuple]] = []
         for snap in snaps:
             meta = _match_monitor(snap.info.title, monitors)
-            pin = self._pins.get(snap.info.title) if self._pins else None
+            pin = self._pins.match(snap.info.title, snap.info.hwnd) if self._pins else None
             if pin is not None and pin.last_checked_at:
                 # 이번 세션에서 분석된 창은 위의 AI 감시 위젯이 같은 내용을
                 # 더 자세히 보여 준다. DB 스냅샷은 재시작 직후처럼 아직
@@ -460,6 +460,7 @@ def _card_key(
             bool(pin.analyzing),
             pin.reason,
             pin.recommended_action,
+            pin.summary,
             pin.last_checked_at,
         )
     meta_key = None if meta is None else (meta.status, meta.last_event, meta.last_checked_at)
@@ -586,6 +587,14 @@ def _make_pin_status_widget(pin: PinnedTarget) -> QWidget:
     head_wrap.setStyleSheet("background: transparent;")
     head_wrap.setLayout(head)
     lay.addWidget(head_wrap)
+
+    if pin.summary and not pin.analyzing:
+        summary = QLabel(pin.summary[:200])
+        summary.setWordWrap(True)
+        summary.setStyleSheet(
+            "color: #cbd5e1; font-size: 10px; background: transparent; border: none;"
+        )
+        lay.addWidget(summary)
 
     if pin.reason and not pin.analyzing:
         reason = QLabel(pin.reason[:200])
