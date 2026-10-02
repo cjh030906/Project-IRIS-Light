@@ -44,6 +44,7 @@ class SkillStep:
     shot: str = ""  # 녹화 화면 (세션 폴더 기준)
     target: str = ""  # 누른 요소 설명 — 실행 때 화면에서 이걸 찾는다. {param} 가능
     visible_text: str = ""
+    win_rect: list[int] = field(default_factory=list)  # 녹화 때 누른 창 (left, top, right, bottom)
     # type
     text: str = ""  # {param} 가능
     clear_first: bool = False
@@ -119,7 +120,23 @@ def placeholders(template: str) -> list[str]:
 
 
 def apply_params(skill: Skill, params: list[SkillParam]) -> None:
-    """녹화 때 쓴 값(example)이 들어간 자리를 {name} 으로 바꾼다."""
+    """녹화 때 쓴 값(example)이 들어간 자리를 {name} 으로 바꾼다.
+
+    이미 다른 이름으로 바꿔 둔 자리({text} → {message})도 새 이름으로 옮긴다."""
+    old_names = {p.example: p.name for p in skill.params}
+    for p in params:
+        prev = old_names.get(p.example)
+        if prev and prev != p.name:
+            for s in skill.steps:
+                for attr in ("text", "target", "visible_text"):
+                    setattr(s, attr, getattr(s, attr).replace("{" + prev + "}", "{" + p.name + "}"))
+    kept = {p.example for p in params}
+    for example, name in old_names.items():
+        if example not in kept:
+            # 칸에서 뺀 값은 녹화 때 글자 그대로 되돌린다
+            for s in skill.steps:
+                for attr in ("text", "target", "visible_text"):
+                    setattr(s, attr, getattr(s, attr).replace("{" + name + "}", example))
     skill.params = params
     for p in sorted(params, key=lambda p: -len(p.example)):
         ex = (p.example or "").strip()
@@ -221,6 +238,7 @@ def build_steps(events: Iterable[LearningEvent]) -> list[SkillStep]:
                     button=button,
                     double=et == "double_click",
                     shot=str(e.metadata.get("shot") or ""),
+                    win_rect=_rect_of(e),
                     timestamp=e.timestamp,
                 )
             )
@@ -264,6 +282,15 @@ def build_steps(events: Iterable[LearningEvent]) -> list[SkillStep]:
 
     _ = fg_process
     return _trim(_drop_repeat_clicks(steps), start_process)
+
+
+def _rect_of(e: LearningEvent) -> list[int]:
+    rect = (e.metadata.get("under") or {}).get("rect") or []
+    try:
+        r = [int(v) for v in rect]
+    except (TypeError, ValueError):
+        return []
+    return r if len(r) == 4 and r[2] > r[0] and r[3] > r[1] else []
 
 
 def _collapse_typing(steps: list[SkillStep], process: str) -> None:
@@ -319,7 +346,8 @@ def _trim(steps: list[SkillStep], start_process: str) -> list[SkillStep]:
     # 끝난 뒤 둘러보는 스크롤
     while steps and steps[-1].kind == "scroll":
         steps.pop()
-    # 처음 창에서 시작한 activate 가 맨 앞에 남는 것은 의미가 없다
-    while steps and steps[0].kind == "activate_app" and steps[0].process == start_process:
-        steps.pop(0)
+    # 학습 버튼을 누르러 IRIS(처음 창)에 있던 동안의 스크롤·클릭도 업무가 아니다
+    if start_process and any(s.process != start_process for s in steps):
+        while steps and steps[0].process == start_process:
+            steps.pop(0)
     return steps

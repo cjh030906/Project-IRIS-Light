@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from iris.infrastructure.local_vision import VISION_NUM_CTX
+from iris.infrastructure.local_vision import vision_chat
 from iris.learning.models import LearningEvent, SemanticTrace, SessionManifest, TraceStep
 from iris.learning.skill import Skill, SkillParam, SkillStep, apply_params, build_steps
 
@@ -88,7 +88,7 @@ def click_image(shot_path: Path, x: float, y: float) -> bytes | None:
     top = int(min(max(0, y - half), max(0, h - _CROP)))
     crop = img.crop((left, top, min(w, left + _CROP), min(h, top + _CROP))).copy()
     _draw_pointer(crop, x - left, y - top)
-    # 800px 그대로 보내면 num_ctx 8192 에서 가끔 '@@@@' 만 돌아온다. 560px 은 매번 1초대로 안정적
+    # 800px 그대로 보내는 것보다 560px 이 빠르고 답이 더 안정적이었다 (카톡 녹화로 비교)
     scale = _SEND_SIDE / float(max(crop.size))
     if scale < 1.0:
         crop = crop.resize((int(crop.width * scale), int(crop.height * scale)))
@@ -133,13 +133,14 @@ class LocalSkillLearner:
     def __init__(
         self,
         ollama_base_url: str,
-        model: str,
+        model: str | Callable[[], str | None],
         *,
         on_progress: Callable[[str], None] | None = None,
         timeout_sec: float = 180.0,
     ) -> None:
         self._base_url = ollama_base_url
         self._model = model
+        self._model_name = ""
         self._on_progress = on_progress
         self._timeout = timeout_sec
 
@@ -177,10 +178,16 @@ class LocalSkillLearner:
         manifest.status = "ready" if skill.steps else "failed"
         return trace
 
+    def _resolve_model(self) -> str:
+        """녹화를 시작할 땐 모델이 없다가 그 사이에 받아질 수 있어 학습 시점에 고른다."""
+        m = self._model() if callable(self._model) else self._model
+        return (m or "").strip()
+
     def build_skill(
         self, session_dir: Path, manifest: SessionManifest, events: list[LearningEvent]
     ) -> Skill:
         steps = build_steps(events)
+        model = self._resolve_model()
         skill = Skill(
             skill_id=f"skill_{manifest.session_id[:12]}",
             steps=steps,
@@ -188,6 +195,16 @@ class LocalSkillLearner:
             screen_height=manifest.screen_height,
             session_dir=str(session_dir),
         )
+        if not model:
+            # 화면을 보는 모델이 없으면 클릭 설명 없이 — 실행은 녹화 그림 맞추기로 한다
+            self._progress("업무 학습: 화면 분석 모델이 없어 클릭 설명 없이 저장해요")
+            apps = [s.process.removesuffix(".exe") for s in steps if s.kind == "activate_app"]
+            skill.name = f"{apps[0] if apps else '화면'} 업무"
+            typed = [s.text for s in steps if s.kind == "type" and s.text.strip()]
+            if len(typed) == 1:
+                apply_params(skill, [SkillParam(name="text", label="입력할 내용", example=typed[0])])
+            return skill
+        self._model_name = model
         client = self._client()
         clicks = [s for s in steps if s.kind == "click"]
         for n, s in enumerate(clicks, 1):
@@ -202,12 +219,12 @@ class LocalSkillLearner:
         if img is None:
             return
         try:
-            text = client.chat_once_with_images(
-                self._model,
+            text = vision_chat(
+                client,
+                self._model_name,
                 _DESCRIBE_PROMPT.format(app=step.process or "?"),
                 [img],
                 timeout_sec=self._timeout,
-                num_ctx=VISION_NUM_CTX,
             )
         except Exception as e:
             log.warning("click describe failed: %s", e)
@@ -217,13 +234,13 @@ class LocalSkillLearner:
     def _summarize(self, client, skill: Skill) -> None:
         typed = [s.text for s in skill.steps if s.kind == "type" and s.text.strip()]
         try:
-            text = client.chat_once_with_images(
-                self._model,
+            text = vision_chat(
+                client,
+                self._model_name,
                 _SUMMARY_PROMPT.format(steps=describe_steps_text(skill.steps)),
                 [],
                 system="Answer with JSON only.",
                 timeout_sec=self._timeout,
-                num_ctx=VISION_NUM_CTX,
             )
             obj = _extract_json(text) or {}
         except Exception as e:

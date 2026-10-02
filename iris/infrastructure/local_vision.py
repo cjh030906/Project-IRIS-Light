@@ -21,7 +21,7 @@ from iris.infrastructure.ollama_client import OllamaClient, _native_base
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
 DEFAULT_VISION_MODEL_SIZE_GB = 3.2
 # 화면 분석 호출의 컨텍스트 — 기본값이면 6GB GPU 에서 CPU 로 밀려 수십 배 느려진다
-VISION_NUM_CTX = 8192
+VISION_NUM_CTX = 4096
 
 _CACHE_TTL_SEC = 120.0
 _cache_lock = threading.Lock()
@@ -135,3 +135,46 @@ def pull_model(
         return str(e)[:200]
     forget_cache()
     return None
+
+
+_KEEP_ALIVE = "30m"  # 다시 올리는 데 80~100초 걸린다 (이 PC 실측) — 한 번 올리면 붙잡아 둔다
+
+
+def is_garbage(text: str) -> bool:
+    """qwen2.5vl 이 Ollama 에서 가끔 '@@@@…'만 돌려준다 (컨텍스트·메모리 상태 따라)."""
+    t = (text or "").strip()
+    return len(t) >= 6 and t.count("@") / len(t) > 0.5
+
+
+def unload(base_url: str, model: str) -> None:
+    try:
+        body = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+        req = Request(f"{_native_base(base_url)}/api/generate", data=body, method="POST",
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=30) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
+def vision_chat(
+    client: OllamaClient,
+    model: str,
+    prompt: str,
+    images_png: list[bytes],
+    *,
+    system: str = "",
+    timeout_sec: float = 180.0,
+) -> str:
+    """화면 분석 호출은 모두 여기로 — 같은 num_ctx(다르면 모델을 다시 올린다)와
+    keep_alive 를 쓰고, '@@@@' 가 오면 모델을 내렸다 올려 한 번 더 묻는다."""
+    for attempt in range(2):
+        text = client.chat_once_with_images(
+            model, prompt, images_png, system=system, timeout_sec=timeout_sec,
+            num_ctx=VISION_NUM_CTX, keep_alive=_KEEP_ALIVE,
+        )
+        if not is_garbage(text):
+            return text
+        if attempt == 0:
+            unload(client.base_url, model)
+    return ""

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from iris.infrastructure.local_vision import vision_chat
 from iris.learning.models import WorkflowRun
 from iris.learning.skill import Skill, SkillStep, fill, placeholders
 from iris.learning.workflow_registry import LearnedWorkflowRepository
@@ -128,7 +129,7 @@ def parse_bbox(text: str) -> Optional[tuple[float, float, float, float]]:
     return x1, y1, x2, y2
 
 
-def find_by_vision(client, model: str, screen, target: str, num_ctx: int) -> Optional[Located]:
+def find_by_vision(client, model: str, screen, target: str) -> Optional[Located]:
     """화면을 보는 모델에 위치를 묻는다 (qwen2.5vl 은 그림 픽셀 좌표로 답한다)."""
     import cv2
 
@@ -143,7 +144,7 @@ def find_by_vision(client, model: str, screen, target: str, num_ctx: int) -> Opt
         'Return JSON only: {"bbox_2d": [x1, y1, x2, y2]} in pixel coordinates of this image.'
     )
     try:
-        text = client.chat_once_with_images(model, prompt, [buf.tobytes()], timeout_sec=120, num_ctx=num_ctx)
+        text = vision_chat(client, model, prompt, [buf.tobytes()], timeout_sec=180)
     except Exception as e:
         log.warning("vision locate failed: %s", e)
         return None
@@ -163,7 +164,7 @@ def text_matches(expected: str, seen: str) -> bool:
     return bool(a) and bool(b) and (a in b or b in a)
 
 
-def verify_spot(client, model: str, screen, x: float, y: float, expected_text: str, num_ctx: int) -> bool:
+def verify_spot(client, model: str, screen, x: float, y: float, expected_text: str) -> bool:
     """찾은 자리를 다시 잘라 보고 적힌 글자가 기대한 글자인지 확인한다.
 
     위치 찾기만 믿으면 '최지호'를 찾으라는데 목록의 '박지원'을 누른다 (실제 사례)."""
@@ -184,9 +185,7 @@ def verify_spot(client, model: str, screen, x: float, y: float, expected_text: s
     buf = io.BytesIO()
     crop.save(buf, "PNG")
     try:
-        text = client.chat_once_with_images(
-            model, _DESCRIBE_PROMPT.format(app="?"), [buf.getvalue()], timeout_sec=120, num_ctx=num_ctx
-        )
+        text = vision_chat(client, model, _DESCRIBE_PROMPT.format(app="?"), [buf.getvalue()], timeout_sec=180)
     except Exception:
         return False
     target, visible = parse_description(text)
@@ -316,6 +315,39 @@ def process_at(x: float, y: float) -> str:
         return psutil.Process(int(pid.value)).name()
     except Exception:
         return ""
+
+
+def window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    r = wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r.left, r.top, r.right, r.bottom
+
+
+def find_by_window_offset(step: SkillStep) -> Optional[Located]:
+    """녹화 때 그 창 안에서 누른 자리를 지금 그 창에서 다시 계산한다.
+
+    입력창은 글자가 들어 있으면 녹화 때 그림(안내 문구)과 달라 그림 맞추기가 실패한다.
+    창 모양이 같은 앱이라면 창 안 위치는 그대로다."""
+    if len(step.win_rect) != 4 or not step.title:
+        return None
+    wins = [h for h, t in _process_windows(step.process) if t == step.title]
+    if not wins:
+        return None
+    l0, t0, r0, b0 = step.win_rect
+    l1, t1, r1, b1 = window_rect(wins[0])
+    w0, h0, w1, h1 = r0 - l0, b0 - t0, r1 - l1, b1 - t1
+    if w0 <= 0 or h0 <= 0 or w1 <= 0 or h1 <= 0:
+        return None
+    # 크기가 바뀌었으면 비율로 — 입력창·버튼은 보통 창 아래·오른쪽에 붙어 있어 가장자리 기준이 더 맞는다
+    fx, fy = (step.x - l0) / w0, (step.y - t0) / h0
+    x = l1 + (step.x - l0) if fx < 0.5 else r1 - (r0 - step.x)
+    y = t1 + (step.y - t0) if fy < 0.5 else b1 - (b0 - step.y)
+    if not (l1 <= x < r1 and t1 <= y < b1):
+        return None
+    return Located(float(x), float(y), "window_offset")
 
 
 def focus_window(hwnd: int) -> None:
@@ -510,6 +542,17 @@ class LocalSkillExecutor:
                 self._active = None
             self._progress(f"업무 실행 {'완료' if run.status == 'succeeded' else '중단'}: {run.message}")
 
+    def _save_failure_shot(self, session: Path, run: WorkflowRun, step_no: int) -> None:
+        """막힌 순간의 화면 — 왜 못 찾았는지 나중에 볼 수 있게 세션 폴더에 남긴다."""
+        try:
+            import cv2
+
+            out = session / "runs" / f"{run.run_id[:8]}_step{step_no}.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out), grab_screen(), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        except Exception:
+            log.exception("failure screenshot")
+
     def _vision(self):
         from iris.infrastructure.ollama_client import OllamaClient
 
@@ -517,10 +560,18 @@ class LocalSkillExecutor:
         model = self._model_provider() if self._model_provider else None
         return client, model
 
-    def _locate(self, step: SkillStep, params: dict[str, str], session: Path, wd: _Watchdog, mouse) -> Optional[Located]:
+    def _locate(
+        self,
+        step: SkillStep,
+        params: dict[str, str],
+        session: Path,
+        wd: _Watchdog,
+        mouse,
+        *,
+        before_typing: bool = False,
+    ) -> Optional[Located]:
         import cv2
 
-        from iris.infrastructure.local_vision import VISION_NUM_CTX
 
         dynamic = bool(placeholders(step.target) or placeholders(step.visible_text))
         shot = None
@@ -542,6 +593,11 @@ class LocalSkillExecutor:
                 spot = find_by_template(screen, shot, step.x, step.y)
                 if spot is not None:
                     return spot
+        if before_typing:
+            # 글자를 넣기 직전의 클릭은 입력창이다 — 창 안 같은 자리
+            spot = find_by_window_offset(step)
+            if spot is not None and process_at(spot.x, spot.y).lower() == step.process.lower():
+                return spot
         if not step.target:
             return None
         client, model = self._vision()
@@ -551,7 +607,7 @@ class LocalSkillExecutor:
         expected = fill(step.visible_text, params)
         if expected and expected not in target:
             target = f"{target} ('{expected}')"
-        spot = find_by_vision(client, model, screen, target, VISION_NUM_CTX)
+        spot = find_by_vision(client, model, screen, target)
         if spot is None:
             return None
         # 3B 모델은 없는 요소도 그럴듯한 좌표로 답한다 — 그 앱의 창 안이고, 그 자리에
@@ -559,7 +615,7 @@ class LocalSkillExecutor:
         if step.process and process_at(spot.x, spot.y).lower() != step.process.lower():
             log.warning("vision spot outside %s — ignored", step.process)
             return None
-        if not verify_spot(client, model, screen, spot.x, spot.y, expected, VISION_NUM_CTX):
+        if not verify_spot(client, model, screen, spot.x, spot.y, expected):
             log.warning("vision spot text mismatch for %r — ignored", expected)
             return None
         return spot
@@ -567,7 +623,6 @@ class LocalSkillExecutor:
     def _run_steps(self, skill: Skill, params: dict[str, str], wd: _Watchdog, run: WorkflowRun) -> None:
         from pynput.mouse import Button, Controller
 
-        from iris.infrastructure.local_vision import VISION_NUM_CTX
 
         mouse = Controller()
         session = Path(skill.session_dir)
@@ -581,8 +636,13 @@ class LocalSkillExecutor:
                 ensure_app(step)
             elif step.kind == "click":
                 wait_for_window(step.process, step.title)
-                spot = self._locate(step, params, session, wd, mouse)
+                nxt = skill.steps[i] if i < total else None
+                spot = self._locate(
+                    step, params, session, wd, mouse,
+                    before_typing=nxt is not None and nxt.kind == "type" and nxt.process == step.process,
+                )
                 if spot is None:
+                    self._save_failure_shot(session, run, i)
                     raise RuntimeError(f"{i}단계: '{fill(label, params)}'을(를) 화면에서 찾지 못했어요")
                 log.info("step %d click via %s (%.2f) at %.0f,%.0f", i, spot.how, spot.score, spot.x, spot.y)
                 mouse.position = (int(spot.x), int(spot.y))

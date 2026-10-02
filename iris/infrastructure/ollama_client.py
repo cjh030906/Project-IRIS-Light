@@ -520,6 +520,7 @@ class OllamaClient:
         system: str = "",
         timeout_sec: float = 90.0,
         num_ctx: int | None = None,
+        keep_alive: str | None = None,
     ) -> str:
         """멀티모달 단발 호출 — 스트림 없이 최종 content만 반환.
 
@@ -551,6 +552,8 @@ class OllamaClient:
         }
         if num_ctx:
             payload["options"] = {"num_ctx": int(num_ctx), "temperature": 0}
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
         req = Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),

@@ -65,7 +65,14 @@ def _window_under(x: float, y: float) -> dict[str, str]:
         n = user32.GetWindowTextLengthW(root)
         title = ctypes.create_unicode_buffer(n + 1)
         user32.GetWindowTextW(root, title, n + 1)
-        return {"class": cls.value or "", "title": title.value or ""}
+        rect = wintypes.RECT()
+        user32.GetWindowRect(root, ctypes.byref(rect))
+        return {
+            "class": cls.value or "",
+            "title": title.value or "",
+            # 창 안에서 어디를 눌렀는지 — 입력창처럼 그림이 바뀌는 곳을 다시 누를 때 쓴다
+            "rect": [rect.left, rect.top, rect.right, rect.bottom],
+        }
     except Exception:
         return {}
 
@@ -496,6 +503,7 @@ class DemonstrationRecorder:
         focus = buf.focus_hwnd or focused_control(fg)
         sensitive = _is_password_control() or looks_like_credential_window(title, proc)
         control_text = None if sensitive else read_control_text(focus)
+        raw_keys, hangul_mode = "".join(buf.keys), buf.hangul
         typed = buf.resolve(control_text, control_class(focus))
         buf.reset()
         if typed is None:
@@ -514,6 +522,9 @@ class DemonstrationRecorder:
                     "field_text": "" if sensitive else typed.field_text,
                     "ended_by": reason,
                     "sensitive": sensitive,
+                    # 글자 복원이 틀렸을 때 원인을 보려고 — 비밀번호 창이면 남기지 않는다
+                    "raw_keys": "" if sensitive else raw_keys,
+                    "ime_hangul": hangul_mode,
                 },
             )
         )

@@ -120,9 +120,8 @@ class TypingBuffer:
             for cand, src in ((hangul, "hangul"), (latin, "latin")):
                 if cand.strip() and cand.strip() in read:
                     return TypedText(cand.strip(), raw, src, focus_class, read)
-            if raw:
-                # 자동완성·IME 모드 오판 — 입력창에 실제로 있는 글자가 정답이다
-                return TypedText(read, raw, "control", focus_class, read)
+            # 친 글자가 입력창 글자에 없다 — 카톡 입력창은 비어 있을 때 안내 문구 "메시지 입력"을
+            # 글자로 돌려준다 (실제 사례). 이때는 키로 조합한 글자를 믿는다.
         if not guess.strip():
             return None
         return TypedText(guess.strip(), raw, "hangul" if self.hangul else "latin", focus_class)

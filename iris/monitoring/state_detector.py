@@ -12,7 +12,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Optional
 
-from iris.infrastructure.local_vision import VISION_NUM_CTX
+from iris.infrastructure.local_vision import vision_chat
 from iris.monitoring.models import DetectionResult, StatusCategory
 
 if TYPE_CHECKING:
@@ -119,13 +119,13 @@ def detect_window_state(
             recommended_action="",
         )
     try:
-        text = client.chat_once_with_images(
+        text = vision_chat(
+            client,
             model,
             _PROMPT.format(title=title or "(제목 없음)"),
             [png_bytes],
             system=_SYSTEM,
             timeout_sec=timeout_sec,
-            num_ctx=VISION_NUM_CTX,
         )
     except Exception as e:  # 네트워크·모델 오류는 UNKNOWN으로 흡수
         return DetectionResult(
