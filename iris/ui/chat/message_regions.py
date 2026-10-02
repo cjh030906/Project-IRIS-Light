@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from PyQt6.QtGui import QTextDocument
 
-from iris.ui.shared.theme_tokens import TOKENS
+from iris.ui.chat.typography import TOKENS
 
 MSG_ANCHOR_PREFIX = "iris-msg-"
 TTS_SCHEME = "iris-tts://"
@@ -62,7 +62,7 @@ def speaker_prefix_html(who: str, msg_id: str = "") -> str:
     name = html.escape(who or "")
     you = (who or "").strip().lower() == "you"
     color = TOKENS.chat_user_name if you else TOKENS.chat_iris_name
-    label = f'<b style="color:{color};font-size:12px;font-weight:600;">{name}</b>'
+    label = f'<b style="color:{color};font-family:{TOKENS.chat_ui_font};font-size:{TOKENS.font_size_micro};font-weight:600;">{name}</b>'
     key = (msg_id or "").strip()
     if not key:
         if you:

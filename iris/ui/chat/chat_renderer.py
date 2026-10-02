@@ -14,7 +14,7 @@ from iris.ui.chat.chat_blocks import (
     parse_file_chip_location,
     wrap_document_html,
 )
-from iris.ui.shared.theme_tokens import TOKENS
+from iris.ui.chat.typography import TOKENS, manager
 
 _MARKDOWN_EXTENSIONS = ("nl2br", "fenced_code", "tables", "sane_lists")
 
@@ -407,6 +407,7 @@ def _style_table_cell(match: re.Match[str]) -> str:
             f"color:{t.text_primary};padding:8px 12px;border:none;"
             f"border-bottom:1px solid {t.chat_table_row_border};text-align:left;"
         )
+    style += f"font-family:{t.chat_ui_font};font-size:{t.chat_font_size};"
     return f"<{tag}{_merge_cell_style(attrs, style)}>"
 
 
@@ -424,7 +425,7 @@ def _style_tables(html_body: str) -> str:
 
 def _style_chat_html(html_body: str) -> str:
     t = TOKENS
-    body = f"color:{t.chat_body};line-height:{t.chat_line_height};font-size:{t.chat_font_size};"
+    body = f"color:{t.chat_body};line-height:{t.chat_line_height};font-size:{t.chat_font_size};font-family:{t.chat_ui_font};"
     shell = (
         f"background-color:{t.chat_block_bg};"
         f"border:1px solid {t.chat_block_border};"
@@ -455,8 +456,10 @@ def _style_chat_html(html_body: str) -> str:
     )
     out = _style_tables(out)
     out = re.sub(r"<h([1-6])>", lambda m: (
-        f'<h{m[1]} style="color:{t.text_primary};font-size:{(24,21,18,16,15,15)[int(m[1])-1]}px;'
-        'font-weight:600;margin-top:20px;margin-bottom:10px;">'), out)
+        f'<h{m[1]} style="color:{t.text_primary};font-family:{t.chat_ui_font};font-size:{manager.get().chat_font_size + (4,3,2,2,1,1)[int(m[1])-1]}px;'
+        'font-weight:600;margin-top:20px;margin-bottom:10px;">'
+        f'<span style="font-size:{manager.get().chat_font_size + (4,3,2,2,1,1)[int(m[1])-1]}px;">'), out)
+    out = re.sub(r"</h([1-6])>", r"</span></h\1>", out)
     out = re.sub(r"<(ul|ol)>", r'<\1 style="margin-top:4px;margin-bottom:16px;margin-left:20px;">', out)
     out = out.replace("<li>", f'<li style="margin-bottom:8px;{body}">')
     out = out.replace("<blockquote>",

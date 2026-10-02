@@ -386,6 +386,8 @@ class OllamaClient:
             "stream": True,
             "think": think,
         }
+        from iris.runtime.attachment_context import trace_payload
+        trace_payload("ollama", payload)
         req = Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),

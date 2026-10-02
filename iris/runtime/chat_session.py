@@ -26,12 +26,14 @@ class ChatSession:
         self.db = db
         self.conversation_id = ensure_active_conversation(db)
         self.history: list[dict[str, str]] = history_dicts(db, self.conversation_id)
+        from .attachment_store import AttachmentStore
+        self.attachments = AttachmentStore()
 
-    def record(self, role: str, content: str) -> str | None:
+    def record(self, role: str, content: str, *, model_content: str = "") -> str | None:
         """메모리에 먼저 넣고 DB에 쓴다. DB 실패 시 메모리는 유지하고 오류 문자열을 돌려준다."""
-        self.history.append({"role": role, "content": content})
+        self.history.append({"role": role, "content": content, **({"model_content": model_content} if model_content else {})})
         try:
-            append_message(self.db, self.conversation_id, role, content)
+            append_message(self.db, self.conversation_id, role, content, model_content=model_content)
         except Exception as exc:  # noqa: BLE001
             return str(exc)
         return None
@@ -48,15 +50,22 @@ class ChatSession:
         return list_conversations(self.db, include_empty_id=self.conversation_id)
 
     def activate(self, conversation_id: int) -> None:
+        if int(conversation_id) != self.conversation_id:
+            from .attachment_store import AttachmentStore
+            self.attachments = AttachmentStore()
         self.conversation_id = int(conversation_id)
         set_active_conversation_id(self.db, self.conversation_id)
         self.history = history_dicts(self.db, self.conversation_id)
 
     def clear_messages(self) -> None:
+        from .attachment_store import AttachmentStore
+        self.attachments = AttachmentStore()
         clear_conversation_messages(self.db, self.conversation_id)
         self.history = []
 
     def start_new(self) -> int:
+        from .attachment_store import AttachmentStore
+        self.attachments = AttachmentStore()
         return start_new_conversation(self.db)
 
     def open_launch_chat(self) -> int:

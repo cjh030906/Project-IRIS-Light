@@ -195,6 +195,7 @@ class ComposerPlusMenu(QFrame):
 
     add_photos = pyqtSignal()
     add_files = pyqtSignal()
+    add_folder = pyqtSignal()
     skill_chosen = pyqtSignal(str)
     mcp_chosen = pyqtSignal(str)
     open_skills_panel = pyqtSignal()
@@ -249,6 +250,10 @@ class ComposerPlusMenu(QFrame):
         files.clicked.connect(self._on_files)
         root.addWidget(files)
 
+        folder = _MenuRow("DIR", "Add Folder", "폴더 첨부")
+        folder.clicked.connect(self._on_folder)
+        root.addWidget(folder)
+
         sep1 = QFrame()
         sep1.setObjectName("ComposerPlusSep")
         sep1.setFixedHeight(1)
@@ -288,6 +293,10 @@ class ComposerPlusMenu(QFrame):
     def _on_files(self) -> None:
         self.add_files.emit()
         self.hide()
+
+    def _on_folder(self) -> None:
+        self.hide()
+        self.add_folder.emit()
 
     def _on_open_skills(self) -> None:
         self.hide()
