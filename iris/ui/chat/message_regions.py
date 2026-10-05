@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 from PyQt6.QtGui import QTextDocument
 
+from iris.ui.chat.typography import TOKENS
+
 MSG_ANCHOR_PREFIX = "iris-msg-"
 TTS_SCHEME = "iris-tts://"
 
@@ -58,11 +60,16 @@ def speaker_prefix_html(who: str, msg_id: str = "") -> str:
     href가 아니라 name 앵커라서 링크 색·밑줄·anchorAt 동작에 영향이 없다.
     """
     name = html.escape(who or "")
+    you = (who or "").strip().lower() == "you"
+    color = TOKENS.chat_user_name if you else TOKENS.chat_iris_name
+    label = f'<b style="color:{color};font-family:{TOKENS.chat_ui_font};font-size:{TOKENS.font_size_micro};font-weight:600;">{name}</b>'
     key = (msg_id or "").strip()
     if not key:
-        return f"<b>{name}</b>: "
+        if you:
+            return f'{label}: <span style="font-weight:400;"> </span>'
+        return f'<p style="margin-top:8px;margin-bottom:8px;">{label}: <br></p>'
     anchor = html.escape(message_anchor_name(key), quote=True)
-    return f'<a name="{anchor}"><b>{name}</b></a>: '
+    return f'<p style="margin-top:8px;margin-bottom:8px;"><a name="{anchor}">{label}</a>: <br></p>'
 
 
 def scan_message_regions(document: QTextDocument) -> list[MessageRegion]:
@@ -149,8 +156,10 @@ if __name__ == "__main__":
 
     assert parse_message_anchor_name(message_anchor_name("m3")) == "m3"
     assert parse_message_anchor_name("iris-tts://m3") is None
-    assert "<b>You</b>: " == speaker_prefix_html("You")
-    assert 'name="iris-msg-m3"' in speaker_prefix_html("Iris", "m3")
+    you_prefix = speaker_prefix_html("You")
+    assert "You</b>: " in you_prefix and TOKENS.chat_user_name in you_prefix
+    iris_prefix = speaker_prefix_html("Iris", "m3")
+    assert 'name="iris-msg-m3"' in iris_prefix and TOKENS.chat_iris_name in iris_prefix
 
     app = QApplication.instance() or QApplication(sys.argv)
     edit = QTextEdit()

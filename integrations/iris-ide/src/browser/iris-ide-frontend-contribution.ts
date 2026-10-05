@@ -13,6 +13,7 @@ import { FileStat } from '@theia/filesystem/lib/common/files';
 import { WorkspaceOpenHandlerContribution, WorkspaceService } from '@theia/workspace/lib/browser';
 
 import { EditorManager } from '@theia/editor/lib/browser';
+import { ProblemManager } from '@theia/markers/lib/browser/problem/problem-manager';
 
 import { NAVIGATOR_CONTEXT_MENU } from '@theia/navigator/lib/browser/navigator-contribution';
 
@@ -20,6 +21,7 @@ import { IrisIdeEditorStateService } from './iris-ide-editor-state';
 import { resolveBridgeIdentity, resolveControlIdentity } from './iris-ide-bridge-identity';
 
 import { IRIS_IDE_PRODUCT_NAME, IrisIdeEditorInfo } from '../common/iris-ide-protocol';
+import { readProblems } from './iris-ide-bridge-ops';
 
 export namespace IrisIdeMarketplaceCommands {
     export const OPEN: Command = {
@@ -55,6 +57,8 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
 
     @inject(EditorManager) protected readonly editorManager: EditorManager;
 
+    @inject(ProblemManager) protected readonly problemManager: ProblemManager;
+
     @inject(IrisIdeEditorStateService) protected readonly state: IrisIdeEditorStateService;
 
     @inject(ThemeService) protected readonly themeService: ThemeService;
@@ -78,6 +82,8 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
     protected controlToken = '';
 
     protected lastPush = '';
+
+    protected lastDiagnosticsPush = '';
 
     protected lastWorkspacePush = '';
 
@@ -176,8 +182,9 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
         }, true);
         // capture: Lumino TabBar preventDefault보다 먼저 — HTML5 copy 드래그 허용
         document.addEventListener('pointerdown', (ev: PointerEvent) => this.onTabPointerDown(ev), true);
+        document.addEventListener('pointermove', (ev: PointerEvent) => this.onTabPointerMove(ev), true);
         document.addEventListener('dragstart', (ev: DragEvent) => this.onTabHtml5DragStart(ev), true);
-        document.addEventListener('pointerup', () => { this.tabDrag = null; }, true);
+        document.addEventListener('pointerup', (ev: PointerEvent) => this.onTabPointerUp(ev), true);
         document.addEventListener('pointercancel', () => { this.tabDrag = null; }, true);
     }
 
@@ -332,11 +339,37 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
             this.tabDrag = null;
             return;
         }
-        // Lumino _evtPointerDown의 preventDefault가 HTML5 드래그를 죽인다.
-        // capture에서 전파를 끊어 브라우저 기본 drag를 살리고, draggable로 copy 커서를 연다.
-        ev.stopPropagation();
-        tab.setAttribute('draggable', 'true');
+        // 클릭은 Lumino에 넘긴다. 움직인 뒤에만 채팅 드래그다.
         this.tabDrag = { uri, x: ev.clientX, y: ev.clientY, armed: false, tab };
+    }
+
+    protected onTabPointerMove(ev: PointerEvent): void {
+        const drag = this.tabDrag;
+        if (!drag || drag.armed) {
+            return;
+        }
+        const dx = ev.clientX - drag.x;
+        const dy = ev.clientY - drag.y;
+        if ((dx * dx) + (dy * dy) < 36) {
+            return;
+        }
+        drag.armed = true;
+        drag.tab.setAttribute('draggable', 'true');
+        void this.beginCompanionDrag([drag.uri]);
+    }
+
+    protected onTabPointerUp(_ev: PointerEvent): void {
+        const drag = this.tabDrag;
+        this.tabDrag = null;
+        if (!drag) {
+            return;
+        }
+        if (drag.armed) {
+            drag.tab.removeAttribute('draggable');
+            void this.finishCompanionDrag();
+            return;
+        }
+        void this.editorManager.open(drag.uri, { mode: 'activate' });
     }
 
     protected onTabHtml5DragStart(ev: DragEvent): void {
@@ -394,16 +427,6 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
         if (tab) {
             tab.removeAttribute('draggable');
         }
-        this.tabDrag = null;
-    }
-
-    /** @deprecated pointer-move 제스처 제거 — HTML5 dragstart 경로 사용. */
-    protected onTabPointerMove(_ev: PointerEvent): void {
-        /* no-op */
-    }
-
-    /** @deprecated */
-    protected onTabPointerUp(): void {
         this.tabDrag = null;
     }
 
@@ -530,23 +553,20 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
         }
     }
 
-    protected syncEditor(): void {
-        const editor = this.editorManager.currentEditor;
-        if (!editor) {
-            this.state.clear();
-            this.pushBridge(null);
-            return;
+    protected infoFromWidget(widget: { editor?: { uri: URI; document?: { languageId?: string }; cursor?: { line: number; character: number }; selection?: { start: { line: number; character: number }; end: { line: number; character: number } } | null } } | undefined): IrisIdeEditorInfo | null {
+        const editor = widget?.editor;
+        if (!editor?.uri) {
+            return null;
         }
-        const uri = editor.editor.uri.toString();
-        const rel = editor.editor.uri.path.toString();
-        const sel = editor.editor.selection;
-        const pos = editor.editor.cursor;
-        const info: IrisIdeEditorInfo = {
-            uri,
+        const rel = editor.uri.path.toString();
+        const sel = editor.selection;
+        const pos = editor.cursor;
+        return {
+            uri: editor.uri.toString(),
             path: rel.replace(/^\/([A-Za-z]:)/, '$1').replace(/^\//, ''),
-            languageId: editor.editor.document.languageId || 'plaintext',
-            line: pos.line + 1,
-            column: pos.character + 1,
+            languageId: editor.document?.languageId || 'plaintext',
+            line: (pos?.line ?? 0) + 1,
+            column: (pos?.character ?? 0) + 1,
             selection: sel
                 ? {
                     start: { line: sel.start.line + 1, column: sel.start.character + 1 },
@@ -554,8 +574,39 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
                 }
                 : null,
         };
-        this.state.update(info);
-        this.pushBridge(info);
+    }
+
+    protected editorInfos(): IrisIdeEditorInfo[] {
+        const bag = this.editorManager as unknown as { all?: Array<{ editor?: { uri: URI } }> };
+        const widgets = Array.isArray(bag.all) ? bag.all : [];
+        const infos: IrisIdeEditorInfo[] = [];
+        for (const widget of widgets) {
+            const info = this.infoFromWidget(widget);
+            if (info) {
+                infos.push(info);
+            }
+        }
+        if (!infos.length) {
+            const current = this.infoFromWidget(this.editorManager.currentEditor);
+            if (current) {
+                infos.push(current);
+            }
+        }
+        return infos;
+    }
+
+    protected syncEditor(): void {
+        const infos = this.editorInfos();
+        const current = this.infoFromWidget(this.editorManager.currentEditor) || infos[0] || null;
+        if (!current) {
+            this.state.clear();
+            this.pushBridge(null, []);
+            this.pushDiagnostics();
+            return;
+        }
+        this.state.update(current);
+        this.pushBridge(current, infos.length ? infos : [current]);
+        this.pushDiagnostics();
     }
 
     /** 미해결 상태면 매 tick 재시도 — sessionStorage 조회뿐이라 비용이 없다. */
@@ -599,11 +650,36 @@ export class IrisIdeFrontendContribution implements FrontendApplicationContribut
         }).catch(() => undefined);
     }
 
-    protected pushBridge(info: IrisIdeEditorInfo | null): void {
+    protected pushDiagnostics(): void {
         if (!this.resolveBridge()) {
             return;
         }
-        const payload = JSON.stringify(info || {});
+        let items: Record<string, unknown>[];
+        try {
+            items = readProblems(this.problemManager);
+        } catch {
+            return;
+        }
+        const payload = JSON.stringify({ diagnostics: items });
+        if (payload === this.lastDiagnosticsPush) {
+            return;
+        }
+        this.lastDiagnosticsPush = payload;
+        fetch(`http://127.0.0.1:${this.bridgePort}/setDiagnostics`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${this.bridgeToken}`,
+            },
+            body: payload,
+        }).catch(() => undefined);
+    }
+
+    protected pushBridge(info: IrisIdeEditorInfo | null, editors: IrisIdeEditorInfo[] = []): void {
+        if (!this.resolveBridge()) {
+            return;
+        }
+        const payload = JSON.stringify({ ...(info || {}), editors });
         if (payload === this.lastPush) {
             return;
         }

@@ -32,7 +32,20 @@ _OFF_UI_ACTIONS = frozenset(
         "project.run",
         "note.export_pdf",
         "extension.install_github",
+        "ide.marketplace_search",
+        "ide.marketplace_install",
+        "ide.diagnostics",
+        "ide.symbols",
+        "ide.references",
+        "ide.definition",
+        "ide.edit",
+        "ide.save",
+        "ide.task",
+        "ide.debug",
+        "ide.plugin_status",
         "project.write_image_code",
+        # 요약·문단 번역 모델 호출. Qt 메인에서 돌리면 창이 멈춘다.
+        "wiki.reprocess_note",
     }
 )
 
@@ -401,7 +414,12 @@ class ControlSurface:
 
                     # ponytail: live file stream 은 메인스레드에서 길어질 수 있음
                     timeout = 15.0
-                    if action == "project.write_file":
+                    if action == "ide.marketplace_install":
+                        # VSIX 받기 + 켜진 Theia 재기동(health 대기 최대 120초)
+                        timeout = 180.0
+                    elif action in ("ide.debug", "ide.task", "ide.edit", "ide.save"):
+                        timeout = 45.0
+                    elif action == "project.write_file":
                         # open+live stream 기본 — 작성 연출 대기
                         if bool(args.get("open", True)) and bool(
                             args.get("typewriter", args.get("stream", True))

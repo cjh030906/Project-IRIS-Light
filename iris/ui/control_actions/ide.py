@@ -7,6 +7,35 @@ from iris.system.control_surface import (
 )
 from iris.ui.control_actions.hosts import IdeHost
 
+def _reload_ide_if_running(window: IdeHost, workspace: str) -> str:
+    """켜진 Theia만 재기동한다. 플러그인 스캔은 프로세스 시작 때 한 번이다."""
+    from iris.system.iris_ide_runtime import shared_iris_ide_runtime
+
+    mgr = shared_iris_ide_runtime()
+    if mgr.runtime_pid is None:
+        return "not_running"
+    try:
+        mgr.stop()
+        ok, detail = mgr.start(workspace)
+    except Exception as exc:  # noqa: BLE001
+        return f"error:{exc}"
+    if not ok:
+        return f"error:{detail}"
+
+    def _load() -> None:
+        load = getattr(window, "_load_theia_after_launch", None)
+        if callable(load):
+            load(mgr.base_url(), workspace)
+
+    try:
+        from iris.ui.control_bindings import _call_on_ui
+
+        _call_on_ui(window, _load)
+    except Exception as exc:  # noqa: BLE001
+        return f"error:{exc}"
+    return "reloaded"
+
+
 def register_ide_actions(window: IdeHost, reg: ActionRegistry) -> None:
     from iris.ui.control_bindings import (
         Path,
@@ -125,7 +154,8 @@ def register_ide_actions(window: IdeHost, reg: ActionRegistry) -> None:
             start = str(load_user_profile(window._db).project_root or "")
         except Exception:
             start = ""
-        path = QFileDialog.getExistingDirectory(window, "Open Folder", start)
+        # frameless MainWindow의 modal 자식이면 닫힌 뒤 0xC0000409.
+        path = QFileDialog.getExistingDirectory(None, "Open Folder", start)
         if not path:
             return ok_result("ide.pick_open_folder", {"cancelled": True})
         return ide_open_folder({"path": path, "new_window": False})
@@ -138,7 +168,7 @@ def register_ide_actions(window: IdeHost, reg: ActionRegistry) -> None:
             start = str(load_user_profile(window._db).project_root or "")
         except Exception:
             start = ""
-        paths, _ok = QFileDialog.getOpenFileNames(window, "Open File", start)
+        paths, _ok = QFileDialog.getOpenFileNames(None, "Open File", start)
         if not paths:
             return ok_result("ide.pick_open_file", {"cancelled": True, "opened": []})
         opened: list[str] = []
@@ -173,6 +203,14 @@ def register_ide_actions(window: IdeHost, reg: ActionRegistry) -> None:
                 err or "companion not entered",
                 {"ui_mode": window._ui_mode, "path": str(root.resolve())},
             )
+        try:
+            from iris.knowledge.ide_project_log import note_opened
+
+            wiki = getattr(window, "_iris_wiki", None)
+            if wiki is not None:
+                note_opened(wiki, str(root.resolve()))
+        except Exception:
+            pass
         return ok_result(
             "ide.open_folder",
             {
@@ -294,4 +332,274 @@ def register_ide_actions(window: IdeHost, reg: ActionRegistry) -> None:
         "chat.drag_end",
         chat_drag_end,
         summary="Finish IDE→chat companion drag — attach if cursor is over Iris",
+    )
+
+    def _ide_project() -> tuple[str, str]:
+        from iris.system.extension_scope import choose_extension_scope
+
+        mode = str(getattr(window, "_ui_mode", "") or "")
+        root = ""
+        try:
+            root = str(window._current_project_root() or "")
+        except Exception:
+            root = ""
+        session = getattr(window, "_ide_session", None)
+        bound = str(getattr(session, "workspace_root", "") or "").strip() if session is not None else ""
+        if bound:
+            root = bound
+        scope, err = choose_extension_scope(mode, root, "project")
+        if err or scope != "project":
+            return "", err or "열린 프로젝트가 없습니다."
+        return root, ""
+
+    def ide_marketplace_search(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.system.project_marketplace import search_extensions
+
+        root, err = _ide_project()
+        if err:
+            return err_result("ide.marketplace_search", err)
+        query = str(args.get("query") or args.get("q") or "").strip()
+        try:
+            rows = search_extensions(query)
+        except Exception as exc:  # noqa: BLE001
+            return err_result("ide.marketplace_search", str(exc)[:300])
+        return ok_result("ide.marketplace_search", {"project_root": root, "extensions": rows})
+
+    def ide_marketplace_install(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.system.iris_ide_runtime import iris_ide_config_dir
+        from iris.system.project_marketplace import install_extension
+
+        root, err = _ide_project()
+        if err:
+            return err_result("ide.marketplace_install", err)
+        ext_id = str(args.get("id") or args.get("extension_id") or "").strip()
+        deploy = iris_ide_config_dir() / "deployedPlugins"
+        try:
+            installed = install_extension(root, ext_id, str(deploy))
+        except Exception as exc:  # noqa: BLE001
+            return err_result("ide.marketplace_install", str(exc)[:300])
+        reload = _reload_ide_if_running(window, root)
+        installed["reload"] = reload
+        if reload.startswith("error:"):
+            return err_result("ide.marketplace_install", reload[6:], installed)
+        plugin: dict[str, Any] = {"id": installed.get("id"), "loaded": False, "reason": reload}
+        if reload == "reloaded":
+            try:
+                client = window._iris_ide_bridge_client()
+                plugin = client.plugin_loaded(str(installed.get("id") or ""))
+            except Exception as exc:  # noqa: BLE001
+                plugin = {
+                    "id": installed.get("id"),
+                    "loaded": False,
+                    "reason": str(exc)[:200],
+                }
+        installed["plugin"] = plugin
+        return ok_result("ide.marketplace_install", installed)
+
+    def ide_project_log(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.ide_project_log import note_update
+
+        root, err = _ide_project()
+        if err:
+            return err_result("ide.project_log", err)
+        wiki = getattr(window, "_iris_wiki", None)
+        if wiki is None:
+            return err_result("ide.project_log", "wiki unavailable")
+        plan = str(args.get("plan") or "")
+        decision = str(args.get("decision") or "")
+        issue = str(args.get("issue") or "")
+        progress = str(args.get("progress") or "")
+        if not any(part.strip() for part in (plan, decision, issue, progress)):
+            return err_result("ide.project_log", "plan, decision, issue, or progress required")
+        try:
+            rel = note_update(
+                wiki,
+                root,
+                plan=plan,
+                decision=decision,
+                issue=issue,
+                progress=progress,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return err_result("ide.project_log", str(exc)[:300])
+        return ok_result("ide.project_log", {"rel_path": rel, "project_root": root})
+
+    reg.register(
+        "ide.marketplace_search",
+        ide_marketplace_search,
+        summary="Search Open VSX for the project open in IRIS IDE. Required: query. Does not install. Do not claim installed.",
+        risk="low",
+    )
+    reg.register(
+        "ide.marketplace_install",
+        ide_marketplace_install,
+        summary="Download an Open VSX VSIX into IRIS IDE deployedPlugins and pin it on the open project. Required: id as publisher.name. ok only when extension/package.json is on disk. reload=reloaded means the IDE process is restarting. reload=not_running means the next IDE start loads it. plugin.loaded true is the only signal the plugin host has the extension. Do not say a PDF tab or extension viewer is already open.",
+        risk="medium",
+    )
+    def _iris_client() -> tuple[Any, str]:
+        session, err = _bound_session(window, require_workspace=False)
+        if err:
+            return None, err
+        if str(getattr(session, "ide_id", "") or "") != "iris_ide":
+            return None, "IRIS IDE session required"
+        try:
+            return window._iris_ide_bridge_client(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    def _bridge(action: str, call: Any) -> dict[str, Any]:
+        client, err = _iris_client()
+        if err or client is None:
+            return err_result(action, err or "IRIS IDE bridge unavailable")
+        try:
+            return ok_result(action, call(client))
+        except Exception as exc:  # noqa: BLE001
+            return err_result(action, str(exc)[:400])
+
+    def ide_diagnostics(_args: dict[str, Any]) -> dict[str, Any]:
+        return _bridge("ide.diagnostics", lambda client: client.get_diagnostics())
+
+    def ide_symbols(args: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(args.get("symbol") or args.get("query") or "")
+        path = str(args.get("path") or "")
+        return _bridge("ide.symbols", lambda client: client.goto_symbol(symbol, path=path))
+
+    def ide_references(args: dict[str, Any]) -> dict[str, Any]:
+        return _bridge(
+            "ide.references",
+            lambda client: client.find_references(
+                str(args.get("path") or ""),
+                line=int(args.get("line") or 0),
+                column=int(args.get("column") or 0),
+            ),
+        )
+
+    def ide_definition(args: dict[str, Any]) -> dict[str, Any]:
+        return _bridge(
+            "ide.definition",
+            lambda client: client.goto_definition(
+                str(args.get("path") or ""),
+                line=int(args.get("line") or 0),
+                column=int(args.get("column") or 0),
+            ),
+        )
+
+    def ide_edit(args: dict[str, Any]) -> dict[str, Any]:
+        op = str(args.get("op") or "insert").strip()
+        text = args.get("text")
+        if text is None:
+            text = args.get("content")
+        if text is None:
+            return err_result("ide.edit", "text required")
+        path = str(args.get("path") or "")
+
+        def _edit(client: Any) -> dict[str, Any]:
+            if op in ("replace_selection", "selection"):
+                return client.replace_selection(str(text), path=path)
+            if op in ("replace_range", "range"):
+                end = args.get("end")
+                return client.replace_range(
+                    str(text),
+                    path=path,
+                    start=int(args.get("start") or 0),
+                    end=None if end is None else int(end),
+                )
+            if op in ("apply", "document"):
+                return client.apply_text_edit(str(text), path=path)
+            if op not in ("insert", "insert_text"):
+                raise ValueError(f"unknown edit op: {op}")
+            return client.insert_text(str(text), path=path)
+
+        return _bridge("ide.edit", _edit)
+
+    def ide_save(args: dict[str, Any]) -> dict[str, Any]:
+        if bool(args.get("all")):
+            return _bridge("ide.save", lambda client: client.save_all())
+        return _bridge("ide.save", lambda client: client.save_file(str(args.get("path") or "")))
+
+    def ide_task(args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or args.get("label") or "").strip()
+        if not name:
+            return err_result("ide.task", "name required")
+        return _bridge("ide.task", lambda client: client.run_task(name))
+
+    def ide_debug(args: dict[str, Any]) -> dict[str, Any]:
+        op = str(args.get("op") or "start").strip()
+
+        def _debug(client: Any) -> dict[str, Any]:
+            if op == "stop":
+                return client.stop_debug()
+            if op == "continue":
+                return client.continue_debug()
+            if op != "start":
+                raise ValueError(f"unknown debug op: {op}")
+            return client.start_debug({"name": str(args.get("name") or args.get("configuration") or "")})
+
+        return _bridge("ide.debug", _debug)
+
+    def ide_plugin_status(args: dict[str, Any]) -> dict[str, Any]:
+        ext_id = str(args.get("id") or args.get("extension_id") or "").strip()
+        if not ext_id:
+            return err_result("ide.plugin_status", "id required")
+        return _bridge("ide.plugin_status", lambda client: client.plugin_loaded(ext_id))
+
+    reg.register(
+        "ide.diagnostics",
+        ide_diagnostics,
+        summary="Problems in the open IRIS IDE. reported false means the editor has not pushed markers yet — do not say the project is clean. An empty diagnostics list is clean only when reported is true.",
+        risk="low",
+    )
+    reg.register(
+        "ide.symbols",
+        ide_symbols,
+        summary="Document symbols from the open IRIS IDE editor. Optional symbol filter and path. items come from the language service. Do not invent symbols when ok is false.",
+        risk="low",
+    )
+    reg.register(
+        "ide.references",
+        ide_references,
+        summary="References at the cursor or at path+line+column in the open IRIS IDE editor. items come from the language service.",
+        risk="low",
+    )
+    reg.register(
+        "ide.definition",
+        ide_definition,
+        summary="Definition at the cursor or at path+line+column in the open IRIS IDE editor.",
+        risk="low",
+    )
+    reg.register(
+        "ide.edit",
+        ide_edit,
+        summary="Edit the open IRIS IDE buffer. op=insert|replace_selection|replace_range|apply, text required, optional path. via=editor changes the buffer. via=disk with applied=append is not a selection replace. Do not claim the buffer changed unless via=editor.",
+        risk="medium",
+    )
+    reg.register(
+        "ide.save",
+        ide_save,
+        summary="Save the open IRIS IDE editor. Optional path, or all=true. via=editor flushes the buffer. via=disk means no open editor and the file was already on disk.",
+        risk="medium",
+    )
+    reg.register(
+        "ide.task",
+        ide_task,
+        summary="Run a tasks.json task in IRIS IDE by name. started true only after TaskService accepts it.",
+        risk="medium",
+    )
+    reg.register(
+        "ide.debug",
+        ide_debug,
+        summary="IRIS IDE debug. op=start needs name (launch configuration). op=stop or continue. No session is not success.",
+        risk="medium",
+    )
+    reg.register(
+        "ide.plugin_status",
+        ide_plugin_status,
+        summary="Ask the IRIS IDE plugin host whether extension id is loaded. loaded false does not mean the viewer is open.",
+        risk="low",
+    )
+    reg.register(
+        "ide.project_log",
+        ide_project_log,
+        summary="Update the Iris wiki note for the project open in IRIS IDE. Optional plan, decision, issue, progress. Secrets are not stored.",
+        risk="low",
     )

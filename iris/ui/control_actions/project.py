@@ -26,11 +26,26 @@ def project_write_file(window: ProjectHost, args: dict[str, Any]) -> dict[str, A
         profile = load_user_profile(window._db)
         root = (profile.project_root or "").strip()
     rel = str(args.get("rel_path") or args.get("path") or "").strip()
+    if Path(rel).suffix.lower() == ".pdf":
+        return err_result(
+            "project.write_file",
+            "PDF는 note.export_pdf 로만 만든다. 문자열로 .pdf 를 쓰지 않는다.",
+        )
     content = args.get("content")
     if content is None:
         return err_result("project.write_file", "content required")
     if not root or not rel:
         return err_result("project.write_file", "project_root and rel_path required")
+
+    def _logged(payload: dict) -> dict:
+        try:
+            from iris.knowledge.ide_project_log import note_file_written
+
+            note_file_written(window, root, rel)
+        except Exception:
+            pass
+        return ok_result("project.write_file", payload)
+
     do_open = bool(args.get("open", True))
     session, session_err = _bound_session(window, require_workspace=do_open)
     if do_open and session_err:
@@ -54,7 +69,7 @@ def project_write_file(window: ProjectHost, args: dict[str, Any]) -> dict[str, A
                 written = write_project_file(root, rel, text)
                 written["opened"] = False
                 _log(window, "project.write_file", True)
-                return ok_result("project.write_file", written)
+                return _logged(written)
             abs_path.parent.mkdir(parents=True, exist_ok=True)
             end = max(len(text) + 1, 999999)
             if abs_path.is_file():
@@ -74,7 +89,7 @@ def project_write_file(window: ProjectHost, args: dict[str, Any]) -> dict[str, A
                 "via": "iris_ide_bridge",
             }
             _log(window, "project.write_file", True)
-            return ok_result("project.write_file", written)
+            return _logged(written)
         except Exception as exc:  # noqa: BLE001
             return err_result("project.write_file", str(exc))
     # open=true 이면 기본 live file stream. 명시 stream/typewriter=false 만 즉시 쓰기.
@@ -104,7 +119,7 @@ def project_write_file(window: ProjectHost, args: dict[str, Any]) -> dict[str, A
             written["typed"] = False
             written["visible"] = False
             _log(window, "project.write_file", True)
-            return ok_result("project.write_file", written)
+            return _logged(written)
 
         # 1) 빈 파일로 만들고 탭 열기
         abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +220,7 @@ def project_write_file(window: ProjectHost, args: dict[str, Any]) -> dict[str, A
     except Exception as exc:  # noqa: BLE001
         return err_result("project.write_file", str(exc))
     _log(window, "project.write_file", True)
-    return ok_result("project.write_file", written)
+    return _logged(written)
 
 def project_run(window: ProjectHost, args: dict[str, Any]) -> dict[str, Any]:
     from iris.ui.control_bindings import Path, _append_activity, _bound_session, _bridge_call_pumping, _log, _qt_pump, err_result, load_user_profile, ok_result

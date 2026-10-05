@@ -282,6 +282,7 @@ class IrisIdeRuntimeManager:
             "lib/browser/iris-ide-frontend-contribution.js",
             "lib/browser/iris-ide-frontend-module.js",
             "lib/browser/iris-ide-bridge-poller.js",
+            "lib/browser/iris-ide-bridge-ops.js",
             "lib/node/iris-ide-backend-contribution.js",
             "lib/node/iris-ide-backend-module.js",
             "lib/node/iris-ide-bridge-server.js",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, QRect
 
 from iris.system.ide_tiler import compute_tile_rects, tiles_are_flush
@@ -9,7 +11,31 @@ from iris.ui.window.frameless_chrome import FramelessShell
 from iris.ui.workspaces.iris_ide_window import IRIS_IDE_TITLE, IrisIdeWindow
 
 
+def _check_folder_open_avoids_frameless_modal() -> None:
+    """폴더 대화상자는 parent=None. 슬롯은 set_embedded 전에 HWND를 만들지 않는다."""
+    root = Path(__file__).resolve().parents[2]
+    hero = (root / "iris/ui/ide/iris_ide_hero_overlay.py").read_text(encoding="utf-8")
+    welcome = (root / "iris/ui/ide/iris_ide_welcome_layer.py").read_text(encoding="utf-8")
+    ide = (root / "iris/ui/control_actions/ide.py").read_text(encoding="utf-8")
+    main_src = (root / "iris/ui/window/main_window.py").read_text(encoding="utf-8")
+    for label, src in (("hero", hero), ("welcome", welcome)):
+        assert "getExistingDirectory(self" not in src, label
+        assert "getExistingDirectory(None" in src, label
+    assert "getExistingDirectory(window" not in ide
+    assert "getOpenFileNames(window" not in ide
+    assert "getExistingDirectory(None" in ide
+    start = main_src.index("def _open_iris_ide_folder")
+    body = main_src[start : main_src.index("\n    def _activate_companion_tile")]
+    assert "apply_frameless_chrome()" not in body
+    assert "show_window=False" in body
+    assert "show_ide_not_installed_dialog(None" in body
+    hide_at = body.index("win.hide()")
+    assert body.index("show_window=False") > hide_at
+    assert body.index("IDE already launching") < hide_at
+
+
 def main() -> None:
+    _check_folder_open_avoids_frameless_modal()
     from PyQt6.QtWidgets import QApplication
     import sys
 
@@ -34,8 +60,8 @@ def main() -> None:
     assert body is not None
     assert body.geometry().x() == shell._margin and body.geometry().y() == shell._margin
     assert not body.geometry().intersects(shell._grips[4].geometry())
-    assert w._caption.isVisible()
-    assert w.maximize_button_global_rect().width() == 34
+    assert not hasattr(w, "_caption")
+    assert w.maximize_button_global_rect().isNull()
     w.show_loading()
     assert w.is_opening()
     assert not w.is_theia_loaded()

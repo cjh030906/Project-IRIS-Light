@@ -26,7 +26,22 @@ _CONTINUE = (
     "시작하겠",
 )
 _ASK = ("어느 쪽", "어떤 파일", "어느 파일", "삭제할까")
-_DONE = ("저장했", "저장 완료", "가져왔", "모두 저장", "전부 저장")
+_DONE = (
+    "저장했",
+    "저장 완료",
+    "가져왔",
+    "모두 저장",
+    "전부 저장",
+    "정리했",
+    "덮어",
+    "번역해 두",
+    "번역했",
+    "열었",
+    "열어 드",
+    "옮겼",
+    "이동 완료",
+    "분류했",
+)
 _OR_CHOICE = re.compile(r"\S{1,20}\s또는\s\S{1,20}")
 _BATCH_SAVED = re.compile(r"\d+\s*건\s*저장")
 
@@ -47,6 +62,9 @@ def decide_followthrough(
     followups: int,
     *,
     cap: int = CAP,
+    moved: bool = False,
+    moved_folder: bool = False,
+    list_truncated: bool = False,
 ) -> str:
     """continue | stop | ask. 채팅 실패 경로에서는 호출하지 않는다."""
     if followups >= cap:
@@ -58,6 +76,11 @@ def decide_followthrough(
         return "ask"
     goal_s = goal or ""
     if any(word in goal_s for word in _GOAL_BULK) and _promises_more(text):
+        return "continue"
+    if _relocate_goal(goal_s) and _claims_done(text) and not moved:
+        return "continue"
+    # ponytail: 잘린 목록 뒤의 파일 단위 이동은 전체가 아니다. 폴더 이동이 끝나면 멈춘다.
+    if _relocate_goal(goal_s) and list_truncated and _claims_done(text) and not moved_folder:
         return "continue"
     if tool_ok_count == 0 and _wiki_save_goal(goal_s) and _claims_done(text):
         return "continue"
@@ -81,10 +104,15 @@ def _last_sentence(text: str) -> str:
 
 
 def _wiki_save_goal(goal: str) -> bool:
-    folded = goal.lower()
-    wiki = "위키" in goal or "wiki" in folded or "가져오" in goal
-    save = "저장" in goal or "가져오" in goal
-    return wiki and save
+    from iris.knowledge.wiki_claim import wiki_work_goal
+
+    return wiki_work_goal(goal)
+
+
+def _relocate_goal(goal: str) -> bool:
+    from iris.knowledge.wiki_claim import relocate_goal
+
+    return relocate_goal(goal)
 
 
 def _claims_done(text: str) -> bool:
@@ -103,6 +131,40 @@ def _check() -> None:
         decide_followthrough(goal, "1강을 저장했습니다. 계속할까요?", 2, 8) == "stop"
     )
     assert decide_followthrough("위키에 저장", "저장했습니다.", 0, 0) == "continue"
+    assert (
+        decide_followthrough(
+            "원문은 남기고 위에 정리하고 문단은 한국어로",
+            "정리했습니다.",
+            0,
+            0,
+        )
+        == "continue"
+    )
+    assert (
+        decide_followthrough("정리된 위키를 열어", "열어 드리겠습니다.", 0, 0) == "continue"
+    )
+    assert decide_followthrough("오늘 날씨 알려줘", "정리했습니다.", 0, 0) == "stop"
+    arrange = "학습자료 폴더를 만들고 강화학습으로 분류해서 저장"
+    assert decide_followthrough(arrange, "분류했습니다.", 2, 0, moved=False) == "continue"
+    assert decide_followthrough(arrange, "옮겼습니다.", 1, 0, moved=True) == "stop"
+    assert (
+        decide_followthrough(arrange, "분류했습니다.", 1, 0, moved=True, list_truncated=True)
+        == "continue"
+    )
+    assert (
+        decide_followthrough(
+            arrange,
+            "옮겼습니다.",
+            1,
+            0,
+            moved=True,
+            moved_folder=True,
+            list_truncated=True,
+        )
+        == "stop"
+    )
+    assert counts_as_tool_ok("wiki.reprocess_note ok")
+    assert not counts_as_tool_ok("wiki.reprocess_note completed")
     assert counts_as_tool_ok("wiki.write_user_note ok")
     assert counts_as_tool_ok("Iris control: wiki.write_user_note ok")
     assert not counts_as_tool_ok("completed")

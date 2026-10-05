@@ -1,0 +1,18 @@
+---
+description: 해결·구현이 끝난 코드리뷰 보고서와 구현 프롬프트는 completed 폴더로 옮긴다
+alwaysApply: true
+---
+
+# 끝난 보고서·프롬프트는 completed로
+
+조사 보고서와 구현 프롬프트는 작업 중에만 폴더 밖에 둔다. 그 문제가 코드에서 해결됐거나, 프롬프트대로 구현하고 확인까지 끝나면 **그 파일만** 옮긴다.
+
+| 있던 곳 | 옮길 곳 |
+|---|---|
+| `docs/code-review/*.md` | `docs/code-review/completed/` |
+| `docs/prompts/*.md` | `docs/prompts/completed/` |
+
+- 보고서와 짝인 구현 프롬프트가 있으면 둘 다 옮긴다. 프롬프트가 `docs/code-review/`에 있어도 그 폴더의 `completed/`로 간다.
+- 이번 세션에서 끝낸 것, 또는 사용자가 끝났다고 한 것만 옮긴다. 다른 문서를 한꺼번에 정리하지 않는다.
+- 아직 고치는 중이거나, `.cursor/rules`가 살아있는 기준으로 가리키는 문서는 그대로 둔다.
+- 이미 git에 있는 파일은 `git mv`로 옮긴다.

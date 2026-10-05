@@ -299,12 +299,13 @@ class IrisIdeHeroOverlay(QWidget):
         self.folder_opened.emit(path)
 
     def _pick_open(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Open folder")
+        # frameless 메인의 modal 자식이면 닫힌 뒤 processEvents에서 0xC0000409.
+        path = QFileDialog.getExistingDirectory(None, "Open folder")
         if path:
             self._emit_folder(path)
 
     def _pick_create(self) -> None:
-        parent = QFileDialog.getExistingDirectory(self, "Create folder — 상위 디렉터리 선택")
+        parent = QFileDialog.getExistingDirectory(None, "Create folder — 상위 디렉터리 선택")
         if not parent:
             return
         new_dir = next_iris_project_dir(Path(parent))

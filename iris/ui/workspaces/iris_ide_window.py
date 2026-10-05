@@ -7,13 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import quote
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent
+from PyQt6.QtCore import QRect, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from PyQt6.QtWidgets import (
-    QHBoxLayout,
     QLabel,
     QMainWindow,
-    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -60,76 +58,7 @@ def _iris_ide_window_stylesheet() -> str:
         font-size: 14px;
         font-family: {t.font_family};
     }}
-    QWidget#IrisIdeCaption {{
-        background: {t.void_black};
-        border: none;
-    }}
-    QPushButton#IrisIdeWinCtrl {{
-        background: transparent;
-        color: {t.text_primary};
-        border: 1px solid {t.border_subtle};
-        border-radius: 3px;
-        font-size: 14px;
-        padding: 0;
-    }}
-    QPushButton#IrisIdeWinCtrl:hover {{
-        background: {t.accent_primary};
-        border-color: {t.accent_border};
-    }}
     """
-
-
-def _ide_win_button(text: str, tip: str) -> QPushButton:
-    btn = QPushButton(text)
-    btn.setObjectName("IrisIdeWinCtrl")
-    btn.setToolTip(tip)
-    btn.setFixedSize(34, 26)
-    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    return btn
-
-
-class _IdeCaption(QWidget):
-    """IDE 창 상단 — 최소화·최대화·닫기. 웹뷰 밖에 둬야 스냅 히트테스트가 닿는다."""
-
-    def __init__(self, host: "IrisIdeWindow") -> None:
-        super().__init__(host)
-        self._host = host
-        self.setObjectName("IrisIdeCaption")
-        self.setFixedHeight(32)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 3, 8, 3)
-        lay.setSpacing(4)
-        lay.addStretch(1)
-        self._btn_min = _ide_win_button("−", "창 내리기")
-        self._btn_max = _ide_win_button("□", "전체 화면")
-        self._btn_close = _ide_win_button("×", "닫기")
-        for btn in (self._btn_min, self._btn_max, self._btn_close):
-            lay.addWidget(btn)
-        self._btn_min.clicked.connect(host.showMinimized)
-        self._btn_max.clicked.connect(host._toggle_maximize)
-        self._btn_close.clicked.connect(host.close_requested.emit)
-
-    def maximize_button_global_rect(self) -> QRect:
-        btn = self._btn_max
-        if not btn.isVisible():
-            return QRect()
-        return QRect(btn.mapToGlobal(QPoint(0, 0)), btn.size())
-
-    def set_maximized(self, maximized: bool) -> None:
-        if maximized:
-            self._btn_max.setText("❐")
-            self._btn_max.setToolTip("창 복원")
-        else:
-            self._btn_max.setText("□")
-            self._btn_max.setToolTip("전체 화면")
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and not self._host.isMaximized():
-            handle = self._host.windowHandle()
-            if handle is not None and handle.startSystemMove():
-                event.accept()
-                return
-        super().mousePressEvent(event)
 
 
 class IrisIdeWindow(QMainWindow):
@@ -152,12 +81,10 @@ class IrisIdeWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._frameless_chrome_applied = False
         self._stack = QStackedWidget()
-        self._caption = _IdeCaption(self)
         body = QWidget()
         body_lay = QVBoxLayout(body)
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(0)
-        body_lay.addWidget(self._caption)
         body_lay.addWidget(self._stack, 1)
         shell = FramelessShell(self, inset_content=True)
         shell.set_center_widget(body)
@@ -206,11 +133,15 @@ class IrisIdeWindow(QMainWindow):
             self.setMinimumSize(0, 0)
             # setParent(host, flags) — 플래그+부모 원자적 (setWindowFlags만 쓰면 부모 유실)
             self.setParent(host, flags)
+            self._frameless_shell.set_inset_content(False)
+            self._frameless_shell.set_grips_visible(False)
         else:
             was = self._embedded
             self._embedded = False
             self.setParent(None, flags)
             self.setMinimumSize(640, 480)
+            self._frameless_shell.set_inset_content(True)
+            self._frameless_shell.set_grips_visible(True)
             if was:
                 self._frameless_chrome_applied = False
 
@@ -224,7 +155,7 @@ class IrisIdeWindow(QMainWindow):
         self._frameless_chrome_applied = True
 
     def maximize_button_global_rect(self) -> QRect:
-        return self._caption.maximize_button_global_rect()
+        return QRect()
 
     def _toggle_maximize(self) -> None:
         now = time.monotonic()
@@ -241,11 +172,6 @@ class IrisIdeWindow(QMainWindow):
         if reply is not None:
             return reply
         return False, 0
-
-    def changeEvent(self, event) -> None:  # noqa: N802
-        super().changeEvent(event)
-        if event.type() == QEvent.Type.WindowStateChange:
-            self._caption.set_maximized(self.isMaximized())
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)

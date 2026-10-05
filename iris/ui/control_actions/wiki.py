@@ -11,6 +11,19 @@ from iris.system.control_surface import (
 from iris.ui.control_actions.hosts import WikiHost
 
 _PAGE_CAP = 80
+_LIST_CAP = 40
+
+
+def page_note_rows(notes: list, cap: int = _LIST_CAP) -> dict[str, Any]:
+    """한 페이지와 전체 개수. 잘리면 truncated 가 참이다."""
+    total = len(notes)
+    page = list(notes[:cap])
+    return {
+        "notes": page,
+        "count": len(page),
+        "total": total,
+        "truncated": total > len(page),
+    }
 
 
 def _page_limit(raw: object) -> int:
@@ -46,6 +59,16 @@ def _dedupe_sources(items: list[str]) -> list[str]:
         seen.add(key)
         out.append(key)
     return out
+
+
+def _move_sources(args: dict[str, Any]) -> list[str]:
+    raw = args.get("sources")
+    if raw is None:
+        raw = args.get("from") or args.get("from_folder") or args.get("rel_path") or args.get("path")
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw or "").strip()
+    return [text] if text else []
 
 
 def _page_sources(args: dict[str, Any]) -> list[str]:
@@ -136,7 +159,10 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
             {"rel_path": n.rel_path, "title": n.title, "folder": n.folder, "source": n.source}
             for n in window._iris_wiki.list_notes()
         ]
-        return ok_result("wiki.list_notes", {"notes": notes, "count": len(notes)})
+        page = page_note_rows(notes)
+        window._wiki_list_truncated = bool(page["truncated"])
+        window._wiki_list_total = int(page["total"])
+        return ok_result("wiki.list_notes", page)
 
     def wiki_open(args: dict[str, Any]) -> dict[str, Any]:
         rel = str(args.get("rel_path") or args.get("path") or "").strip()
@@ -355,6 +381,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
         return ok_result("wiki.import_pages", data)
 
     def wiki_search(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.code_note_prompt import search_code_notes
         from iris.knowledge.wiki_filing import open_classifier
         from iris.knowledge.wiki_note_index import search_notes, sync_knowledge_notes
 
@@ -380,6 +407,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
         try:
             sync_knowledge_notes(window._db, window._iris_wiki)
             hits = search_notes(window._db, query, embedder=embedder, limit=limit)
+            code_hits = search_code_notes(window._iris_wiki._docs.root, query, limit=limit)
         except OSError as exc:
             return err_result("wiki.search", str(exc))
         _log(window, "wiki.search", True)
@@ -397,11 +425,184 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
                     }
                     for hit in hits
                 ],
+                "code_hits": [
+                    {
+                        "rel_path": f"docs/{hit.rel_path}",
+                        "title": hit.title,
+                        "excerpt": hit.excerpt,
+                        "score": hit.score,
+                        "source": "code-note",
+                    }
+                    for hit in code_hits
+                ],
                 "count": len(hits),
             },
         )
 
-    reg.register("wiki.list_notes", wiki_list, summary="List Iris Wiki note paths")
+    def wiki_read(args: dict[str, Any]) -> dict[str, Any]:
+        rel = str(args.get("rel_path") or args.get("path") or "").strip()
+        if not rel:
+            return err_result("wiki.read_note", "rel_path required")
+        try:
+            text = window._iris_wiki.read_note(rel)
+        except (OSError, ValueError) as exc:
+            return err_result("wiki.read_note", str(exc))
+        capped = text[:20_000]
+        _log(window, "wiki.read_note", True)
+        return ok_result(
+            "wiki.read_note",
+            {
+                "rel_path": rel,
+                "text": capped,
+                "chars": len(text),
+                "truncated": len(text) > len(capped),
+            },
+        )
+
+    def wiki_delete(args: dict[str, Any]) -> dict[str, Any]:
+        rel = str(args.get("rel_path") or args.get("path") or "").strip()
+        if not rel:
+            return err_result("wiki.delete_note", "rel_path required")
+        if not rel.replace("\\", "/").startswith("user/"):
+            return err_result("wiki.delete_note", "user notes only")
+        try:
+            path = window._iris_wiki.delete_user_note(rel)
+        except (OSError, ValueError) as exc:
+            return err_result("wiki.delete_note", str(exc))
+        window._on_obsidian_icon()
+        window._obsidian_page.reload_graph()
+        window._left_sidebar.obsidian_detail.reload()
+        _log(window, "wiki.delete_note", True)
+        return ok_result("wiki.delete_note", {"rel_path": rel, "path": str(path)})
+
+    def wiki_move(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.wiki_move import move_user_bytes
+
+        sources = _move_sources(args)
+        dest = str(args.get("dest_folder") or args.get("folder") or "").strip()
+        if not sources:
+            return err_result("wiki.move_notes", "sources required")
+        if not dest:
+            return err_result("wiki.move_notes", "dest_folder required")
+        try:
+            moved = move_user_bytes(window._iris_wiki, sources, dest)
+        except (OSError, ValueError) as exc:
+            return err_result("wiki.move_notes", str(exc))
+        complete = int(moved.get("count") or 0) > 0 and not moved.get("left")
+        window._wiki_turn_moved = complete
+        window._wiki_turn_moved_folder = complete and bool(moved.get("folders"))
+        if complete:
+            window._wiki_turn_wrote = True
+            window._wiki_turn_changed = True
+        db = getattr(window, "_db", None)
+        if db is not None:
+            try:
+                from iris.knowledge.wiki_note_index import sync_knowledge_notes
+
+                sync_knowledge_notes(db, window._iris_wiki)
+            except Exception as exc:  # noqa: BLE001 — 디스크 이동은 유지한다
+                moved["index_error"] = str(exc)
+        window._on_obsidian_icon()
+        window._obsidian_page.reload_graph()
+        window._left_sidebar.obsidian_detail.reload()
+        if not complete:
+            left = ", ".join(str(item) for item in (moved.get("left") or []))
+            return err_result("wiki.move_notes", f"sources still present: {left}")
+        _log(window, "wiki.move_notes", True)
+        return ok_result("wiki.move_notes", moved)
+
+    def wiki_reprocess(args: dict[str, Any]) -> dict[str, Any]:
+        from iris.knowledge.wiki_command import WikiCommand
+        from iris.knowledge.wiki_ops import execute_wiki_command
+        from iris.knowledge.wiki_summarize import summarize_for_wiki, translate_for_wiki
+        from iris.ui.control_bindings import _call_on_ui
+
+        rel = str(args.get("rel_path") or args.get("path") or "").strip()
+        if not rel:
+            return err_result("wiki.reprocess_note", "rel_path required")
+        model = str(args.get("model") or window._settings.ollama_model or "").strip()
+        if not model:
+            return err_result("wiki.reprocess_note", "model required")
+        base = (window._settings.ollama_base_url or "http://127.0.0.1:11434/v1").strip()
+        summarize = _truthy(args.get("summarize", True))
+        translate = _truthy(args.get("translate", True))
+
+        def _sum(text: str) -> str:
+            return summarize_for_wiki(text, model=model, ollama_base_url=base)
+
+        def _tr(text: str) -> str:
+            return translate_for_wiki(text, model=model, ollama_base_url=base)
+
+        from iris.knowledge.wiki_filing import filing_kwargs
+        from iris.storage.failover_prefs import load_history_settings
+
+        try:
+            filing = filing_kwargs(
+                db=window._db,
+                base_url=base,
+                history_settings=load_history_settings(window._db),
+                model=model,
+                project_root="",
+            )
+            result = execute_wiki_command(
+                window._iris_wiki,
+                WikiCommand(
+                    op="reprocess",
+                    rel_path=rel,
+                    keep_original=True,
+                    summarize=summarize,
+                    translate=translate,
+                ),
+                summarize_fn=_sum if summarize else None,
+                translate_fn=_tr if translate else None,
+                filing=filing,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            return err_result("wiki.reprocess_note", str(exc))
+        wiki_rel = str(result.get("rel_path") or rel)
+
+        def _show() -> None:
+            window._on_obsidian_icon()
+            window._obsidian_page.reload_graph()
+            window._left_sidebar.obsidian_detail.reload()
+            window._obsidian_page.show_note(wiki_rel)
+
+        _call_on_ui(window, _show)
+        _log(window, "wiki.reprocess_note", True)
+        return ok_result("wiki.reprocess_note", result)
+
+    reg.register(
+        "wiki.list_notes",
+        wiki_list,
+        summary="List Iris Wiki note paths. count is this page, total is the vault, truncated is true when total is larger.",
+    )
+
+    reg.register(
+        "wiki.read_note",
+        wiki_read,
+        summary="Read one Iris Wiki note body by rel_path",
+    )
+
+    reg.register(
+        "wiki.delete_note",
+        wiki_delete,
+        summary="Delete one user Iris Wiki note by rel_path",
+        risk="medium",
+    )
+
+    reg.register(
+        "wiki.move_notes",
+        wiki_move,
+        summary="Copy existing user notes to dest_folder as the same bytes, then delete the sources. sources: file or folder rel_paths. Folder sources keep their folder name under dest_folder.",
+        risk="medium",
+    )
+
+    reg.register(
+        "wiki.reprocess_note",
+        wiki_reprocess,
+        summary="Keep the note, write a Korean summary on top, and Korean under each paragraph. One call. Do not paste the note into write_user_note.",
+        risk="medium",
+    )
 
     reg.register(
         "wiki.open_note",
@@ -420,7 +621,7 @@ def register_wiki_actions(window: WikiHost, reg: ActionRegistry) -> None:
     reg.register(
         "wiki.write_user_note",
         wiki_write,
-        summary="Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox.",
+        summary="Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox. Do not use this to move existing notes; wiki.move_notes copies bytes and deletes the source.",
         risk="medium",
     )
 

@@ -277,7 +277,7 @@
   },
   {
     "name": "extension.install_github",
-    "summary": "Install a GitHub repo as Hermes MCP and/or skill. Required: url. kind=auto|mcp|skill. Optional secrets, directory. needs_input: ask the user and do not invent secrets. Do not claim installed without ok.",
+    "summary": "Install a GitHub repo as MCP and/or skill. Required: url. kind=auto|mcp|skill. scope=project only in IRIS IDE (writes the open project). scope=iris only on the main Iris screen (Hermes). needs_input: ask and do not invent secrets. Do not claim installed without ok. Do not treat an IDE extension and a Hermes MCP as one install.",
     "risk": "medium",
     "confirm_required": false
   },
@@ -291,6 +291,30 @@
     "name": "get_state",
     "summary": "Iris session state: ui_mode companion workspace IDE project_root model",
     "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.debug",
+    "summary": "IRIS IDE debug. op=start needs name (launch configuration). op=stop or continue. No session is not success.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.definition",
+    "summary": "Definition at the cursor or at path+line+column in the open IRIS IDE editor.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.diagnostics",
+    "summary": "Problems in the open IRIS IDE. reported false means the editor has not pushed markers yet — do not say the project is clean. An empty diagnostics list is clean only when reported is true.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.edit",
+    "summary": "Edit the open IRIS IDE buffer. op=insert|replace_selection|replace_range|apply, text required, optional path. via=editor changes the buffer. via=disk with applied=append is not a selection replace. Do not claim the buffer changed unless via=editor.",
+    "risk": "medium",
     "confirm_required": false
   },
   {
@@ -308,6 +332,18 @@
   {
     "name": "ide.list",
     "summary": "List IDE catalog and install status",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.marketplace_install",
+    "summary": "Download an Open VSX VSIX into IRIS IDE deployedPlugins and pin it on the open project. Required: id as publisher.name. ok only when extension/package.json is on disk. reload=reloaded means the IDE process is restarting. reload=not_running means the next IDE start loads it. plugin.loaded true is the only signal the plugin host has the extension. Do not say a PDF tab or extension viewer is already open.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.marketplace_search",
+    "summary": "Search Open VSX for the project open in IRIS IDE. Required: query. Does not install. Do not claim installed.",
     "risk": "low",
     "confirm_required": false
   },
@@ -336,6 +372,30 @@
     "confirm_required": false
   },
   {
+    "name": "ide.plugin_status",
+    "summary": "Ask the IRIS IDE plugin host whether extension id is loaded. loaded false does not mean the viewer is open.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.project_log",
+    "summary": "Update the Iris wiki note for the project open in IRIS IDE. Optional plan, decision, issue, progress. Secrets are not stored.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.references",
+    "summary": "References at the cursor or at path+line+column in the open IRIS IDE editor. items come from the language service.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.save",
+    "summary": "Save the open IRIS IDE editor. Optional path, or all=true. via=editor flushes the buffer. via=disk means no open editor and the file was already on disk.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "ide.set_preferred",
     "summary": "Set preferred IDE id (cursor vscode pycharm … or custom)",
     "risk": "medium",
@@ -344,6 +404,18 @@
   {
     "name": "ide.set_project_root",
     "summary": "Set project_root folder for IDE Companion / vibe coding",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.symbols",
+    "summary": "Document symbols from the open IRIS IDE editor. Optional symbol filter and path. items come from the language service. Do not invent symbols when ok is false.",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "ide.task",
+    "summary": "Run a tasks.json task in IRIS IDE by name. started true only after TaskService accepts it.",
     "risk": "medium",
     "confirm_required": false
   },
@@ -403,7 +475,7 @@
   },
   {
     "name": "note.export_pdf",
-    "summary": "Save text to PDF in a child process. Required: content. Optional path (default Documents/IRIS/iris-note.pdf). Do not run PyMuPDF, reportlab, or pdf_create.py. Do not claim saved without ok.",
+    "summary": "Make a PDF from content and/or source files. Required: content or sources. Optional path (open project, else Documents/IRIS/iris-note.pdf). Do not run PyMuPDF, reportlab, or pdf_create.py. Do not claim saved without ok and a real file.",
     "risk": "medium",
     "confirm_required": false
   },
@@ -576,6 +648,12 @@
     "confirm_required": false
   },
   {
+    "name": "wiki.delete_note",
+    "summary": "Delete one user Iris Wiki note by rel_path",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "wiki.import_content",
     "summary": "Extract PDF/URL/file text, classify into Iris Wiki folders, then open in UI (mode=raw|summarize)",
     "risk": "medium",
@@ -589,13 +667,25 @@
   },
   {
     "name": "wiki.list_notes",
-    "summary": "List Iris Wiki note paths",
+    "summary": "List Iris Wiki note paths. count is this page, total is the vault, truncated is true when total is larger.",
     "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "wiki.move_notes",
+    "summary": "Copy existing user notes to dest_folder as the same bytes, then delete the sources. sources: file or folder rel_paths. Folder sources keep their folder name under dest_folder.",
+    "risk": "medium",
     "confirm_required": false
   },
   {
     "name": "wiki.open_note",
     "summary": "Open Iris Wiki workspace and show note by rel_path",
+    "risk": "low",
+    "confirm_required": false
+  },
+  {
+    "name": "wiki.read_note",
+    "summary": "Read one Iris Wiki note body by rel_path",
     "risk": "low",
     "confirm_required": false
   },
@@ -606,6 +696,12 @@
     "confirm_required": false
   },
   {
+    "name": "wiki.reprocess_note",
+    "summary": "Keep the note, write a Korean summary on top, and Korean under each paragraph. One call. Do not paste the note into write_user_note.",
+    "risk": "medium",
+    "confirm_required": false
+  },
+  {
     "name": "wiki.search",
     "summary": "Search saved Iris Wiki notes (FTS and embeddings). Excerpts only. Not conversation history.",
     "risk": "low",
@@ -613,7 +709,7 @@
   },
   {
     "name": "wiki.write_user_note",
-    "summary": "Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox.",
+    "summary": "Save markdown into a classified Iris Wiki folder (사용자, 학습자료, 인사이트, projects, research). Ambiguous notes stay in inbox. Do not use this to move existing notes; wiki.move_notes copies bytes and deletes the source.",
     "risk": "medium",
     "confirm_required": false
   },

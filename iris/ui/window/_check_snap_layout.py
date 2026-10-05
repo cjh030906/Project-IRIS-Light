@@ -47,8 +47,11 @@ def main() -> None:
     assert frame.width() == geom.width() and frame.height() == geom.height()
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    style = user32.GetWindowLongW(int(host.winId()), -16) & 0xFFFFFFFF
+    user32.GetWindowLongW.restype = ctypes.c_uint32
+    style = int(user32.GetWindowLongW(int(host.winId()), -16)) & 0xFFFFFFFF
     assert style & 0x00010000  # WS_MAXIMIZEBOX
+    assert not (style & 0x00C00000)  # WS_CAPTION — 네이티브 제목줄
+    assert not (style & 0x00080000)  # WS_SYSMENU — 네이티브 최소화·최대화·닫기
 
     class MSG(ctypes.Structure):
         _fields_ = [

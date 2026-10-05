@@ -1,0 +1,40 @@
+---
+description: Iris가 채팅 요청 직후 Qt6Core 0xC0000409로 죽을 때의 원인과 고치는 순서
+alwaysApply: true
+---
+
+# Qt 슬롯 예외 = Iris 즉시 종료 (0xC0000409)
+
+`pythonw.exe` + `Qt6Core.dll` + `c0000409` + 오프셋 `0x1cf68` + `BEX64`는 Qt `qFatal`이다. 오프셋이 같다고 원인이 같지 않다. PyQt6는 슬롯 밖으로 나간 Python 예외를 오류 창 없이 이 코드로 죽인다. `launcher.log`는 비어 있는 경우가 많다.
+
+## 재발 시 순서
+
+1. WER `ReportArchive\AppCrash_pythonw.exe_*` 시각을 확인한다.
+2. `%USERPROFILE%\.iris-light\iris_light.db`의 `chat_messages.created_at`과 맞춘다.
+   - 사용자 행도 없으면 전송 슬롯 초입 (`AttributeError`, 키워드 인자 누락).
+   - 비서 행이 같은 초까지 있으면 그 기록 직후 (`_finish_current_turn`, 위키 화면 전환).
+3. 슬롯이 예외를 내지 않게 고친다. traceback을 사용자에게 보여 주는 우회를 새로 만들지 않는다.
+
+## 코드를 넣을 때
+
+- `MainWindow` 슬롯이 읽는 속성은 `__init__`에서 만든다. (`_sending_followthrough` 누락이 2026-09-30 12시대 종료)
+- 키워드 전용 인자에는 기본값을 둔다. (`open_followup` 누락이 2026-09-30 15:34 위키 저장 직후 종료)
+- 고친 뒤 `python -m iris.ui._check_turn_followup`을 실행한다.
+
+## IDE에서 폴더를 열 때 (2026-10-03)
+
+폴더 기록(`ide-recent-folders.json`) 직후 같은 오프셋이면 채팅 슬롯이 아니다. `_open_iris_ide_folder` 안이다.
+
+- `QFileDialog` 부모는 `None`. 히어로·웰컴·`ide.pick_open_folder`·`ide.pick_open_file`를 frameless `MainWindow`나 그 자식에 붙이지 않는다. 닫힌 네이티브 대화상자가 다음 `processEvents`에서 걷히면 `qFatal`이다.
+- 그 슬롯에서 `apply_frameless_chrome` / `show` / `winId`를 `set_embedded`보다 먼저 호출하지 않는다. 네이티브 HWND를 만든 뒤 `setParent`하면 같은 코드로 죽는다. 이미 보이는 IDE 창은 숨긴 다음 붙인다.
+- 고친 뒤 `python -m iris.ui._check_iris_ide_window`를 실행한다.
+
+## 이 코드의 다른 입구 (슬롯 수정으로 막히지 않음)
+
+- `QApplication` 전에 `ensure_qt_webengine_ready()` 없이 WebEngine 로드
+- frameless 메인의 modal 자식 (위저드·설정·IDE 폴더 대화상자는 `parent=None`)
+- `nativeEvent` / `QAbstractNativeEventFilter` / `WNDPROC`
+- 생성자 안의 `winId()`
+- `--use-gl=desktop`
+
+상세 시각표: `docs/code-review/채팅요청-즉시종료-0xC0000409-종합.md`

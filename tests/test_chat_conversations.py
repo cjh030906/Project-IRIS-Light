@@ -70,24 +70,26 @@ class ChatConversationTests(TestCase):
             [{"role": "user", "content": "둘째 세션 질문"}],
         )
 
-    def test_title_stays_blank_until_reply_then_summarizes(self) -> None:
+    def test_title_stays_blank_until_the_model_names_it(self) -> None:
+        from iris.storage.chat_title import apply_generated_title
+
         conv = create_conversation(self.db)
         self.assertEqual(conv.title, DEFAULT_TITLE)
         question = "PDF 저장하면 프로그램이 꺼지는 문제가 있는데 원인 확인하고 수정해줘"
         append_message(self.db, conv.id, "user", question)
+        append_message(self.db, conv.id, "assistant", "저장 직후 종료 경로를 고쳤습니다.")
         waiting = get_conversation(self.db, conv.id)
         assert waiting is not None
         self.assertEqual(waiting.title, DEFAULT_TITLE)
-        append_message(self.db, conv.id, "assistant", "저장 직후 종료 경로를 고쳤습니다.")
+        stored = apply_generated_title(self.db, conv.id, "PDF 저장 종료 오류 수정")
+        self.assertEqual(stored, "PDF 저장 종료 오류 수정")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
         self.assertEqual(reloaded.title, "PDF 저장 종료 오류 수정")
         self.assertNotIn(question, reloaded.title)
         self.assertFalse(reloaded.title_locked)
-        append_message(self.db, conv.id, "user", "그럼 그 부분 더 자세히")
-        kept = get_conversation(self.db, conv.id)
-        assert kept is not None
-        self.assertEqual(kept.title, "PDF 저장 종료 오류 수정")
+        bodies = [item["content"] for item in history_dicts(self.db, conv.id)]
+        self.assertNotIn("PDF 저장 종료 오류 수정", bodies)
 
     def test_user_text_does_not_become_title(self) -> None:
         conv = create_conversation(self.db)
@@ -96,49 +98,61 @@ class ChatConversationTests(TestCase):
         assert reloaded is not None
         self.assertEqual(reloaded.title, DEFAULT_TITLE)
 
-    def test_first_basis_keeps_first_topic(self) -> None:
+    def test_first_basis_keeps_first_model_title(self) -> None:
+        from iris.storage.chat_title import apply_generated_title
+
         save_title_basis(self.db, TITLE_BASIS_FIRST)
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
         append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
+        self.assertEqual(apply_generated_title(self.db, conv.id, "IRIS 구조"), "IRIS 구조")
         append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
         append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
-        reloaded = get_conversation(self.db, conv.id)
-        assert reloaded is not None
-        self.assertEqual(reloaded.title, "IRIS 구조")
+        self.assertEqual(apply_generated_title(self.db, conv.id, "부산 여행 일정"), "IRIS 구조")
 
-    def test_topic_shift_updates_title(self) -> None:
+    def test_later_model_title_replaces_when_basis_is_last(self) -> None:
+        from iris.storage.chat_title import apply_generated_title
+
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
         append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
+        apply_generated_title(self.db, conv.id, "IRIS 구조")
         append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
         append_message(self.db, conv.id, "assistant", "오전에는 해운대를 추천합니다.")
+        apply_generated_title(self.db, conv.id, "부산 여행 일정")
         reloaded = get_conversation(self.db, conv.id)
         assert reloaded is not None
-        self.assertEqual(reloaded.title, "내일 부산 여행 일정")
+        self.assertEqual(reloaded.title, "부산 여행 일정")
         self.assertFalse(reloaded.title_locked)
 
-    def test_first_basis_skips_reply_before_user(self) -> None:
-        save_title_basis(self.db, TITLE_BASIS_FIRST)
-        conv = create_conversation(self.db)
-        append_message(self.db, conv.id, "assistant", "무엇을 도와드릴까요?")
-        append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
-        append_message(self.db, conv.id, "assistant", "ui와 system으로 나뉩니다.")
-        reloaded = get_conversation(self.db, conv.id)
-        assert reloaded is not None
-        self.assertEqual(reloaded.title, "IRIS 구조")
+    def test_title_exchange_skips_a_greeting_before_the_question(self) -> None:
+        from iris.storage.chat_title import title_exchange
 
-    def test_switching_basis_retitles_unlocked_chat(self) -> None:
+        save_title_basis(self.db, TITLE_BASIS_FIRST)
+        pair = title_exchange(
+            [
+                {"role": "assistant", "content": "무엇을 도와드릴까요?"},
+                {"role": "user", "content": "IRIS 창 구조 알려줘"},
+                {"role": "assistant", "content": "ui와 system으로 나뉩니다."},
+            ],
+            basis=TITLE_BASIS_FIRST,
+        )
+        assert pair is not None
+        self.assertEqual(pair[0], "IRIS 창 구조 알려줘")
+
+    def test_switching_basis_does_not_rewrite_the_model_title(self) -> None:
+        from iris.storage.chat_title import apply_generated_title
+
         conv = create_conversation(self.db)
         append_message(self.db, conv.id, "user", "IRIS 창 구조 알려줘")
         append_message(self.db, conv.id, "assistant", "첫 답변입니다.")
-        append_message(self.db, conv.id, "user", "내일 부산 여행 일정 짜줘")
-        append_message(self.db, conv.id, "assistant", "마지막 답변입니다.")
-        self.assertEqual(get_conversation(self.db, conv.id).title, "내일 부산 여행 일정")
+        apply_generated_title(self.db, conv.id, "IRIS 구조")
         save_title_basis(self.db, TITLE_BASIS_FIRST)
         refresh_conversation_title(self.db, conv.id)
         self.assertEqual(get_conversation(self.db, conv.id).title, "IRIS 구조")
         self.assertEqual(load_title_basis(self.db), TITLE_BASIS_FIRST)
+        apply_generated_title(self.db, conv.id, "다른 주제")
+        self.assertEqual(get_conversation(self.db, conv.id).title, "IRIS 구조")
 
     def test_summarize_reply_skips_code_fence(self) -> None:
         title = summarize_reply("```python\nprint(1)\n```\n설치가 끝났습니다. 이어서 실행하세요.")
@@ -152,9 +166,54 @@ class ChatConversationTests(TestCase):
         }
         for question, title in cases.items():
             self.assertEqual(summarize_work_title(question), title)
-            self.assertEqual(suggest_title([{"role": "user", "content": question}]), title)
+            self.assertEqual(
+                suggest_title([{"role": "user", "content": question}], basis=TITLE_BASIS_FIRST),
+                title,
+            )
+            self.assertEqual(suggest_title([{"role": "user", "content": question}]), DEFAULT_TITLE)
             self.assertLessEqual(len(title), 25)
             self.assertNotEqual(title, question)
+
+    def test_saved_messages_are_not_replaced_by_the_title(self) -> None:
+        from iris.storage.chat_title import apply_generated_title, title_exchange, title_messages
+
+        conv = create_conversation(self.db)
+        question = "프랜스포머는 뭔지 아는데 어탠션은뭐야?"
+        answer = "어텐션은 각 토큰이 서로를 보는 방식입니다."
+        append_message(self.db, conv.id, "user", question)
+        append_message(self.db, conv.id, "assistant", answer)
+        apply_generated_title(self.db, conv.id, "트랜스포머와 어텐션")
+        self.assertEqual(
+            history_dicts(self.db, conv.id),
+            [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ],
+        )
+        pair = title_exchange(history_dicts(self.db, conv.id), basis="last")
+        assert pair is not None
+        prompt = title_messages(*pair)
+        self.assertIn("트랜스포머와 어텐션", prompt[0]["content"])
+        self.assertIn(question, prompt[1]["content"])
+        self.assertNotIn("트랜스포머와 어텐션", history_dicts(self.db, conv.id)[1]["content"])
+
+    def test_attachment_path_is_left_out_of_the_title_request(self) -> None:
+        from iris.storage.chat_title import title_exchange
+
+        pair = title_exchange(
+            [
+                {
+                    "role": "user",
+                    "content": '이 pdf 내용을 요약해서 알려줘 [첨부 파일] @"C:/secret/a.pdf"',
+                },
+                {"role": "assistant", "content": "요약을 마쳤습니다."},
+            ],
+            basis=TITLE_BASIS_FIRST,
+        )
+        assert pair is not None
+        self.assertNotIn("secret", pair[0])
+        self.assertNotIn("첨부", pair[0])
+        self.assertNotIn(".pdf", pair[0])
 
     def test_manual_title_is_not_auto_updated(self) -> None:
         conv = create_conversation(self.db)

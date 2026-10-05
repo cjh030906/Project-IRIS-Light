@@ -151,9 +151,17 @@ class IdeLink:
                 "active_editor": part(lambda: fast.get_active_editor().get("editor")),
                 "cursor": part(fast.get_cursor_position),
                 "selection": part(lambda: fast.get_selection().get("selection")),
-                "diagnostics": part(lambda: fast.get_diagnostics().get("diagnostics") or []),
+                "diagnostics": part(lambda: _diagnostics_snapshot(fast.get_diagnostics())),
             }
         }
+
+
+def _diagnostics_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """reported 가 없으면 빈 목록으로 바꾸지 않는다. 빈 목록은 마커를 읽은 뒤다."""
+    if not payload.get("reported"):
+        return {"reported": False, "diagnostics": None}
+    items = payload.get("diagnostics")
+    return {"reported": True, "diagnostics": items if isinstance(items, list) else []}
 
 
 def _query_error(exc: BaseException) -> dict[str, str]:

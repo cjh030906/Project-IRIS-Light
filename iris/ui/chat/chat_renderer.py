@@ -14,7 +14,7 @@ from iris.ui.chat.chat_blocks import (
     parse_file_chip_location,
     wrap_document_html,
 )
-from iris.ui.shared.theme_tokens import TOKENS
+from iris.ui.chat.typography import TOKENS, manager
 
 _MARKDOWN_EXTENSIONS = ("nl2br", "fenced_code", "tables", "sane_lists")
 
@@ -93,9 +93,61 @@ def render_wiki_document(text: str) -> str:
     return render_markdown_document(text, citations=True)
 
 
+_ATTACH_TOKEN = "\ue010{}\ue011"
+_LOCAL_ATTACH = re.compile(
+    r'@"([^"]+)"'
+    r"|@'([^']+)'"
+    r"|@([A-Za-z]:[\\/][^\s<>]+)"
+    r"|`([A-Za-z]:[\\/][^`\n]+)`"
+    r"|`(\\\\[^`\n]+)`"
+)
+
+
+def _swap_attachment_prose(text: str, chips: list[str]) -> str:
+    from iris.ui.chat.composer_attachments import attachment_chip_html
+
+    def repl(match: re.Match[str]) -> str:
+        raw = next(group for group in match.groups() if group)
+        chips.append(attachment_chip_html(raw))
+        return _ATTACH_TOKEN.format(len(chips) - 1)
+
+    return _LOCAL_ATTACH.sub(repl, text)
+
+
+def _swap_local_attachments(text: str) -> tuple[str, list[str]]:
+    """절대경로·백틱 경로는 칩 토큰으로. 코드 펜스 안은 그대로."""
+    chips: list[str] = []
+    parts: list[str] = []
+    pos = 0
+    source = text or ""
+    while pos < len(source):
+        fence = source.find(_FENCE, pos)
+        if fence < 0:
+            parts.append(_swap_attachment_prose(source[pos:], chips))
+            break
+        if fence > pos:
+            parts.append(_swap_attachment_prose(source[pos:fence], chips))
+        close = source.find(_FENCE, fence + 3)
+        if close < 0:
+            parts.append(source[fence:])
+            break
+        parts.append(source[fence : close + 3])
+        pos = close + 3
+    return "".join(parts), chips
+
+
 def render_user_message(text: str) -> str:
-    """사용자 메시지 — markdown (인용 칩 제외)."""
-    return render_markdown_document(text, citations=False)
+    """사용자 메시지 — markdown. 로컬 첨부는 파일명 칩."""
+    source, chips = _swap_local_attachments(text or "")
+    rendered = render_markdown_document(source, citations=False)
+    for index, chip in enumerate(chips):
+        rendered = rendered.replace(_ATTACH_TOKEN.format(index), chip)
+    # QTextDocument does not support rounded CSS bubbles. A quiet inset card
+    # uses native paragraph margins instead of a dark, rectangular table.
+    return (
+        '<div style="margin-left:24px;margin-right:12px;">'
+        f"{rendered}</div>"
+    )
 
 
 def render_error_inline(text: str) -> str:
@@ -236,18 +288,46 @@ def _upgrade_inline_code_file_chips(html_body: str) -> str:
 
 
 def _markdown_body_to_html(text: str) -> str:
-    source = _inject_file_chips_in_source(text)
+    from iris.ui.chat.markdown_normalization import normalize_markdown_source
+
+    source = _inject_file_chips_in_source(_normalize_prose_symbols(normalize_markdown_source(text)))
     try:
         import markdown as md
 
         rendered = md.markdown(source, extensions=list(_MARKDOWN_EXTENSIONS))
-    except Exception:
-        return wrap_document_html(_plain_to_chat_html(source))
+    except ImportError:
+        # Qt's built-in GitHub dialect also supports tables and fenced code.
+        # A missing optional parser must not silently show Markdown as plain text.
+        from PyQt6.QtGui import QTextDocument
+
+        document = QTextDocument()
+        document.setMarkdown(source, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+        return document.toHtml()
 
     rendered = _sanitize_chat_html(rendered)
     rendered = _upgrade_fenced_pre_to_cards(rendered)
     rendered = _upgrade_inline_code_file_chips(rendered)
     return wrap_document_html(_style_chat_html(rendered))
+
+
+def _normalize_prose_symbols(text: str) -> str:
+    """Show common math arrows in prose; preserve fenced and inline code."""
+    symbols = {"rightarrow": "→", "leftarrow": "←", "leftrightarrow": "↔",
+               "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔",
+               "times": "×", "cdot": "·", "leq": "≤", "geq": "≥", "neq": "≠"}
+    chunks = re.split(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)", text)
+    for i in range(0, len(chunks), 2):
+        chunks[i] = re.sub(r"\\(" + "|".join(symbols) + r")(?![A-Za-z])",
+                           lambda m: symbols[m.group(1)], chunks[i])
+        chunks[i] = re.sub(r"(?:\$|\\\()\s*([→←↔⇒⇐⇔])\s*(?:\$|\\\))", r"\1", chunks[i])
+        def math_text(match: re.Match[str]) -> str:
+            value = match[1]
+            if not ("\\" in value or re.fullmatch(r"[\w=+*/().<>≤≥≠-]+", value)):
+                return match[0]
+            value = re.sub(r"\\text\{([^{}]+)\}", r"\1", value)
+            return re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1) / (\2)", value)
+        chunks[i] = re.sub(r"(?<!\\)\$([^$\n]+)(?<!\\)\$", math_text, chunks[i])
+    return "".join(chunks)
 
 
 def _upgrade_fenced_pre_to_cards(html_body: str) -> str:
@@ -266,15 +346,77 @@ def _upgrade_fenced_pre_to_cards(html_body: str) -> str:
 def _plain_to_chat_html(text: str) -> str:
     escaped = html.escape(text)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    return escaped.replace("\n", "<br>")
+    escaped = re.sub(r"^#{1,6}\s+(.+)$", r"<h3>\1</h3>", escaped, flags=re.MULTILINE)
+    return "".join("<p>" + part.replace("\n", "<br>") + "</p>"
+                   for part in escaped.split("\n\n") if part.strip())
+
+
+_ALLOWED_CHAT_TAGS = frozenset(
+    {
+        "a", "b", "blockquote", "br", "code", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+        "hr", "i", "img", "li", "ol", "p", "pre", "span", "strong", "table", "tbody",
+        "td", "th", "thead", "tr", "ul",
+    }
+)
+_DROP_WITH_CONTENT = ("script", "style", "iframe", "object", "embed", "svg", "math", "form")
+_ON_ATTR = re.compile(
+    r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+    re.IGNORECASE,
+)
+_URL_ATTR = re.compile(
+    r"""(?P<name>href|src)\s*=\s*(?P<q>["'])(?P<val>.*?)(?P=q)""",
+    re.IGNORECASE | re.DOTALL,
+)
+_STYLE_JS = re.compile(
+    r"(?i)(?:url\s*\(\s*(['\"]?)\s*(?:javascript|vbscript|data|file):[^)]*\)|expression\s*\([^)]*\))"
+)
+_CHAT_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", re.DOTALL)
+_ALLOWED_URL_PREFIXES = (
+    "http://", "https://",
+    "iris-file://", "iris-wiki://", "iris-copy://", "iris-collapse://",
+    "iris-tts://", "iris-error://", "iris-update://", "iris-hermes-update://",
+    "iris-stt://", "iris-diagram://", "iris-ollama-login://",
+    "iris-image:",
+)
+
+
+def _chat_url_ok(value: str) -> bool:
+    raw = html.unescape((value or "").strip())
+    low = raw.lower()
+    if low.startswith(("javascript:", "vbscript:", "data:", "file:")):
+        return False
+    if low.startswith(_ALLOWED_URL_PREFIXES):
+        return True
+    if re.match(r"^[a-z]:[\\/]", low):
+        return True
+    head = low.split("/", 1)[0]
+    return ":" not in head
 
 
 def _sanitize_chat_html(html_body: str) -> str:
-    t = html_body
-    t = re.sub(r"(?is)<script[\s\S]*?</script>", "", t)
-    t = re.sub(r"(?is)<style[\s\S]*?</style>", "", t)
-    t = re.sub(r"(?is)<iframe[\s\S]*?</iframe>", "", t)
-    return t
+    t = html_body or ""
+    for name in _DROP_WITH_CONTENT:
+        t = re.sub(rf"(?is)<{name}\b[\s\S]*?</{name}>", "", t)
+        t = re.sub(rf"(?is)<{name}\b[^>]*?/?>", "", t)
+
+    def _tag(match: re.Match[str]) -> str:
+        closing, name, attrs = match.group(1), match.group(2).lower(), match.group(3) or ""
+        if name not in _ALLOWED_CHAT_TAGS:
+            return ""
+        if closing:
+            return f"</{name}>"
+        attrs = _ON_ATTR.sub("", attrs)
+        attrs = _STYLE_JS.sub("", attrs)
+
+        def _url(url_match: re.Match[str]) -> str:
+            if _chat_url_ok(url_match.group("val")):
+                return url_match.group(0)
+            return ""
+
+        attrs = _URL_ATTR.sub(_url, attrs)
+        return f"<{name}{attrs}>"
+
+    return _CHAT_TAG.sub(_tag, t)
 
 
 def _style_img_tag(attrs: str) -> str:
@@ -282,7 +424,7 @@ def _style_img_tag(attrs: str) -> str:
 
     sm = _IMG_SRC.search(attrs or "")
     src = (sm.group(2) if sm else "").strip()
-    if not src:
+    if not src or not _chat_url_ok(src):
         return ""
     am = _IMG_ALT.search(attrs or "")
     alt = html.escape((am.group(2) if am else "").strip(), quote=True)
@@ -317,14 +459,15 @@ def _style_table_cell(match: re.Match[str]) -> str:
     if tag == "th":
         style = (
             f"background-color:{t.chat_table_header_bg};color:{t.text_primary};"
-            f"font-weight:600;padding:6px 12px;border:none;"
+            f"font-weight:600;padding:8px 12px;border:none;"
             f"border-bottom:1px solid {t.chat_table_row_border};text-align:left;"
         )
     else:
         style = (
-            f"color:{t.text_primary};padding:6px 12px;border:none;"
+            f"color:{t.text_primary};padding:8px 12px;border:none;"
             f"border-bottom:1px solid {t.chat_table_row_border};text-align:left;"
         )
+    style += f"font-family:{t.chat_ui_font};font-size:{t.chat_font_size};"
     return f"<{tag}{_merge_cell_style(attrs, style)}>"
 
 
@@ -342,7 +485,7 @@ def _style_tables(html_body: str) -> str:
 
 def _style_chat_html(html_body: str) -> str:
     t = TOKENS
-    body = f"color:{t.text_primary};"
+    body = f"color:{t.chat_body};line-height:{t.chat_line_height};font-size:{t.chat_font_size};font-family:{t.chat_ui_font};"
     shell = (
         f"background-color:{t.chat_block_bg};"
         f"border:1px solid {t.chat_block_border};"
@@ -352,10 +495,9 @@ def _style_chat_html(html_body: str) -> str:
     out = html_body
     out = re.sub(
         r"<p>",
-        f'<span style="display:block;margin:0 0 4px 0;{body}">',
+        f'<p style="margin-top:0;margin-bottom:14px;{body}">',
         out,
     )
-    out = re.sub(r"</p>", "</span>", out)
     out = re.sub(
         r"<hr\s*/?>",
         f'<hr style="border:none;border-top:1px solid {t.text_muted};margin:8px 0;height:0;" />',
@@ -373,12 +515,17 @@ def _style_chat_html(html_body: str) -> str:
         out,
     )
     out = _style_tables(out)
-    out = re.sub(
-        r"<h([1-6])>",
-        f'<span style="display:block;font-weight:700;margin:6px 0 4px 0;{body}">',
-        out,
-    )
-    out = re.sub(r"</h[1-6]>", "</span>", out)
+    out = re.sub(r"<h([1-6])>", lambda m: (
+        f'<h{m[1]} style="color:{t.text_primary};font-family:{t.chat_ui_font};font-size:{manager.get().chat_font_size + (4,3,2,2,1,1)[int(m[1])-1]}px;'
+        'font-weight:600;margin-top:20px;margin-bottom:10px;">'
+        f'<span style="font-size:{manager.get().chat_font_size + (4,3,2,2,1,1)[int(m[1])-1]}px;">'), out)
+    out = re.sub(r"</h([1-6])>", r"</span></h\1>", out)
+    out = re.sub(r"<(ul|ol)>", r'<\1 style="margin-top:4px;margin-bottom:16px;margin-left:20px;">', out)
+    out = out.replace("<li>", f'<li style="margin-bottom:8px;{body}">')
+    out = out.replace("<blockquote>",
+        f'<blockquote style="margin-left:18px;margin-right:12px;margin-top:12px;'
+        f'margin-bottom:16px;color:{t.text_secondary};">')
+    out = out.replace("<strong>", f'<strong style="font-weight:600;color:{t.text_primary};">')
     out = re.sub(
         r'<a(?![^>]*\bstyle=)(?=[^>]*href="(?!iris-(?!wiki://)))',
         '<a style="color:#60a5fa;" ',
@@ -389,6 +536,12 @@ def _style_chat_html(html_body: str) -> str:
 
 
 if __name__ == "__main__":
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])
     chip = render_file_chip("src/app/main.py")
     assert "src/app/main.py" in chip
     assert "iris-file://" in chip or "#475569" in chip
@@ -400,4 +553,12 @@ if __name__ == "__main__":
         "```diff\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n```"
     )
     assert "#34d399" in fenced and "#f87171" in fenced
+    dirty = render_iris_message(
+        '안녕 <script>alert(1)</script> [x](javascript:alert(1))\n\n'
+        '![a](javascript:alert(1))\n\n'
+        "See [Docs](https://example.com/a)"
+    )
+    lowered = dirty.lower()
+    assert "<script" not in lowered and "javascript:" not in lowered, dirty
+    assert "https://example.com/a" in dirty
     print("chat_renderer file/diff ok")

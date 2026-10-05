@@ -112,7 +112,8 @@ const bundleHasCurrentExt =
     bundleText.includes('ide.pick_open_folder') &&
     bundleText.includes('iris.ide.showStartScreen') &&
     bundleText.includes('iris.ide.runFile') &&
-    bundleText.includes('IRIS_EXIT:');
+    bundleText.includes('IRIS_EXIT:') &&
+    bundleText.includes('setDiagnostics');
 if (rebundle || !bundleHasIris || !bundleHasCurrentExt) {
     console.log('patch-theia-build: rebundling frontend (iris extension)...');
     execSync('node esbuild.mjs', { cwd: root, stdio: 'inherit' });

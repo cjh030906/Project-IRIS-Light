@@ -19,17 +19,28 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
     )
 
     def note_export_pdf(args: dict[str, Any]) -> dict[str, Any]:
-        content = str(args.get("content") or "").strip()
-        if not content:
-            return err_result("note.export_pdf", "content required")
-        raw_path = str(args.get("path") or "").strip()
-        dest = Path(raw_path).expanduser() if raw_path else Path.home() / "Documents" / "IRIS" / "iris-note.pdf"
         from iris.knowledge.pdf_export import save_pdf
+        from iris.knowledge.pdf_job import compose_pdf_text, resolve_pdf_dest, source_list
 
+        snap = _call_on_ui(window, lambda: _pdf_root(window))
+        root = str(snap.get("project_root") or "") if isinstance(snap, dict) else ""
+        content = compose_pdf_text(
+            str(args.get("content") or ""),
+            source_list(args),
+            root,
+        )
+        if not content:
+            return err_result("note.export_pdf", "content or sources required")
+        dest = resolve_pdf_dest(str(args.get("path") or ""), root)
         saved = save_pdf(content, dest)
-        if not saved.get("ok"):
+        if not saved.get("ok") or not dest.is_file():
             return err_result("note.export_pdf", str(saved.get("error") or "PDF 저장에 실패했습니다."))
-        return ok_result("note.export_pdf", {"path": str(dest)})
+
+        def _arm() -> None:
+            window._turn_pdf_path = str(dest.resolve())
+
+        _call_on_ui(window, _arm)
+        return ok_result("note.export_pdf", {"path": str(dest.resolve())})
 
     def extension_install_github(args: dict[str, Any]) -> dict[str, Any]:
         from iris.system.github_extension_install import ExtensionRequest, install_from_request
@@ -37,6 +48,19 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
         url = str(args.get("url") or "").strip()
         if not url:
             return err_result("extension.install_github", "url required")
+        snap = _call_on_ui(window, lambda: _extension_context(window))
+        if not isinstance(snap, dict):
+            return err_result("extension.install_github", "scope unavailable")
+        from iris.system.extension_scope import choose_extension_scope
+
+        scope, scope_err = choose_extension_scope(
+            str(snap.get("ui_mode") or ""),
+            str(snap.get("project_root") or ""),
+            str(args.get("scope") or ""),
+        )
+        if scope_err:
+            return err_result("extension.install_github", scope_err)
+        project_root = str(snap.get("project_root") or "") if scope == "project" else None
         kind = str(args.get("kind") or "auto").strip().lower()
         if kind not in ("auto", "mcp", "skill"):
             kind = "auto"
@@ -46,6 +70,7 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
             ExtensionRequest(url, kind),
             secrets={str(k): str(v) for k, v in secrets.items()},
             directory=directory,
+            project_root=project_root,
         )
         data = result.to_dict()
         if result.status == "needs_input":
@@ -69,9 +94,10 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
                 result.message or "설치하지 못했습니다.",
                 data,
             )
-        if result.mcp_added:
+        data["scope"] = scope
+        if result.mcp_added and scope == "iris":
             data["runtime"] = _restart_gateway(window)
-        if result.status in ("installed", "already"):
+        if result.status in ("installed", "already") and scope == "iris":
             def _sync() -> None:
                 try:
                     from iris.ui.chat.skill_mcp_dialogs import _sync_wiki_catalog
@@ -129,13 +155,13 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
     reg.register(
         "note.export_pdf",
         note_export_pdf,
-        summary="Save text to PDF in a child process. Required: content. Optional path (default Documents/IRIS/iris-note.pdf). Do not run PyMuPDF, reportlab, or pdf_create.py. Do not claim saved without ok.",
+        summary="Make a PDF from content and/or source files. Required: content or sources. Optional path (open project, else Documents/IRIS/iris-note.pdf). Do not run PyMuPDF, reportlab, or pdf_create.py. Do not claim saved without ok and a real file.",
         risk="medium",
     )
     reg.register(
         "extension.install_github",
         extension_install_github,
-        summary="Install a GitHub repo as Hermes MCP and/or skill. Required: url. kind=auto|mcp|skill. Optional secrets, directory. needs_input: ask the user and do not invent secrets. Do not claim installed without ok.",
+        summary="Install a GitHub repo as MCP and/or skill. Required: url. kind=auto|mcp|skill. scope=project only in IRIS IDE (writes the open project). scope=iris only on the main Iris screen (Hermes). needs_input: ask and do not invent secrets. Do not claim installed without ok. Do not treat an IDE extension and a Hermes MCP as one install.",
         risk="medium",
     )
     reg.register(
@@ -144,6 +170,28 @@ def register_agent_turn_actions(window: Any, reg: ActionRegistry) -> None:
         summary="Read code from an image file and write it via project.write_file. Required: image (file path), rel_path. Ask when the target file is unknown. Do not claim written without ok.",
         risk="medium",
     )
+
+
+def _pdf_root(window: Any) -> dict[str, str]:
+    root = ""
+    try:
+        root = str(window._current_project_root() or "")
+    except Exception:
+        root = ""
+    return {"project_root": root}
+
+
+def _extension_context(window: Any) -> dict[str, str]:
+    root = ""
+    try:
+        root = str(window._current_project_root() or "")
+    except Exception:
+        root = ""
+    session = getattr(window, "_ide_session", None)
+    bound = str(getattr(session, "workspace_root", "") or "").strip() if session is not None else ""
+    if bound:
+        root = bound
+    return {"ui_mode": str(getattr(window, "_ui_mode", "") or ""), "project_root": root}
 
 
 def _vision_snap(window: Any) -> dict[str, str]:

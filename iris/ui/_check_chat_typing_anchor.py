@@ -70,7 +70,9 @@ def main() -> int:
     assert bar.value() == bar.maximum(), (bar.value(), bar.maximum())
 
     print("chat typing anchor ok", f"anchor={anchor}", f"max={bar.maximum()}", f"ticks={len(lengths)}")
+    _check_user_scroll(app, panel)
     _check_stream(app, panel)
+    _check_stream_user_scroll(app, panel)
     return 0
 
 
@@ -89,6 +91,116 @@ def _check_stream(app: QApplication, panel: ChatPanel) -> None:
     assert bar.maximum() > anchor, (bar.maximum(), anchor)
     assert bar.value() == anchor, (bar.value(), anchor)
     print("chat stream anchor ok", f"anchor={anchor}", f"max={bar.maximum()}")
+
+
+def _check_user_scroll(app: QApplication, panel: ChatPanel) -> None:
+    """출력 중 휠로 벗어난 위치는 다음 글자가 와도 유지된다."""
+    from PyQt6.QtCore import QPoint, QPointF, Qt
+    from PyQt6.QtGui import QWheelEvent
+
+    panel.append_message_typed("Iris", LONG_ANSWER, speech_sync=False)
+    app.processEvents()
+    bar = panel._log.verticalScrollBar()
+    anchor = panel._typing_anchor_y
+    assert anchor is not None and anchor > 80, anchor
+    pinned = min(anchor, bar.maximum())
+    up = max(0, pinned - 160)
+    assert pinned - up > 24, (pinned, up, bar.maximum())
+    bar.setValue(up)
+    panel._note_user_log_scroll()
+    assert panel._scroll_user_hold, (bar.value(), pinned, anchor, bar.maximum())
+    held = bar.value()
+    for _ in range(40):
+        if not panel._typing_text:
+            break
+        panel._type_next_chunk()
+        app.processEvents()
+    assert abs(bar.value() - held) <= 2, (bar.value(), held, anchor)
+
+    for _ in range(800):
+        if not panel._typing_text:
+            break
+        if bar.maximum() > anchor + 40 and not panel._scroll_user_hold:
+            break
+        panel._type_next_chunk()
+        app.processEvents()
+    # 홀드 중에는 길이가 늘어도 위치가 유지된다. 맨 아래 추적은 홀드를 푼 뒤.
+    assert abs(bar.value() - held) <= 2, (bar.value(), held)
+    bar.setValue(bar.maximum())
+    panel._note_user_log_scroll()
+    assert panel._scroll_follow_tail, (bar.value(), bar.maximum(), anchor)
+    start_max = bar.maximum()
+    for _ in range(800):
+        if not panel._typing_text:
+            break
+        panel._type_next_chunk()
+        app.processEvents()
+        if bar.maximum() > start_max + 8:
+            break
+    assert bar.maximum() > start_max, (start_max, bar.maximum())
+    assert bar.value() == bar.maximum(), (bar.value(), bar.maximum())
+
+    bar.setValue(min(anchor, bar.maximum()))
+    panel._note_user_log_scroll()
+    assert not panel._scroll_user_hold and not panel._scroll_follow_tail
+    for _ in range(20):
+        if not panel._typing_text:
+            break
+        panel._type_next_chunk()
+        app.processEvents()
+    assert bar.value() == min(anchor, bar.maximum()), (bar.value(), anchor)
+
+    view = panel._log.viewport()
+    pos = view.rect().center()
+    before = bar.value()
+    panel._log.wheelEvent(
+        QWheelEvent(
+            QPointF(pos),
+            QPointF(view.mapToGlobal(pos)),
+            QPoint(0, 0),
+            QPoint(0, 240),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+    )
+    app.processEvents()
+    assert bar.value() < before, (bar.value(), before)
+    assert panel._scroll_user_hold
+    parked = bar.value()
+    for _ in range(20):
+        if not panel._typing_text:
+            break
+        panel._type_next_chunk()
+        app.processEvents()
+    assert abs(bar.value() - parked) <= 2, (bar.value(), parked)
+    print("chat user scroll during typing ok", f"held={held}", f"parked={parked}")
+
+
+def _check_stream_user_scroll(app: QApplication, panel: ChatPanel) -> None:
+    """스트리밍 청크가 이어져도 올려 둔 위치가 끌려 내려가지 않는다."""
+    panel.begin_stream_message("Iris", speech_sync=False)
+    app.processEvents()
+    bar = panel._log.verticalScrollBar()
+    anchor = panel._typing_anchor_y
+    assert anchor is not None and anchor > 80, anchor
+    for _ in range(6):
+        panel.append_stream_chunk("스트리밍으로 들어오는 답변 조각입니다. ")
+        app.processEvents()
+    pinned = min(anchor, bar.maximum())
+    up = max(0, pinned - 160)
+    bar.setValue(up)
+    panel._note_user_log_scroll()
+    assert panel._scroll_user_hold, (bar.value(), pinned, anchor, bar.maximum())
+    held = bar.value()
+    for _ in range(10):
+        panel.append_stream_chunk("이어서 출력되는 문장입니다. ")
+        app.processEvents()
+    panel.end_stream_message()
+    app.processEvents()
+    assert abs(bar.value() - held) <= 2, (bar.value(), held, anchor)
+    print("chat user scroll during stream ok", f"value={bar.value()}", f"anchor={anchor}")
 
 
 if __name__ == "__main__":

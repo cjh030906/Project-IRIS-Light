@@ -23,6 +23,7 @@ export class IrisIdeBridgeServer {
     protected workspaceRoot = '';
     protected workspaceOpen = false;
     protected editorState: Json | null = null;
+    protected openEditors: Json[] = [];
 
     async start(): Promise<void> {
         const envWs = (process.env.IRIS_IDE_WORKSPACE || '').trim();
@@ -125,8 +126,26 @@ export class IrisIdeBridgeServer {
         if (!info || typeof info !== 'object' || Array.isArray(info)) {
             return null;
         }
-        const hasId = Boolean(String(info.path || '').trim() || String(info.uri || '').trim());
-        return hasId ? info : null;
+        const copy: Json = { ...info };
+        delete copy.editors;
+        const hasId = Boolean(String(copy.path || '').trim() || String(copy.uri || '').trim());
+        return hasId ? copy : null;
+    }
+
+    protected normalizeEditorList(list: unknown, fallback: Json | null): Json[] {
+        const out: Json[] = [];
+        if (Array.isArray(list)) {
+            for (const item of list) {
+                const row = this.normalizeEditorState(item && typeof item === 'object' ? item as Json : null);
+                if (row) {
+                    out.push(row);
+                }
+            }
+        }
+        if (!out.length && fallback) {
+            out.push(fallback);
+        }
+        return out;
     }
 
     protected async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -179,11 +198,12 @@ export class IrisIdeBridgeServer {
             }
             case 'setEditorState':
                 this.editorState = this.normalizeEditorState(args);
+                this.openEditors = this.normalizeEditorList(args.editors, this.editorState);
                 return { saved: true };
             case 'getActiveEditor':
                 return { editor: this.editorState || null };
             case 'getOpenEditors':
-                return { editors: this.editorState ? [this.editorState] : [] };
+                return { editors: this.openEditors };
             case 'getCursorPosition':
                 return {
                     line: (this.editorState?.line as number) || 1,
@@ -192,7 +212,7 @@ export class IrisIdeBridgeServer {
             case 'getSelection':
                 return { selection: this.editorState?.selection || null };
             case 'getDiagnostics':
-                return { diagnostics: [] };
+                throw new Error('diagnostics are reported by the standalone bridge frontend');
             case 'openFile':
             case 'gotoFile': {
                 const rel = String(args.path || params.get('path') || '');
@@ -210,7 +230,7 @@ export class IrisIdeBridgeServer {
             }
             case 'saveFile':
             case 'saveAll':
-                return { saved: true };
+                throw new Error('save goes through the standalone bridge frontend');
             case 'createFile': {
                 const rel = String(args.path || '');
                 const abs = this.resolvePath(rel);
@@ -235,30 +255,14 @@ export class IrisIdeBridgeServer {
             case 'replaceSelection':
             case 'applyTextEdit':
             case 'insertText':
-            case 'replaceRange': {
-                const rel = String(args.path || (this.editorState?.path as string) || '');
-                const abs = this.resolvePath(rel);
-                let text = fs.readFileSync(abs, 'utf-8');
-                const insert = String(args.text ?? args.content ?? '');
-                if (cmd === 'insertText' || cmd === 'replaceSelection') {
-                    text += insert;
-                } else if (cmd === 'replaceRange') {
-                    const start = parseInt(String(args.start || 0), 10) || 0;
-                    const end = parseInt(String(args.end || text.length), 10) || text.length;
-                    text = text.slice(0, start) + insert + text.slice(end);
-                } else {
-                    text = insert;
-                }
-                fs.writeFileSync(abs, text, 'utf-8');
-                return { path: abs, length: text.length };
-            }
+            case 'replaceRange':
+                throw new Error(`${cmd} goes through the standalone bridge frontend`);
             case 'formatDocument':
-                return { formatted: false, reason: 'not implemented' };
             case 'gotoLine':
-                return { line: parseInt(String(args.line || 1), 10) || 1 };
             case 'gotoSymbol':
             case 'findReferences':
-                return { items: [] };
+            case 'gotoDefinition':
+                throw new Error(`${cmd} goes through the standalone bridge frontend`);
             case 'createTerminal':
             case 'runTerminalCommand': {
                 const command = String(args.command || args.cmd || 'echo IRIS_IDE_TEST');
@@ -270,13 +274,12 @@ export class IrisIdeBridgeServer {
             case 'getTerminalState':
                 return { active: false };
             case 'runTask':
-                return { started: false };
             case 'getTaskState':
-                return { running: false };
             case 'startDebug':
             case 'stopDebug':
             case 'continueDebug':
-                return { hooked: true };
+            case 'pluginLoaded':
+                throw new Error(`${cmd} goes through the standalone bridge frontend`);
             case 'getGitStatus': {
                 try {
                     const { execSync } = require('child_process') as typeof import('child_process');

@@ -7,7 +7,25 @@ import { EditorManager } from '@theia/editor/lib/browser';
 import { TerminalService } from '@theia/terminal/lib/browser/base/terminal-service';
 import { TerminalWidget } from '@theia/terminal/lib/browser/base/terminal-widget';
 import { WorkspaceService } from '@theia/workspace/lib/browser';
+import { DebugSessionManager } from '@theia/debug/lib/browser/debug-session-manager';
+import { TaskService } from '@theia/task/lib/browser/task-service';
+import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import { resolveBridgeIdentity } from './iris-ide-bridge-identity';
+import {
+    continueDebug,
+    editBuffer,
+    formatDocument,
+    gotoLine,
+    pluginLoaded,
+    queryLocations,
+    querySymbols,
+    runNamedTask,
+    saveEvery,
+    saveOne,
+    startDebug,
+    stopDebug,
+    taskState,
+} from './iris-ide-bridge-ops';
 
 interface PendingCommand {
     id: number;
@@ -68,6 +86,32 @@ function cmdQuote(arg: string): string {
     return arg;
 }
 
+function markExit(command: string, shell: ShellKind): string {
+    if (command.includes('IRIS_EXIT:')) {
+        return command;
+    }
+    if (shell === 'cmd') {
+        return [
+            'if not exist .iris mkdir .iris',
+            'del /f /q .iris\\last_run.log 2>nul',
+            `${command} > .iris\\last_run.log 2>&1`,
+            'echo IRIS_EXIT:%ERRORLEVEL% >> .iris\\last_run.log',
+            'type .iris\\last_run.log',
+        ].join('\n');
+    }
+    if (shell === 'powershell') {
+        const escaped = command.replace(/'/g, "''");
+        return [
+            'New-Item -ItemType Directory -Force -Path .iris | Out-Null',
+            'Remove-Item -Force -ErrorAction SilentlyContinue .iris\\last_run.log',
+            `& { ${escaped} } 2>&1 | Tee-Object -FilePath .iris\\last_run.log`,
+            '$code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }',
+            'Add-Content -Path .iris\\last_run.log -Value "IRIS_EXIT:$code"',
+        ].join('; ');
+    }
+    return `mkdir -p .iris; rm -f .iris/last_run.log; { ${command}; } 2>&1 | tee .iris/last_run.log; code=\${PIPESTATUS[0]}; printf "IRIS_EXIT:%s\\n" "$code" >> .iris/last_run.log`;
+}
+
 function wrapRun(argv: string[], shell: ShellKind): string {
     if (shell === 'cmd') {
         const quoted = argv.map(cmdQuote).join(' ');
@@ -104,6 +148,12 @@ export class IrisIdeBridgePoller implements FrontendApplicationContribution {
     @inject(TerminalService) protected readonly terminalService: TerminalService;
 
     @inject(WorkspaceService) protected readonly workspaceService: WorkspaceService;
+
+    @inject(TaskService) protected readonly taskService: TaskService;
+
+    @inject(DebugSessionManager) protected readonly debugSessions: DebugSessionManager;
+
+    @inject(HostedPluginSupport) protected readonly plugins: HostedPluginSupport;
 
     protected bridgePort = 0;
 
@@ -184,6 +234,42 @@ export class IrisIdeBridgePoller implements FrontendApplicationContribution {
                 return this.createTerminal(args);
             case 'runTerminalCommand':
                 return this.runInTerminal(args);
+            case 'getTerminalState':
+                return {
+                    active: Boolean(this.terminalService.currentTerminal || this.terminalService.lastUsedTerminal),
+                    via: 'theia',
+                };
+            case 'saveFile':
+                return saveOne(this.editorManager, args);
+            case 'saveAll':
+                return saveEvery(this.editorManager);
+            case 'insertText':
+            case 'replaceSelection':
+            case 'replaceRange':
+            case 'applyTextEdit':
+                return editBuffer(this.editorManager, cmd, args);
+            case 'formatDocument':
+                return formatDocument(this.editorManager, args);
+            case 'gotoLine':
+                return gotoLine(this.editorManager, args);
+            case 'gotoSymbol':
+                return querySymbols(this.editorManager, args);
+            case 'findReferences':
+                return queryLocations(this.editorManager, '_executeReferenceProvider', args);
+            case 'gotoDefinition':
+                return queryLocations(this.editorManager, '_executeDefinitionProvider', args);
+            case 'runTask':
+                return runNamedTask(this.taskService, args);
+            case 'getTaskState':
+                return taskState(this.taskService);
+            case 'startDebug':
+                return startDebug(this.debugSessions, args);
+            case 'stopDebug':
+                return stopDebug(this.debugSessions);
+            case 'continueDebug':
+                return continueDebug(this.debugSessions);
+            case 'pluginLoaded':
+                return pluginLoaded(this.plugins, args);
             default:
                 throw new Error(`unsupported frontend command: ${cmd}`);
         }
@@ -232,14 +318,14 @@ export class IrisIdeBridgePoller implements FrontendApplicationContribution {
         const cwd = String(args.cwd || '').trim();
         const terminal = await this.ensureTerminal(cwd);
         const shell = await shellOf(terminal);
-        const body = argv.length > 0 ? wrapRun(argv, shell) : command;
+        const body = argv.length > 0 ? wrapRun(argv, shell) : markExit(command, shell);
         const lines = [...(cwd ? [cdCommand(cwd, shell)] : []), ...body.split(/\r?\n/)].filter(line => line.trim());
         // cmd.exe submits a line on CR. A single LF-joined paste stays on one prompt.
         for (const line of lines) {
             terminal.sendText(`${line}\r\n`);
             await new Promise(resolve => window.setTimeout(resolve, 150));
         }
-        return { command: body, queued: true, via: 'theia_terminal', cwd, shell, delivered: true };
+        return { command: body, queued: false, via: 'theia_terminal', cwd, shell, delivered: true };
     }
 
     /** 편집기 탭 실행 버튼 — 브리지 큐와 같은 셸 맞춤 전송. */

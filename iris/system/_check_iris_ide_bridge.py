@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from iris.infrastructure.iris_ide_client import IrisIdeClient
+from iris.infrastructure.iris_ide_client import IrisIdeClient, IrisIdeClientError
 from iris.system.iris_ide_runtime import runtime_source_dir, runtime_state_path
 from iris.system.node_runtime import node_executable
 
@@ -69,12 +69,32 @@ def main() -> None:
             client.open_file("hello.py")
             ed = client.get_active_editor()
             assert "hello.py" in str(ed.get("editor", {}).get("path", ""))
-            client.replace_selection("# iris\n", path="hello.py")
+            edited = client.replace_selection("# iris\n", path="hello.py")
+            assert edited.get("via") == "disk" and edited.get("applied") == "append", edited
             assert "# iris" in hello.read_text(encoding="utf-8")
-            term = client.run_terminal_command("echo IRIS_IDE_TEST")
-            assert "IRIS_IDE_TEST" in str(term.get("output", ""))
+            try:
+                client.run_terminal_command("echo IRIS_IDE_TEST")
+                raise AssertionError("terminal without frontend returned success")
+            except IrisIdeClientError as exc:
+                assert "frontend" in str(exc).lower(), exc
             diag = client.get_diagnostics()
-            assert isinstance(diag.get("diagnostics"), list)
+            assert diag.get("reported") is False and diag.get("diagnostics") is None, diag
+            pushed = client.set_diagnostics([])
+            assert pushed.get("reported") is True
+            clean = client.get_diagnostics()
+            assert clean.get("reported") is True and clean.get("diagnostics") == []
+            saved = client.save_file("hello.py")
+            assert saved.get("saved") is True and saved.get("via") == "disk", saved
+            try:
+                client.save_all()
+                raise AssertionError("saveAll without frontend returned success")
+            except IrisIdeClientError as exc:
+                assert "frontend" in str(exc).lower(), exc
+            try:
+                client.start_debug({"name": "Python"})
+                raise AssertionError("debug without frontend returned success")
+            except IrisIdeClientError as exc:
+                assert "hooked" not in str(exc).lower()
         finally:
             if proc.poll() is None:
                 proc.terminate()

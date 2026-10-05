@@ -33,13 +33,12 @@ class IdeUnifiedShell(QWidget):
         self._split = QSplitter(Qt.Orientation.Horizontal, self)
         self._split.setObjectName("IdeUnifiedHSplit")
         self._split.setChildrenCollapsible(False)
-        self._split.setHandleWidth(0)
+        self._split.setHandleWidth(6)
         self._split.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # ponytail: IDE↔Companion 경계 드래그 길이조절 금지 (핸들 0 + 비율 고정)
         self._split.setStyleSheet(
             "QSplitter#IdeUnifiedHSplit { background: transparent; }"
             "QSplitter#IdeUnifiedHSplit::handle {"
-            " width: 0; max-width: 0; margin: 0; border: none; background: transparent;"
+            " width: 6px; margin: 0; border: none; background: rgba(255,255,255,0.22);"
             "}"
         )
 
@@ -47,6 +46,7 @@ class IdeUnifiedShell(QWidget):
         self._ide_host.setObjectName("IdeUnifiedIdeHost")
         self._ide_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._ide_host.setStyleSheet(f"background-color: {TOKENS.void_black};")
+        self._ide_host.setMinimumWidth(240)
         self._ide_lay = QVBoxLayout(self._ide_host)
         # ponytail: Companion grip 모드에선 0 — 기본은 좌/하단 8px (activity/status 여유)
         self._ide_lay.setContentsMargins(8, 0, 0, 8)
@@ -57,6 +57,7 @@ class IdeUnifiedShell(QWidget):
         self._iris_host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._iris_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self._iris_host.setStyleSheet("background: transparent;")
+        self._iris_host.setMinimumWidth(160)
         self._iris_lay = QVBoxLayout(self._iris_host)
         self._iris_lay.setContentsMargins(0, 0, 0, 0)
         self._iris_lay.setSpacing(0)
@@ -74,7 +75,8 @@ class IdeUnifiedShell(QWidget):
         self._ide: QWidget | None = None
         self._companion: IdeCompanionPage | None = None
         self._on_split_changed = None
-        self._split.splitterMoved.connect(self._lock_ratio)
+        self._user_ratio: float | None = None
+        self._split.splitterMoved.connect(self._remember_split)
 
     def set_split_changed_callback(self, cb) -> None:
         """좌측 host 폭 변경 시 HWND 도킹 sync 등."""
@@ -101,16 +103,28 @@ class IdeUnifiedShell(QWidget):
         companion.show()
         self.apply_ratio(total_w)
 
-    def apply_ratio(self, total_w: int, ratio: float = _UNIFIED_IDE_RATIO) -> None:
+    def reset_user_ratio(self) -> None:
+        """컴패니언에 새로 들어갈 때만 8:2로 되돌린다."""
+        self._user_ratio = None
+
+    def split_handle_width(self) -> int:
+        return int(self._split.handleWidth())
+
+    def apply_ratio(self, total_w: int, ratio: float | None = None) -> None:
+        use = self._user_ratio if ratio is None else ratio
+        if use is None:
+            use = _UNIFIED_IDE_RATIO
+        use = min(0.88, max(0.5, float(use)))
         w = max(1, int(total_w))
-        ide_w = int(w * ratio)
+        ide_w = int(w * use)
         iris_w = w - ide_w
         self._split.setSizes([ide_w, max(1, iris_w)])
 
-    def _lock_ratio(self, *_args) -> None:
-        # ponytail: 핸들 폭 0이어도 드래그되면 8:2로 되돌림
-        total = sum(self._split.sizes()) or self.width()
-        self.apply_ratio(total)
+    def _remember_split(self, *_args) -> None:
+        sizes = self._split.sizes()
+        total = sum(sizes)
+        if total > 0:
+            self._user_ratio = sizes[0] / total
         cb = self._on_split_changed
         if callable(cb):
             cb()

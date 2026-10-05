@@ -63,6 +63,9 @@ class UnsupportedAttachmentTypeError(ValueError):
         self.suffix = suffix
 
 
+_SKIP_HTML = {"script", "style", "noscript", "nav", "header", "footer", "aside"}
+
+
 class _HtmlTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -72,7 +75,7 @@ class _HtmlTextExtractor(HTMLParser):
         self.title = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in ("script", "style", "noscript"):
+        if tag in _SKIP_HTML:
             self._skip += 1
             return
         if tag == "title":
@@ -81,7 +84,7 @@ class _HtmlTextExtractor(HTMLParser):
             self._chunks.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in ("script", "style", "noscript") and self._skip:
+        if tag in _SKIP_HTML and self._skip:
             self._skip -= 1
         if tag == "title":
             self._in_title = False
@@ -390,6 +393,51 @@ def fetch_firecrawl_text(url: str, *, timeout: float = 45.0) -> tuple[str, str]:
     return title, md
 
 
+def html_to_article(html: str, *, url: str = "") -> tuple[str, str]:
+    """본문 추출. trafilatura 가 글을 주면 그걸 쓰고, 아니면 메뉴를 뺀 표준 파서."""
+    title, body = _trafilatura_article(html, url)
+    if body.strip():
+        if not title.strip():
+            title = _stdlib_title(html)
+        if not title.strip() and url:
+            title = urlparse(url).netloc
+        return title.strip() or "web page", body.strip()
+    return _stdlib_article(html, url)
+
+
+def _trafilatura_article(html: str, url: str) -> tuple[str, str]:
+    try:
+        import trafilatura
+    except ImportError:
+        return "", ""
+    try:
+        body = trafilatura.extract(
+            html or "",
+            url=url or None,
+            include_comments=False,
+            include_tables=True,
+            favor_precision=True,
+        ) or ""
+        meta = trafilatura.extract_metadata(html or "")
+        title = (getattr(meta, "title", None) or "") if meta is not None else ""
+    except Exception:
+        return "", ""
+    return str(title or "").strip(), str(body or "").strip()
+
+
+def _stdlib_title(html: str) -> str:
+    parser = _HtmlTextExtractor()
+    parser.feed(html or "")
+    return parser.title.strip()
+
+
+def _stdlib_article(html: str, url: str) -> tuple[str, str]:
+    parser = _HtmlTextExtractor()
+    parser.feed(html or "")
+    title = parser.title.strip() or (urlparse(url).netloc if url else "") or "web page"
+    return title, parser.text()
+
+
 def fetch_url_text(url: str, *, timeout: float = 20.0) -> tuple[str, str]:
     last_err: Exception | None = None
     try:
@@ -420,10 +468,7 @@ def _fetch_url_text_stdlib(url: str, *, timeout: float = 20.0) -> tuple[str, str
     if m:
         charset = m.group(1).strip("\"'")
     html = raw.decode(charset, errors="replace")
-    parser = _HtmlTextExtractor()
-    parser.feed(html)
-    title = parser.title.strip() or urlparse(url).netloc or "web page"
-    body = parser.text()
+    title, body = html_to_article(html, url=url)
     if not body:
         raise ValueError("no readable text at URL")
     return title, body

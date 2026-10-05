@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 from pathlib import Path
 
@@ -166,6 +167,42 @@ def composer_chip_label(path: str) -> str:
     return attachment_filename(path)
 
 
+def _chip_icon_src(path: str, *, workspace_root: str = "") -> str:
+    """OS 아이콘을 한 번만 저장. 채팅 HTML img src. 경로는 파일명에 넣지 않는다."""
+    kind = composer_chip_kind(path, workspace_root=workspace_root)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in kind) or "file"
+    dest = Path.home() / ".iris-light" / "chip-icons" / f"{safe}.png"
+    try:
+        if not dest.is_file():
+            pix = composer_chip_icon(path, workspace_root=workspace_root)
+            if pix.isNull():
+                return ""
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not pix.save(str(dest), "PNG"):
+                return ""
+        return f"iris-chip:{safe}"
+    except OSError:
+        return ""
+
+
+def attachment_chip_html(path: str, *, workspace_root: str = "") -> str:
+    """파일 선택·드롭·전송 메시지 공통 칩. 보이는 텍스트는 이름과 형식만."""
+    name = html.escape(composer_chip_label(path))
+    meta = html.escape(composer_chip_meta(path, workspace_root=workspace_root))
+    src = _chip_icon_src(path, workspace_root=workspace_root)
+    icon = (
+        f'<img src="{html.escape(src, quote=True)}" width="16" height="16" /> '
+        if src
+        else ""
+    )
+    return (
+        '<span style="background-color:rgba(56,189,248,0.12);'
+        'border:1px solid rgba(56,189,248,0.28);border-radius:10px;">'
+        f"{icon}{name}"
+        f' <span style="color:#94a3b8;font-size:10px;">{meta}</span></span>'
+    )
+
+
 def composer_chip_icon(path: str, *, workspace_root: str = "") -> QPixmap:
     """칩 아이콘 — OS 파일 아이콘(QFileIconProvider)."""
     raw = (path or "").strip()
@@ -267,11 +304,12 @@ class ComposerAttachmentStrip(QWidget):
         icon_label.setScaledContents(True)
 
         name = composer_chip_label(path)
+        meta_text = composer_chip_meta(path, workspace_root=self._workspace_root)
         label = QLabel(name)
-        label.setToolTip(path)
+        label.setToolTip(f"{name} · {meta_text}")
         label.setStyleSheet("color: #e2e8f0; font-size: 11px; background: transparent; border: none;")
 
-        meta = QLabel(composer_chip_meta(path, workspace_root=self._workspace_root))
+        meta = QLabel(meta_text)
         meta.setObjectName("ComposerAttachmentMeta")
         meta.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
 

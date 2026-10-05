@@ -321,6 +321,8 @@ class SettingsDialog(QDialog):
         )
 
         scroll, content_lay = make_scroll_body()
+        from iris.ui.settings.typography_box import build_typography_box
+        content_lay.addWidget(build_typography_box(db))
 
         conn_box = QGroupBox("연결 (Ollama / Hermes)")
         conn_lay = QVBoxLayout(conn_box)

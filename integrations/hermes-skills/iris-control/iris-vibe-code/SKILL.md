@@ -26,6 +26,16 @@ description: >
    - **Dev server** (`npm start`, `npx vite`, `python -m http.server`, …):
      `project.run` with `{ command: "…" }` (optional `preview_url`) → terminal + browser localhost.
 5. Confirm from invoke result: `visible`, `typed`, `ide_terminal` / `browser`.
+6. **Read the editor before claiming a fix:**
+   `ide.diagnostics`. `reported: false` means markers were not pushed — do not say there are no problems.
+   An empty `diagnostics` list is clean only when `reported` is true.
+   Symbols, references, and definition: `ide.symbols`, `ide.references`, `ide.definition`.
+   Do not invent locations when `ok` is false.
+7. **Change the open buffer:** `ide.edit` (`op=insert|replace_selection|replace_range|apply`, `text`, optional `path`).
+   `via=editor` is the buffer. `via=disk` with `applied=append` is not a selection replace — say so.
+   Then `ide.save` (`path`, or `all=true`). `via=editor` flushed the buffer.
+8. **Task / debug:** `ide.task` needs `name` from tasks.json. `ide.debug` `op=start` needs `name` (launch configuration); `op=stop` or `continue`.
+   No session or no task is not success.
 
 ## Do not
 
@@ -33,3 +43,4 @@ description: >
 - Do not use `cursor`/`code` CLI alone to write or run.
 - Do not open run logs as files in the editor — terminal only.
 - Do not double-run the same command.
+- Do not say the buffer, the problems list, or a debug session changed unless that action returned ok.

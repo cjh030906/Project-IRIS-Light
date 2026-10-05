@@ -80,3 +80,73 @@ class WikiImportWorker(QThread):
             self.finished_err.emit(str(exc))
             return
         self.finished_ok.emit(result)
+
+
+class WikiCommandWorker(QThread):
+    """요약·문단 번역이 필요한 위키 명령. 모델 호출은 UI 스레드 밖."""
+
+    finished_ok = pyqtSignal(dict)
+    finished_err = pyqtSignal(str)
+
+    def __init__(
+        self,
+        wiki: IrisWiki,
+        command: object,
+        *,
+        model: str = "",
+        ollama_base_url: str = "",
+        db=None,
+        project_root: str = "",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._wiki = wiki
+        self._command = command
+        self._model = model
+        self._ollama_base_url = ollama_base_url
+        self._db = db
+        self._project_root = project_root
+
+    def run(self) -> None:
+        try:
+            from iris.knowledge.wiki_command import WikiCommand
+            from iris.knowledge.wiki_ops import execute_wiki_command
+            from iris.knowledge.wiki_summarize import summarize_for_wiki, translate_for_wiki
+
+            command = self._command
+            if not isinstance(command, WikiCommand):
+                raise RuntimeError("wiki command required")
+            model = (self._model or "").strip()
+            base = (self._ollama_base_url or "http://127.0.0.1:11434/v1").strip()
+            if command.needs_model() and not model:
+                raise RuntimeError("요약·번역에는 모델 선택이 필요합니다.")
+
+            def _sum(text: str) -> str:
+                return summarize_for_wiki(text, model=model, ollama_base_url=base)
+
+            def _tr(text: str) -> str:
+                return translate_for_wiki(text, model=model, ollama_base_url=base)
+
+            filing: dict = {}
+            if self._db is not None:
+                from iris.knowledge.wiki_filing import filing_kwargs
+                from iris.storage.failover_prefs import load_history_settings
+
+                filing = filing_kwargs(
+                    db=self._db,
+                    base_url=base,
+                    history_settings=load_history_settings(self._db),
+                    model=model,
+                    project_root=self._project_root,
+                )
+            result = execute_wiki_command(
+                self._wiki,
+                command,
+                summarize_fn=_sum if command.summarize else None,
+                translate_fn=_tr if command.translate else None,
+                filing=filing,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.finished_err.emit(str(exc))
+            return
+        self.finished_ok.emit(result)

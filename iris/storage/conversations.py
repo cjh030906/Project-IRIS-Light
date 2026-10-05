@@ -44,6 +44,7 @@ class ChatMessage:
     role: str
     content: str
     created_at: str
+    model_content: str = ""
 
 
 def _now() -> str:
@@ -132,24 +133,6 @@ def _is_topic_line(text: str) -> bool:
     if _FOLLOWUP_RE.match(body) and len(tokens) < 4:
         return False
     return len(tokens) >= 2
-
-
-def topic_shifted(anchor: str, later: list[str]) -> bool:
-    """later 가 anchor 와 다른 주제로 넘어갔는지."""
-    if not later:
-        return False
-    a = _tokens(anchor)
-    b = _tokens(" ".join(later))
-    if len(b) < 3:
-        return False
-    shared = a & b
-    novel = b - a
-    if len(novel) < 3:
-        return False
-    lead = " ".join(later[0].split())
-    if _FOLLOWUP_RE.match(lead) and len(novel) < 5:
-        return False
-    return len(novel) >= max(3, 2 * len(shared))
 
 
 def _anchor_line(texts: list[str]) -> str:
@@ -261,10 +244,68 @@ def _user_lines(messages: list[ChatMessage] | list[dict[str, str]]) -> list[str]
     users: list[str] = []
     for msg in messages:
         role, content = _message_parts(msg)
-        body = content.strip()
+        body = _title_user_text(content)
         if role == "user" and body:
             users.append(body)
     return users
+
+
+def _title_user_text(text: str) -> str:
+    """제목 재료에서 첨부 표식과 그 뒤 본문을 뺀다."""
+    body = text or ""
+    for mark in ("[첨부 파일]", "[자료 본문]"):
+        at = body.find(mark)
+        if at >= 0:
+            body = body[:at]
+    body = re.sub(r'\s*@"[^"]*"', " ", body)
+    return " ".join(body.split())
+
+
+def _reply_texts(messages: list[ChatMessage] | list[dict[str, str]]) -> list[str]:
+    replies: list[str] = []
+    for msg in messages:
+        role, content = _message_parts(msg)
+        if role != "assistant":
+            continue
+        body = (content or "").replace(INTERRUPTED_NOTE, "\n").strip()
+        if body:
+            replies.append(body)
+    return replies
+
+
+def _question_echo(raw: str, title: str) -> bool:
+    """조사·요청어만 빠져 질문과 같은 제목이면 True. 새 단어나 두 단어 이하 핵심은 False."""
+    raw_s = " ".join((raw or "").split())
+    title_s = " ".join((title or "").split())
+    if not title_s or title_s == raw_s:
+        return True
+    title_tokens = [tok for tok in title_s.split() if tok != "및"]
+    if any(tok not in raw_s for tok in title_tokens):
+        return False
+    # 「IRIS 구조」처럼 두 단어 이하로 줄인 핵심은 질문 전문이 아니다.
+    if len(title_tokens) <= 2 and len(raw_s) > len(title_s) + 2:
+        return False
+    return True
+
+
+def _first_reply_title(
+    messages: list[ChatMessage] | list[dict[str, str]],
+) -> str:
+    seen_user = False
+    for msg in messages:
+        role, content = _message_parts(msg)
+        if role == "user" and _title_user_text(content):
+            seen_user = True
+            continue
+        if not seen_user or role != "assistant":
+            continue
+        body = (content or "").replace(INTERRUPTED_NOTE, "\n").strip()
+        if not body:
+            continue
+        title = summarize_reply(body)
+        if title not in ("", DEFAULT_TITLE):
+            return title
+    return DEFAULT_TITLE
 
 
 def suggest_title(
@@ -272,19 +313,21 @@ def suggest_title(
     *,
     basis: str = TITLE_BASIS_LAST,
 ) -> str:
-    """작업 내용을 짧게 요약. first는 첫 주제, last는 마지막으로 바뀐 주제."""
+    """last는 최근 답변의 첫 문장. first는 첫 질문의 작업 제목, 아니면 그 답변."""
+    if basis != TITLE_BASIS_FIRST:
+        replies = _reply_texts(messages)
+        if not replies:
+            return DEFAULT_TITLE
+        title = summarize_reply(replies[-1])
+        return title if title not in ("", DEFAULT_TITLE) else DEFAULT_TITLE
     users = _user_lines(messages)
     if not users:
         return DEFAULT_TITLE
-    start = 0
-    if basis != TITLE_BASIS_FIRST:
-        for i in range(1, len(users)):
-            if topic_shifted(users[start], [users[i]]):
-                start = i
-    anchor = _anchor_line(users[start:])
-    if not _is_topic_line(anchor):
-        return DEFAULT_TITLE
-    return summarize_work_title(anchor) or DEFAULT_TITLE
+    anchor = _anchor_line(users)
+    work = summarize_work_title(anchor) if _is_topic_line(anchor) else ""
+    if work and not _question_echo(anchor, work):
+        return work
+    return _first_reply_title(messages)
 
 
 def ensure_chat_schema(db: Database) -> None:
@@ -328,6 +371,14 @@ def ensure_chat_schema(db: Database) -> None:
         "UPDATE chat_conversations SET title = ? WHERE title = ? AND title_locked = 0",
         (DEFAULT_TITLE, summarize_reply(INTERRUPTED_NOTE)),
     )
+    message_cols = {
+        str(row["name"])
+        for row in db._execute("PRAGMA table_info(chat_messages)").fetchall()
+    }
+    if "model_content" not in message_cols:
+        db._execute(
+            "ALTER TABLE chat_messages ADD COLUMN model_content TEXT NOT NULL DEFAULT ''"
+        )
     db._commit()
 
 
@@ -446,7 +497,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
     ensure_chat_schema(db)
     rows = db._execute(
         """
-        SELECT id, conversation_id, role, content, created_at
+        SELECT id, conversation_id, role, content, created_at, model_content
           FROM chat_messages
          WHERE conversation_id = ?
          ORDER BY id ASC
@@ -460,6 +511,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
             role=str(row["role"] or ""),
             content=str(row["content"] or ""),
             created_at=str(row["created_at"] or ""),
+            model_content=str(row["model_content"] or ""),
         )
         for row in rows
     ]
@@ -467,7 +519,7 @@ def list_messages(db: Database, conversation_id: int) -> list[ChatMessage]:
 
 def history_dicts(db: Database, conversation_id: int) -> list[dict[str, str]]:
     return [
-        {"role": m.role, "content": m.content}
+        {"role": m.role, "content": m.content, **({"model_content": m.model_content} if m.model_content else {})}
         for m in list_messages(db, conversation_id)
         if m.role in ("user", "assistant")
     ]
@@ -486,47 +538,12 @@ def _set_title(
     )
 
 
-def _maybe_refresh_title(db: Database, conversation_id: int) -> None:
-    """임시 제목은 첫 응답 뒤에 한 번 요약. 사용자가 잠그면 유지. 주제가 바뀌면 다시 요약."""
-    conv = get_conversation(db, conversation_id)
-    if conv is None or conv.title_locked:
-        return
-    messages = list_messages(db, conversation_id)
-    if not any(m.role == "assistant" and m.content.strip() for m in messages):
-        return
-    basis = load_title_basis(db)
-    suggested = suggest_title(messages, basis=basis)
-    if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
-        return
-    if conv.title in ("", DEFAULT_TITLE):
-        _set_title(db, conversation_id, suggested, locked=False)
-        return
-    if basis == TITLE_BASIS_FIRST:
-        return
-    users = [
-        m.content.strip()
-        for m in messages
-        if m.role == "user" and m.content.strip()
-    ]
-    anchor = _anchor_line(users) if users else ""
-    if anchor and topic_shifted(anchor, [users[-1]]):
-        _set_title(db, conversation_id, suggested, locked=False)
-
-
 def refresh_conversation_title(db: Database, conversation_id: int) -> None:
-    """설정 변경 직후, 잠기지 않은 제목을 현재 기준으로 다시 맞춘다."""
-    ensure_chat_schema(db)
-    conv = get_conversation(db, conversation_id)
-    if conv is None or conv.title_locked:
-        return
-    messages = list_messages(db, conversation_id)
-    if not any(m.role == "assistant" and m.content.strip() for m in messages):
-        return
-    suggested = suggest_title(messages, basis=load_title_basis(db))
-    if suggested in ("", DEFAULT_TITLE) or suggested == conv.title:
-        return
-    _set_title(db, conversation_id, suggested, locked=False)
-    db._commit()
+    """기준만 저장한다. 이미 붙은 제목을 문장 자르기로 다시 쓰지 않는다.
+
+    다음 답변을 만들 때 모델이 그 기준으로 제목을 붙인다.
+    """
+    del db, conversation_id
 
 
 def rename_conversation(db: Database, conversation_id: int, title: str) -> str:
@@ -543,22 +560,20 @@ def rename_conversation(db: Database, conversation_id: int, title: str) -> str:
     return name
 
 
-def append_message(db: Database, conversation_id: int, role: str, content: str) -> int:
+def append_message(db: Database, conversation_id: int, role: str, content: str, *, model_content: str = "") -> int:
     ensure_chat_schema(db)
     stamp = _now()
     cur = db._execute(
         """
-        INSERT INTO chat_messages(conversation_id, role, content, created_at)
-        VALUES(?, ?, ?, ?)
+        INSERT INTO chat_messages(conversation_id, role, content, created_at, model_content)
+        VALUES(?, ?, ?, ?, ?)
         """,
-        (int(conversation_id), str(role or ""), str(content or ""), stamp),
+        (int(conversation_id), str(role or ""), str(content or ""), stamp, model_content),
     )
     db._execute(
         "UPDATE chat_conversations SET updated_at = ? WHERE id = ?",
         (stamp, int(conversation_id)),
     )
-    if str(role) in ("user", "assistant") and (content or "").strip():
-        _maybe_refresh_title(db, conversation_id)
     db._commit()
     return int(cur.lastrowid or 0)
 
