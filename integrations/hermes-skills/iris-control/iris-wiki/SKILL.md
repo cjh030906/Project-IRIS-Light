@@ -41,13 +41,15 @@ User notes live under `~/.iris-light/iris-wiki/` and appear in the UI as `user/.
 4. Confirm with the returned `rel_path` (e.g. `user/학습자료/수학/note.md`).
 5. Search saved notes: `wiki.search` with `query`. This is not conversation History.
 6. If the user only wants to open an existing note: `wiki.open_note` with `rel_path`.
-7. List notes: `wiki.list_notes`. Reload UI: `wiki.reload`.
+7. List notes: `wiki.list_notes`. The result `total` is the whole vault. `truncated` means this page is not the whole list. Reload UI: `wiki.reload`.
+8. Move or classify notes that already exist: `wiki.move_notes` with `sources` (file or folder rel_paths) and `dest_folder`. Iris copies the same bytes and deletes the sources. Folder sources keep their folder name under `dest_folder`. Do not rewrite those notes with `wiki.write_user_note`.
 
 ## Rules
 
 - Explaining a PDF, file, folder, or link is not a wiki save. If the user message contains `[자료 본문]`, answer from that excerpt. Do not ask for page screenshots first. Do not say PDF text cannot be read.
 - Saving the chat as a PDF file is `note.export_pdf`, not this skill. Do not run PyMuPDF, reportlab, or pdf_create.py.
 - Never say “저장했습니다” without a successful `wiki.write_user_note` or `wiki.import_content` result.
+- Never say notes were moved or classified out of inbox unless `wiki.move_notes` returns ok and `left` is empty. A shorter new file is not a move.
 - Local Iris may handle save without MCP when user attaches a file or pastes a URL with save intent.
 - Prefer `mode=summarize` when user asks to 요약/정리; default `raw` for full capture.
 - Do not write under `docs/` — user wiki only.

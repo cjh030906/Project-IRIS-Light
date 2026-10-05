@@ -1,6 +1,6 @@
 """연번 12 — 액션 이름·계약은 같고 등록만 기능별로 나뉘었는지.
 
-카탈로그 스냅샷은 register() 와 같다. 115건.
+카탈로그 스냅샷은 register() 와 같다. 131건.
 """
 
 from __future__ import annotations
@@ -94,6 +94,8 @@ def check_threads() -> None:
     assert runs_off_ui_thread("emulator.tap") is True
     assert runs_off_ui_thread("email.list_messages") is True
     assert runs_off_ui_thread("ide.open_file") is False
+    assert runs_off_ui_thread("ide.diagnostics") is True
+    assert runs_off_ui_thread("ide.edit") is True
     assert runs_off_ui_thread("settings.set") is False
 
 
@@ -116,7 +118,7 @@ def main() -> None:
     before = json.loads(_CATALOG.read_text(encoding="utf-8"))
     assert got == before, "action catalog drifted"
     names = [a["name"] for a in got]
-    assert len(names) == len(set(names)) == 115
+    assert len(names) == len(set(names)) == 131
     check_invalid_and_write(reg, window)
     check_threads()
     check_summary_and_modules()

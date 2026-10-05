@@ -90,7 +90,7 @@ def _assert_layout_orb_a_structure(app: QApplication) -> None:
     assert not hasattr(companion, "_v_split")
     assert live.parent() is companion
     assert chat.parent() is companion
-    assert shell._split.handleWidth() == 0
+    assert shell._split.handleWidth() == 6
 
     # A: release + embed into spacer
     root.set_orb_above_ui(False)
@@ -188,7 +188,9 @@ def main() -> int:
     shell.mount(None, companion, total_w=1000)
     app.processEvents()
     sizes = shell._split.sizes()
-    assert sizes[0] == 800 and sizes[1] == 200, sizes
+    total = sum(sizes) or 1
+    assert abs(sizes[0] / total - 0.8) < 0.02, sizes
+    assert shell.split_handle_width() == 6
     ide2.set_embedded(True, host=shell)
     assert ide2.is_embedded()
     assert ide2.isWindow()

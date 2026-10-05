@@ -17,11 +17,14 @@ const wantPort = parseInt(process.env.IRIS_IDE_BRIDGE_PORT || '0', 10);
 const stateFile = (process.env.IRIS_IDE_STATE_FILE || '').trim();
 
 let editorState = null;
+let openEditors = [];
 let pendingCommands = [];
 let commandResults = {};
 let nextCommandId = 1;
 let boundPort = 0;
 let lastFrontendPollAt = 0;
+// null = 프런트가 마커를 아직 안 읽음. [] 는 읽었는데 문제가 없을 때만.
+let diagnosticsReport = null;
 
 function writeState(port) {
     boundPort = port || boundPort;
@@ -62,8 +65,22 @@ function resolvePath(rel) {
 /** 식별자(path|uri) 없는 상태는 「편집기 없음」이다 — 프런트엔드는 편집기가 닫히면 {}를 보낸다. */
 function normalizeEditorState(info) {
     if (!info || typeof info !== 'object' || Array.isArray(info)) return null;
-    const hasId = Boolean(String(info.path || '').trim() || String(info.uri || '').trim());
-    return hasId ? info : null;
+    const copy = Object.assign({}, info);
+    delete copy.editors;
+    const hasId = Boolean(String(copy.path || '').trim() || String(copy.uri || '').trim());
+    return hasId ? copy : null;
+}
+
+function normalizeEditorList(list, fallback) {
+    const out = [];
+    if (Array.isArray(list)) {
+        for (const item of list) {
+            const row = normalizeEditorState(item);
+            if (row) out.push(row);
+        }
+    }
+    if (!out.length && fallback) out.push(fallback);
+    return out;
 }
 
 function readBody(req) {
@@ -116,10 +133,77 @@ function waitForFrontendCommand(id, timeoutMs = 30000) {
     });
 }
 
-function enqueueFrontend(cmd, args, timeoutMs = 30000) {
+function waitForPoll(ms) {
+    return new Promise(resolve => {
+        const start = Date.now();
+        const tick = () => {
+            if (lastFrontendPollAt || Date.now() - start >= ms) {
+                resolve(Boolean(lastFrontendPollAt));
+                return;
+            }
+            setTimeout(tick, 80);
+        };
+        setTimeout(tick, 80);
+    });
+}
+
+async function enqueueFrontend(cmd, args, timeoutMs = 30000, pollWaitMs = 800) {
+    if (!lastFrontendPollAt) {
+        const seen = await waitForPoll(pollWaitMs);
+        if (!seen) {
+            throw new Error('no frontend poll yet — is IRIS IDE Theia loaded?');
+        }
+    }
     const id = nextCommandId++;
     pendingCommands.push({ id, cmd, args: args || {} });
     return waitForFrontendCommand(id, timeoutMs);
+}
+
+function readExitLog(cwd, timeoutMs) {
+    const log = path.join(cwd || workspaceRoot, '.iris', 'last_run.log');
+    const deadline = Date.now() + timeoutMs;
+    const pull = () => {
+        if (!fs.existsSync(log)) return '';
+        return fs.readFileSync(log, 'utf8');
+    };
+    return new Promise(resolve => {
+        const tick = () => {
+            const text = pull();
+            const match = text.match(/^IRIS_EXIT:(-?\d+)\s*$/m);
+            if (match) {
+                const output = text.replace(/^IRIS_EXIT:(-?\d+)\s*$/m, '').trim().slice(0, 8000);
+                resolve({ completed: true, exit_code: parseInt(match[1], 10), output });
+                return;
+            }
+            if (Date.now() >= deadline) {
+                resolve({ completed: false, exit_code: null, output: text.trim().slice(0, 8000) });
+                return;
+            }
+            setTimeout(tick, 200);
+        };
+        tick();
+    });
+}
+
+function diskEdit(cmd, args) {
+    const rel = String(args.path || editorState?.path || '');
+    const abs = resolvePath(rel);
+    let text = fs.readFileSync(abs, 'utf8');
+    const insert = String(args.text ?? args.content ?? '');
+    let applied = 'replace';
+    if (cmd === 'insertText' || cmd === 'replaceSelection') {
+        text += insert;
+        applied = 'append';
+    } else if (cmd === 'replaceRange') {
+        const start = parseInt(String(args.start || 0), 10) || 0;
+        const end = parseInt(String(args.end || text.length), 10) || text.length;
+        text = text.slice(0, start) + insert + text.slice(end);
+        applied = 'range';
+    } else {
+        text = insert;
+    }
+    fs.writeFileSync(abs, text, 'utf8');
+    return { path: abs, length: text.length, via: 'disk', applied };
 }
 
 async function dispatch(cmd, args) {
@@ -144,6 +228,7 @@ async function dispatch(cmd, args) {
         }
         case 'setEditorState':
             editorState = normalizeEditorState(args);
+            openEditors = normalizeEditorList(args.editors, editorState);
             return { saved: true };
         case 'pollPendingCommands': {
             lastFrontendPollAt = Date.now();
@@ -163,13 +248,17 @@ async function dispatch(cmd, args) {
         case 'getActiveEditor':
             return { editor: editorState };
         case 'getOpenEditors':
-            return { editors: editorState ? [editorState] : [] };
+            return { editors: openEditors };
         case 'getCursorPosition':
             return { line: editorState?.line || 1, column: editorState?.column || 1 };
         case 'getSelection':
             return { selection: editorState?.selection || null };
+        case 'setDiagnostics':
+            diagnosticsReport = Array.isArray(args.diagnostics) ? args.diagnostics : [];
+            return { reported: true, count: diagnosticsReport.length };
         case 'getDiagnostics':
-            return { diagnostics: [] };
+            if (diagnosticsReport === null) return { diagnostics: null, reported: false };
+            return { diagnostics: diagnosticsReport, reported: true };
         case 'openFile':
         case 'gotoFile': {
             const rel = String(args.path || '');
@@ -183,8 +272,28 @@ async function dispatch(cmd, args) {
             }
         }
         case 'saveFile':
-        case 'saveAll':
-            return { saved: true };
+        case 'saveAll': {
+            let front;
+            try {
+                front = await enqueueFrontend(cmd, args, 4000);
+            } catch (err) {
+                const missing = String(err && err.message || err).includes('no frontend poll');
+                if (!missing || cmd === 'saveAll') throw err;
+                front = { noEditor: true };
+            }
+            if (front && front.noEditor) {
+                if (cmd === 'saveAll') throw new Error('no open editor to save');
+                const rel = String(args.path || editorState?.path || '');
+                if (!rel) throw new Error('no open editor to save');
+                const abs = resolvePath(rel);
+                if (!fs.existsSync(abs)) throw new Error(`file not found: ${rel}`);
+                return { path: abs, saved: true, via: 'disk', editor: false };
+            }
+            if (!front || front.saved !== true) {
+                throw new Error(String((front && front.reason) || 'save failed'));
+            }
+            return front;
+        }
         case 'createFile': {
             const rel = String(args.path || '');
             const abs = resolvePath(rel);
@@ -208,26 +317,20 @@ async function dispatch(cmd, args) {
         case 'applyTextEdit':
         case 'insertText':
         case 'replaceRange': {
-            const rel = String(args.path || editorState?.path || '');
-            const abs = resolvePath(rel);
-            let text = fs.readFileSync(abs, 'utf8');
-            const insert = String(args.text ?? args.content ?? '');
-            if (cmd === 'insertText' || cmd === 'replaceSelection') text += insert;
-            else if (cmd === 'replaceRange') {
-                const start = parseInt(String(args.start || 0), 10) || 0;
-                const end = parseInt(String(args.end || text.length), 10) || text.length;
-                text = text.slice(0, start) + insert + text.slice(end);
-            } else text = insert;
-            fs.writeFileSync(abs, text, 'utf8');
-            return { path: abs, length: text.length };
+            try {
+                const edited = await enqueueFrontend(cmd, args, 4000);
+                if (!edited || !edited.noEditor) return edited;
+            } catch (err) {
+                if (!String(err && err.message || err).includes('no frontend poll')) throw err;
+            }
+            return diskEdit(cmd, args);
         }
         case 'formatDocument':
-            return { formatted: false };
         case 'gotoLine':
-            return { line: parseInt(String(args.line || 1), 10) || 1 };
         case 'gotoSymbol':
         case 'findReferences':
-            return { items: [] };
+        case 'gotoDefinition':
+            return await enqueueFrontend(cmd, args, 8000);
         case 'createTerminal':
             try {
                 return await enqueueFrontend('createTerminal', { name: String(args.name || 'IRIS') }, 3500);
@@ -242,18 +345,19 @@ async function dispatch(cmd, args) {
             }
             const cwd = args.cwd ? String(args.cwd) : workspaceRoot;
             // ponytail: execSync 폴백 금지 — Hermes/브릿지 셸이 아니라 Theia 통합 터미널만.
-            return await enqueueFrontend('runTerminalCommand', { command, cwd, argv }, 15000);
+            const sent = await enqueueFrontend('runTerminalCommand', { command, cwd, argv }, 15000);
+            const log = await readExitLog(cwd, 12000);
+            return { ...sent, ...log, queued: false };
         }
         case 'getTerminalState':
-            return { active: pendingCommands.some(c => c.cmd === 'runTerminalCommand') };
+            return await enqueueFrontend('getTerminalState', {}, 3000);
         case 'runTask':
-            return { started: false };
         case 'getTaskState':
-            return { running: false };
         case 'startDebug':
         case 'stopDebug':
         case 'continueDebug':
-            return { hooked: true };
+        case 'pluginLoaded':
+            return await enqueueFrontend(cmd, args, cmd === 'pluginLoaded' ? 8000 : 20000, cmd === 'pluginLoaded' ? 7000 : 800);
         case 'getGitStatus':
             try {
                 return { porcelain: execSync('git status --porcelain', { cwd: workspaceRoot, encoding: 'utf8' }) };

@@ -25,6 +25,7 @@ from PyQt6.QtGui import (
     QTextBlockFormat,
     QTextCursor,
     QTextOption,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -48,6 +49,8 @@ _ROLE_PROVIDER_NAME = int(Qt.ItemDataRole.UserRole) + 3
 _COLOR_MODEL_DEFAULT = QColor("#38bdf8")  # 도구 지원·일반 선택 가능 — 밝은 푸른색
 _COLOR_MODEL_NO_TOOLS = QColor("#9ca3af")  # 도구 미지원 — 회색
 _COLOR_MODEL_PRO = QColor("#fca5a5")  # Pro/구독 — 옅은 붉은색
+# 이 픽셀 안으로 돌아오면 다시 답변 시작 줄에 붙인다.
+_SCROLL_HOLD_SLACK = 24
 
 from iris.core.activity_privacy import prepare_chat_text
 from iris.core.chat_block_parser import (
@@ -611,6 +614,7 @@ class ChatLogTextEdit(QTextEdit):
     hermes_update_action_clicked = pyqtSignal(str)  # apply | later
     ollama_login_clicked = pyqtSignal()
     files_attached = pyqtSignal(list)
+    scrolled_by_user = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -672,6 +676,11 @@ class ChatLogTextEdit(QTextEdit):
         if forwarded is not None:
             return forwarded
         return super().eventFilter(watched, event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        super().wheelEvent(event)
+        # 픽셀 휠은 스크롤바 actionTriggered를 안 낸다. 출력 중 위치 고정 해제용.
+        self.scrolled_by_user.emit()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _mime_has_attachable(event.mimeData()):
@@ -1383,6 +1392,12 @@ class ChatPanel(QWidget):
         self._typing_body_start: int | None = None
         self._typing_render_markdown = False
         self._typing_anchor_y: int | None = None
+        # 출력 중 사용자가 휠로 벗어나면 앵커로 끌어당기지 않는다.
+        self._scroll_user_hold = False
+        self._scroll_follow_tail = False
+        self._scroll_hold_value: int | None = None
+        self._scroll_programmatic = 0
+        self._applying_held_scroll = False
         # ponytail: speech_sync=True인데도 TTS 재생 시작 타이밍까지 타이핑이 자동으로 시작되면
         # "TTS 완성 후 텍스트 표시" 요구사항이 깨진다.
         self._typing_wait_for_tts_completion = False
@@ -1428,6 +1443,9 @@ class ChatPanel(QWidget):
         self._log.hermes_update_action_clicked.connect(self.hermes_update_action_clicked.emit)
         self._log.ollama_login_clicked.connect(self.ollama_login_clicked.emit)
         self._log.files_attached.connect(self._on_composer_drop_paths)
+        self._log.scrolled_by_user.connect(self._note_user_log_scroll)
+        self._log.verticalScrollBar().actionTriggered.connect(self._on_log_scroll_action)
+        self._log.verticalScrollBar().rangeChanged.connect(self._reapply_held_log_scroll)
 
         self._height_handle = _ChatHeightHandle()
         self._height_handle.drag_started.connect(self._begin_height_drag)
@@ -2246,30 +2264,91 @@ class ChatPanel(QWidget):
         """새 메시지·음성 인식 결과가 항상 보이도록 출력창을 맨 아래로 스크롤.
 
         타이핑 앵커가 잡혀 있으면 맨 아래 대신 답변 시작 줄에서 멈춘다.
+        사용자가 휠로 벗어나면 그 위치를 유지하고, 맨 아래까지 내리면 새 글을 따라간다.
         """
 
         def _do_scroll() -> None:
             bar = self._log.verticalScrollBar()
-            if self._typing_anchor_y is not None:
-                # 답변 시작 줄이 화면 상단에 올 때까지만 내려가고 그 뒤로는 고정.
-                # 아래로만 이동 — 사용자가 직접 더 내려서 읽는 중이면 끌어당기지 않는다.
-                target = min(self._typing_anchor_y, bar.maximum())
-                if bar.value() < target:
-                    bar.setValue(target)
-                return
-            cursor = self._log.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self._log.setTextCursor(cursor)
-            self._log.ensureCursorVisible()
-            bar.setValue(bar.maximum())
+            self._scroll_programmatic += 1
+            try:
+                if self._typing_anchor_y is not None:
+                    if self._scroll_user_hold and self._scroll_hold_value is not None:
+                        bar.setValue(min(self._scroll_hold_value, bar.maximum()))
+                        return
+                    if self._scroll_follow_tail:
+                        bar.setValue(bar.maximum())
+                        return
+                    # 답변 시작 줄이 화면 상단에 올 때까지만 내려가고 그 뒤로는 고정.
+                    target = min(self._typing_anchor_y, bar.maximum())
+                    if bar.value() < target:
+                        bar.setValue(target)
+                    return
+                cursor = self._log.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self._log.setTextCursor(cursor)
+                self._log.ensureCursorVisible()
+                bar.setValue(bar.maximum())
+            finally:
+                self._scroll_programmatic -= 1
 
         if deferred:
             QTimer.singleShot(0, _do_scroll)
         else:
             _do_scroll()
 
+    def _on_log_scroll_action(self, _action: int) -> None:
+        self._note_user_log_scroll()
+
+    def _note_user_log_scroll(self) -> None:
+        """휠·키로 로그를 움직이면 출력 중 앵커 고정을 놓는다."""
+        if self._scroll_programmatic or self._typing_anchor_y is None:
+            return
+        bar = self._log.verticalScrollBar()
+        value = bar.value()
+        anchor = min(self._typing_anchor_y, bar.maximum())
+        if abs(value - anchor) <= _SCROLL_HOLD_SLACK:
+            self._scroll_user_hold = False
+            self._scroll_follow_tail = False
+            self._scroll_hold_value = None
+            return
+        # 맨 아래를 보고 있으면 이어지는 글을 따라간다. 그 사이는 둔 자리에 둔다.
+        if (
+            bar.maximum() > anchor + _SCROLL_HOLD_SLACK
+            and value >= bar.maximum() - _SCROLL_HOLD_SLACK
+        ):
+            self._scroll_user_hold = False
+            self._scroll_follow_tail = True
+            self._scroll_hold_value = None
+            return
+        self._scroll_user_hold = True
+        self._scroll_follow_tail = False
+        self._scroll_hold_value = value
+
+    def _reapply_held_log_scroll(self, _minimum: int, maximum: int) -> None:
+        """본문을 다시 그릴 때 문서가 줄었다 늘며 스크롤이 잘리는 것을 되돌린다."""
+        if self._scroll_programmatic or self._applying_held_scroll:
+            return
+        if self._typing_anchor_y is None:
+            return
+        if not self._scroll_user_hold and not self._scroll_follow_tail:
+            return
+        bar = self._log.verticalScrollBar()
+        self._applying_held_scroll = True
+        self._scroll_programmatic += 1
+        try:
+            if self._scroll_user_hold and self._scroll_hold_value is not None:
+                bar.setValue(min(self._scroll_hold_value, maximum))
+            elif self._scroll_follow_tail:
+                bar.setValue(maximum)
+        finally:
+            self._scroll_programmatic -= 1
+            self._applying_held_scroll = False
+
     def _begin_typing_anchor(self) -> None:
         """답변 시작 줄을 기준점으로 잡아 타이핑 중 화면이 계속 밀리지 않게 한다."""
+        self._scroll_user_hold = False
+        self._scroll_follow_tail = False
+        self._scroll_hold_value = None
         self._typing_anchor_y = None
         self._scroll_log_to_bottom()
         QTimer.singleShot(0, self._capture_typing_anchor)

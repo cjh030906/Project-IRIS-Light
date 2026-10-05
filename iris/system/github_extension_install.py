@@ -211,8 +211,17 @@ def install_from_request(
     directory: str | None = None,
     fetch: Callable[[str], RepoSnapshot] | None = None,
     probe_timeout: float = 20.0,
+    project_root: str | None = None,
 ) -> InstallResult:
-    home = (home or hermes_home()).expanduser()
+    if (project_root or "").strip():
+        root = Path(project_root).expanduser().resolve()
+        if not root.is_dir():
+            return InstallResult("refused", "열린 프로젝트 폴더가 없습니다.")
+        home = root / ".iris"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "PROJECT").write_text(str(root), encoding="utf-8")
+    else:
+        home = (home or hermes_home()).expanduser()
     secrets = _accepted_secrets(secrets or {})
     try:
         snap = (fetch or fetch_github)(req.url)
@@ -498,7 +507,7 @@ def _apply_mcps(
         result.mcp_names.append(spec.name)
         result.tools.extend(tools)
         result.mcp_added = True
-        result.config_path = str(home / "config.yaml")
+        result.config_path = str(home / ("mcp.json" if _project_store(home) else "config.yaml"))
         if probe.get("called_tool"):
             result.called_tool = str(probe.get("called_tool"))
             result.call_preview = str(probe.get("call_preview") or "")
@@ -896,7 +905,35 @@ def _write_skill_tree(dest: Path, snap: RepoSnapshot, prefix: str) -> None:
         target.write_text(text, encoding="utf-8")
 
 
+def _project_store(home: Path) -> bool:
+    return (home / "PROJECT").is_file()
+
+
+def _write_project_mcp(home: Path, name: str, block: dict[str, Any]) -> None:
+    path = home / "mcp.json"
+    data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    safe = _safe_name(name)
+    if safe in servers and not _same_server(servers.get(safe), block):
+        raise RuntimeError("기존 설정과 달라 덮어쓰지 않습니다")
+    servers[safe] = block
+    data["mcpServers"] = servers
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _write_server(home: Path, name: str, block: dict[str, Any]) -> None:
+    if _project_store(home):
+        _write_project_mcp(home, name, block)
+        return
     path = home / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = _read_config(home)

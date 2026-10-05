@@ -812,12 +812,30 @@ def host_label_for_hermes(base_url: str) -> str:
 
 
 def _format_tool_progress(obj: dict[str, Any]) -> str:
+    """액션 이름을 status 보다 앞에 둔다. completed 만으로는 성공이 아니다."""
     if not isinstance(obj, dict):
         return ""
-    for key in ("message", "status", "tool", "name", "detail"):
+    name = ""
+    for key in ("tool", "name", "tool_name", "action"):
         val = obj.get(key)
         if isinstance(val, str) and val.strip():
-            return val.strip()
+            name = val.strip()
+            break
+    status = str(obj.get("status") or "").strip()
+    message = str(obj.get("message") or "").strip()
+    if name and status:
+        return f"{name} {status}"
+    if name and message and message != name:
+        return f"{name} {message}"
+    if name:
+        return name
+    if message:
+        return message
+    if status:
+        return status
+    detail = obj.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
     return "tool running"
 
 
@@ -894,6 +912,12 @@ if __name__ == "__main__":
         '{"file_glob":"**/node_modules/typescript","path":"C:/Users/kwakm","target":"files"}'
     )
     assert not _looks_like_tool_args_json('{"answer":"yes"}')
+    assert (
+        _format_tool_progress({"status": "completed", "tool": "wiki.write_user_note"})
+        == "wiki.write_user_note completed"
+    )
+    assert _format_tool_progress({"status": "running"}) == "running"
+    assert _format_tool_progress({"tool": "wiki.open_note", "status": "ok"}) == "wiki.open_note ok"
     assert not _should_emit_assistant_content(
         '{"file_glob":"x"}',
         {"delta": {"content": '{"file_glob":"x"}'}},

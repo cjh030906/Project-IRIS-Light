@@ -186,6 +186,15 @@ class FramelessShell(QWidget):
         for idx in (0, 3, 5):
             self._grips[idx].setVisible(visible)
 
+    def set_inset_content(self, inset: bool) -> None:
+        """도킹 중 8px 검정 테두리를 끈다."""
+        self._inset_content = bool(inset)
+        self._sync_layout()
+
+    def set_grips_visible(self, visible: bool) -> None:
+        for grip in self._grips:
+            grip.setVisible(bool(visible))
+
     def set_companion_grip_mode(self, active: bool) -> None:
         """Companion A: 좌·하단 전폭 grip 숨김 — Theia 터미널/채팅 입력 보호.
 
@@ -237,7 +246,8 @@ class FramelessShell(QWidget):
             grip.raise_()
 
 
-# 윈도우 11 스냅 레이아웃 — 커스텀 □ 위를 HTMAXBUTTON으로 알린다.
+# 윈도우 11 스냅 레이아웃 — 아이리스 □ 위를 HTMAXBUTTON으로 알린다.
+# WS_CAPTION|WS_SYSMENU 는 네이티브 최소화·최대화·닫기를 아이리스 단추 위에 그린다.
 # ponytail: 탐색기 드롭 수신·창 프로시저 교체는 기동 즉사라 여기 두지 않는다.
 _WM_NCCALCSIZE = 0x0083
 _WM_NCHITTEST = 0x0084
@@ -245,7 +255,10 @@ _WM_NCLBUTTONDOWN = 0x00A1
 _WM_NCLBUTTONUP = 0x00A2
 _HTMAXBUTTON = 9
 _GWL_STYLE = -16
-_SNAP_STYLE = 0x00C00000 | 0x00040000 | 0x00010000 | 0x00020000 | 0x00080000  # CAPTION|THICKFRAME|MAX|MIN|SYSMENU
+_WS_CAPTION = 0x00C00000
+_WS_SYSMENU = 0x00080000
+_SNAP_STYLE = 0x00040000 | 0x00010000 | 0x00020000  # THICKFRAME|MAX|MIN
+_NATIVE_CAPTION_BUTTONS = _WS_CAPTION | _WS_SYSMENU
 _SWP_FRAME = 0x0020 | 0x0002 | 0x0001 | 0x0004 | 0x0010
 
 
@@ -286,7 +299,7 @@ def cursor_on_maximize_button(x: int, y: int, rect) -> bool:
 
 
 def enable_windows_snap_caption(window: QWidget) -> None:
-    """프레임은 그대로 두고, 스냅 레이아웃이 요구하는 최대화 버튼 스타일만 켠다."""
+    """스냅 레이아웃용 최대화 상자만 켠다. 네이티브 창 단추는 그리지 않는다."""
     if sys.platform != "win32":
         return
     try:
@@ -300,16 +313,17 @@ def enable_windows_snap_caption(window: QWidget) -> None:
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-    user32.GetWindowLongW.restype = ctypes.c_long
-    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
-    user32.SetWindowLongW.restype = ctypes.c_long
+    user32.GetWindowLongW.restype = ctypes.c_uint32
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_uint32]
+    user32.SetWindowLongW.restype = ctypes.c_uint32
     user32.SetWindowPos.argtypes = [
         wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_uint,
     ]
-    style = user32.GetWindowLongW(hwnd, _GWL_STYLE)
-    if (style & _SNAP_STYLE) != _SNAP_STYLE:
-        user32.SetWindowLongW(hwnd, _GWL_STYLE, style | _SNAP_STYLE)
+    style = int(user32.GetWindowLongW(hwnd, _GWL_STYLE)) & 0xFFFFFFFF
+    want = (style | _SNAP_STYLE) & ~_NATIVE_CAPTION_BUTTONS & 0xFFFFFFFF
+    if style != want:
+        user32.SetWindowLongW(hwnd, _GWL_STYLE, want)
         user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_FRAME)
     suppress_native_window_border(window)
 

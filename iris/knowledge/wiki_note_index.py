@@ -485,6 +485,23 @@ def search_notes(
     return hits
 
 
+def empty_stored_block(query: str) -> str:
+    q = " ".join((query or "").split())[:80] or "(빈 질문)"
+    return (
+        "# Iris Wiki 노트 (저장된 자료)\n\n"
+        f"「{q}」로 저장 노트를 찾았고 0건이다. "
+        "위키에 그 사실이 없다. 일반 지식으로 메우지 말고 없다고만 해라.\n"
+    )
+
+
+def note_prompt_or_empty(block: str, query: str, on_empty: bool) -> str:
+    if (block or "").strip():
+        return block
+    if on_empty:
+        return empty_stored_block(query)
+    return ""
+
+
 def format_note_prompt(hits: list[NoteHit]) -> str:
     if not hits:
         return ""
@@ -514,9 +531,20 @@ def wiki_prompt_for_query(
     embedder: Embedder | None = None,
     *,
     limit: int = _TOP_K,
+    on_empty: bool = False,
 ) -> str:
     try:
         sync_knowledge_notes(db, wiki)
     except OSError:
         pass
-    return format_note_prompt(search_notes(db, query, embedder=embedder, limit=limit))
+    block = format_note_prompt(search_notes(db, query, embedder=embedder, limit=limit))
+    return note_prompt_or_empty(block, query, on_empty)
+
+
+if __name__ == "__main__":
+    assert format_note_prompt([]) == ""
+    assert note_prompt_or_empty("", "환율", False) == ""
+    empty = note_prompt_or_empty("", "강화학습", True)
+    assert "0건" in empty and "없다고만" in empty
+    assert note_prompt_or_empty("발췌 있음", "강화학습", True) == "발췌 있음"
+    print("wiki_note_index empty-block ok")

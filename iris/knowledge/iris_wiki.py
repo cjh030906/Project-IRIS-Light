@@ -135,6 +135,22 @@ class IrisWiki:
         notes.sort(key=lambda n: n.sort_key)
         return notes
 
+    def resolve_user_note(self, rel_path: str) -> Path:
+        rel_path = self._normalize_user_rel(rel_path)
+        path = (self.user_root / rel_path).resolve()
+        root = self.user_root.resolve()
+        if root not in path.parents and path != root:
+            raise ValueError("invalid user wiki path")
+        return path
+
+    def delete_user_note(self, rel_path: str) -> Path:
+        """사용자 위키 노트만 지운다. docs 볼트는 지우지 않는다."""
+        path = self.resolve_user_note(rel_path)
+        if not path.is_file():
+            raise FileNotFoundError(rel_path)
+        path.unlink()
+        return path
+
     def read_note(self, rel_path: str) -> str:
         rel_path = (rel_path or "").strip()
         if rel_path.startswith(DOCS_PREFIX):

@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
 
+from iris.storage.chat_title import apply_generated_title
 from iris.storage.conversations import (
     append_message,
     create_conversation,
@@ -26,9 +27,11 @@ def _check_history_panel(app: QApplication, db: Database) -> None:
     first = create_conversation(db)
     append_message(db, first.id, "user", "IRIS 구조 알려줘")
     append_message(db, first.id, "assistant", "ui와 system으로 나뉩니다.")
+    apply_generated_title(db, first.id, "IRIS 구조")
     second = create_conversation(db)
     append_message(db, second.id, "user", "새 채팅 기능 붙여줘")
     append_message(db, second.id, "assistant", "채팅 목록을 왼쪽 패널에 붙였습니다.")
+    apply_generated_title(db, second.id, "채팅 목록")
 
     panel = ChatHistoryPanel()
     panel.set_conversations(list_conversations(db), active_id=second.id)
@@ -51,14 +54,14 @@ def _check_history_panel(app: QApplication, db: Database) -> None:
     buttons = panel.findChildren(QPushButton)
     titles = {b.toolTip() for b in buttons}
     assert "IRIS 구조" in titles, titles
-    assert "채팅 기능 추가" in titles, titles
+    assert "채팅 목록" in titles, titles
     assert "새 채팅" in titles, "새 채팅(+) 버튼이 없다"
     assert "제목 수정" in titles, "제목 수정 버튼이 없다"
 
     for b in buttons:
         if b.toolTip() == "IRIS 구조":
             b.click()
-        elif b.toolTip() == "대화 삭제: 채팅 기능 추가":
+        elif b.toolTip() == "대화 삭제: 채팅 목록":
             b.click()
         elif b.toolTip() == "새 채팅":
             b.click()

@@ -14,9 +14,9 @@ from iris.system.hermes_iris_control_sync import hermes_home
 
 
 
-_MARKER = "<!-- iris-control-nudge-v18 -->"
+_MARKER = "<!-- iris-control-nudge-v20 -->"
 
-_BLOCK = """<!-- iris-control-nudge-v18 -->
+_BLOCK = """<!-- iris-control-nudge-v20 -->
 
 ## Iris Light UI control
 
@@ -50,9 +50,11 @@ When the user asks to open IDE / start coding / Companion / "ide 켜줘" / open 
 
 14. Calendar / 일정: `workspace.open_calendar`, then `calendar.add_event` / `calendar.list_events` / `calendar.select_day` / `calendar.delete_event` (skill iris-calendar).
 
-15. Wiki / 위키에 저장: no keyword shortcut while Hermes is on. PDF·URL·파일 → `wiki.import_content` (`source`, `mode=raw|summarize`); 직전 답변 → `wiki.write_user_note`; never claim saved without ok (skill iris-wiki). 여러 페이지·사이트 전체는 `wiki.import_pages` (`source` 또는 `sources`, `discover=true`). 페이지마다 `import_content` 를 반복하지 말 것. 저장 성공은 반환의 saved 건수로만 말한다. rel_path 를 비우면 사용자·학습자료·인사이트·projects·research 로 분류된다. inbox 를 기본 경로로 넣지 말 것. 저장된 노트는 `wiki.search`.
-15b. "PDF로 저장/만들어 줘" (위키 아님): `note.export_pdf` with `content` and optional `path`. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process.
-15c. GitHub MCP/Skill URL: `extension.install_github` (`url`, `kind=auto|mcp|skill`). If status is needs_input, ask for the missing key or directory. Do not invent secrets.
+15. Wiki / 위키에 저장: no keyword shortcut while Hermes is on. PDF·URL·파일 → `wiki.import_content` (`source`, `mode=raw|summarize`); 직전 답변 → `wiki.write_user_note`; never claim saved without ok (skill iris-wiki). 여러 페이지·사이트 전체는 `wiki.import_pages` (`source` 또는 `sources`, `discover=true`). 페이지마다 `import_content` 를 반복하지 말 것. 저장 성공은 반환의 saved 건수로만 말한다. rel_path 를 비우면 사용자·학습자료·인사이트·projects·research 로 분류된다. inbox 를 기본 경로로 넣지 말 것. 저장된 노트는 `wiki.search`. 이미 있는 노트를 폴더로 옮기거나 분류하면 `wiki.move_notes` (`sources`, `dest_folder`). 같은 바이트를 복사한 뒤 원본을 지운다. `wiki.write_user_note` 로 본문을 다시 쓰지 말 것. `wiki.list_notes` 의 total 이 전체다. truncated 이면 그 페이지만 정리해도 완료가 아니다.
+15b. PDF for a submission or a combined note/code (not a wiki save): `note.export_pdf` with `content` and/or `sources` (file paths) and optional `path`. This tool is the save path while Hermes is on. Relative path is under the open project. Do not run pdf_create.py, reportlab, or PyMuPDF yourself — that can kill the Iris process. Do not claim saved unless ok and the file exists. Do not write .pdf via project.write_file.
+15c. GitHub MCP/Skill URL: `extension.install_github` (`url`, `kind=auto|mcp|skill`, `scope=project|iris`). In IRIS IDE, scope=project writes the open project only. scope=iris (Hermes) only from the main Iris screen, not from IDE. If status is needs_input, ask for the missing key or directory. Do not invent secrets. Do not claim installed without a URL and ok. Do not say an Open VSX extension and a Hermes MCP were installed together.
+15f. Open VSX for the project open in IRIS IDE: `ide.marketplace_search` (`query`) then `ide.marketplace_install` (`id` as publisher.name). Install downloads the VSIX into the IDE deployedPlugins folder. Do not claim installed unless ok and result.package exists. Do not say a PDF tab is already open. If reload is reloaded, say the IDE is restarting to load the extension. If reload is not_running, say it loads the next time IRIS IDE starts. plugin.loaded true is the only signal the plugin host has the extension. Do not say a viewer opened when loaded is false. Name-only requests are not installed. Project plan/progress: `ide.project_log` (`plan`, `decision`, `issue`, `progress`).
+15g. Read and change the open IRIS IDE like an editor, not from an empty success: `ide.diagnostics` (reported false is not "no problems"), `ide.symbols`, `ide.references`, `ide.definition`, `ide.edit` (via=editor is the buffer; via=disk applied=append is not a selection replace), `ide.save`, `ide.task`, `ide.debug` (start needs a launch name; no session is not success). Do not claim a fix, a save, or a debug session without ok.
 15d. Image attachment → code file: `project.write_image_code` (`image` path, `rel_path`). If the target file is unknown, ask. Never claim the file was written without ok.
 15e. If the user message contains `[자료 본문]`, answer from that excerpt (PDF, folder, file, or link). Do not ask for page screenshots first. Do not say you cannot read PDF. HWP is unsupported. Saving a chat as a PDF file stays 15b (`note.export_pdf` only).
 
@@ -126,6 +128,8 @@ def ensure_memory_nudge() -> str:
 
         and "wiki.search" in existing
 
+        and "wiki.move_notes" in existing
+
         and "note.export_pdf" in existing
 
         and "extension.install_github" in existing
@@ -144,6 +148,8 @@ def ensure_memory_nudge() -> str:
 
         and "there is no project.open_folder" in existing
 
+        and "ide.diagnostics" in existing
+
     ):
 
         return "memory nudge already present"
@@ -154,7 +160,7 @@ def ensure_memory_nudge() -> str:
 
     path.write_text(text, encoding="utf-8")
 
-    return "memory nudge updated (v18)"
+    return "memory nudge updated (v20)"
 
 
 

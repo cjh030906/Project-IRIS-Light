@@ -30,11 +30,13 @@ class ChatSession:
         self.attachments = AttachmentStore()
 
     def record(self, role: str, content: str, *, model_content: str = "") -> str | None:
-        """메모리에 먼저 넣고 DB에 쓴다. DB 실패 시 메모리는 유지하고 오류 문자열을 돌려준다."""
+        """메모리에 먼저 넣고 DB에 쓴다. DB에 못 쓰면 메모리에서도 빼서 다음 턴에 안 남긴다."""
         self.history.append({"role": role, "content": content, **({"model_content": model_content} if model_content else {})})
         try:
             append_message(self.db, self.conversation_id, role, content, model_content=model_content)
         except Exception as exc:  # noqa: BLE001
+            if self.history and self.history[-1].get("role") == role and self.history[-1].get("content") == content:
+                self.history.pop()
             return str(exc)
         return None
 

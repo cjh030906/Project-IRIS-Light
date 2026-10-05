@@ -112,6 +112,7 @@ KNOWLEDGE_PREFIXES: tuple[str, ...] = (
     "인사이트/",
     "projects/",
     "research/",
+    "아이리스 IDE/",
 )
 TRAITS_REL = "profile/traits.md"
 

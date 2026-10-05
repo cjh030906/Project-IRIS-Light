@@ -36,3 +36,35 @@ def summarize_for_wiki(
     if not summary:
         raise RuntimeError("empty summary from model")
     return summary
+
+
+_TRANSLATE_SYSTEM = (
+    "You translate one paragraph into Korean for an Iris Wiki note. "
+    "Output only the Korean paragraph. No preamble, no quotes, no original text."
+)
+
+
+def translate_for_wiki(
+    text: str,
+    *,
+    model: str,
+    ollama_base_url: str,
+) -> str:
+    """문단 하나. 완료 문장이나 도구 호출을 하지 않는다."""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if len(body) > 4_000:
+        body = body[:4_000]
+    from iris.infrastructure.ollama_client import OllamaClient
+
+    client = OllamaClient(base_url=ollama_base_url)
+    prompt = f"다음 문단을 한국어로 번역해 주세요.\n\n{body}"
+    out = client.chat_once_with_images(
+        model,
+        prompt,
+        [],
+        system=_TRANSLATE_SYSTEM,
+        timeout_sec=120.0,
+    )
+    return (out or "").strip()

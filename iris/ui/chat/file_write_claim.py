@@ -19,7 +19,7 @@ ASK_WHICH = "열린 파일이 여러 개입니다. 어느 파일에 쓸지 알�
 _CODE_ONLY_PROMPT = "코드만 출력. 설명·파일명·완료 문장 금지"
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _WRITE_RE = re.compile(r"작성|넣어|써|스크립트|코드")
-_CLAIM_RE = re.compile(r"처리 완료|생성하겠습니다|작성했습니다|파일을 열었습니다")
+_CLAIM_RE = re.compile(r"처리 완료|생성하겠습니다|작성했습니다|파일을 열었습니다|저장했습니다")
 _CODE_HINT = re.compile(
     r"(^\s*(import|from|def|class|for|while|if|return|print|const|let|var|function)\b)|[{}=();]",
     re.M,
@@ -57,7 +57,10 @@ def verified_write_path(result: dict | None) -> str:
 def reveal_line(path: str) -> str:
     p = (path or "").strip()
     if p and Path(p).is_file():
-        return f"IDE에 `{Path(p).resolve()}` 파일을 열었습니다."
+        resolved = Path(p).resolve()
+        if resolved.suffix.lower() == ".pdf":
+            return f"PDF로 저장했습니다.\n\n- 경로: `{resolved}`"
+        return f"IDE에 `{resolved}` 파일을 열었습니다."
     return CHAT_ONLY
 
 

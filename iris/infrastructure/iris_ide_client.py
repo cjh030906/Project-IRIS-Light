@@ -132,6 +132,9 @@ class IrisIdeClient:
     def get_diagnostics(self) -> dict[str, Any]:
         return self._request("getDiagnostics")
 
+    def set_diagnostics(self, diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._request("setDiagnostics", {"diagnostics": diagnostics})
+
     def open_file(self, path: str, *, line: int = 1, column: int = 1) -> dict[str, Any]:
         return self._request("openFile", {"path": path, "line": line, "column": column})
 
@@ -181,11 +184,17 @@ class IrisIdeClient:
     def goto_line(self, line: int) -> dict[str, Any]:
         return self._request("gotoLine", {"line": line})
 
-    def goto_symbol(self, symbol: str) -> dict[str, Any]:
-        return self._request("gotoSymbol", {"symbol": symbol})
+    def goto_symbol(self, symbol: str, *, path: str = "") -> dict[str, Any]:
+        return self._request("gotoSymbol", {"symbol": symbol, "path": path})
 
-    def find_references(self, path: str = "") -> dict[str, Any]:
-        return self._request("findReferences", {"path": path})
+    def find_references(self, path: str = "", *, line: int = 0, column: int = 0) -> dict[str, Any]:
+        return self._request("findReferences", {"path": path, "line": line, "column": column})
+
+    def goto_definition(self, path: str = "", *, line: int = 0, column: int = 0) -> dict[str, Any]:
+        return self._request("gotoDefinition", {"path": path, "line": line, "column": column})
+
+    def plugin_loaded(self, extension_id: str) -> dict[str, Any]:
+        return self._request("pluginLoaded", {"id": extension_id})
 
     def create_terminal(self, name: str = "IRIS") -> dict[str, Any]:
         return self._request("createTerminal", {"name": name})

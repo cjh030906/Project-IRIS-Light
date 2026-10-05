@@ -25,6 +25,9 @@ class PastChatsWorker(QThread):
         query: str,
         current_conversation_id: int,
         *,
+        search_today: bool = False,
+        wiki_on_empty: bool = False,
+        code_on_empty: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -32,8 +35,46 @@ class PastChatsWorker(QThread):
         self._base_url = base_url
         self._query = query
         self._conversation_id = int(current_conversation_id or 0)
+        self._search_today = bool(search_today)
+        self._wiki_on_empty = bool(wiki_on_empty)
+        self._code_on_empty = bool(code_on_empty)
 
     def run(self) -> None:
+        web = ""
+        web_urls: list[str] = []
+        if self._search_today:
+            try:
+                from iris.knowledge.answer_grounding import today_search
+
+                found = today_search(self._query)
+            except Exception as exc:  # noqa: BLE001
+                from iris.knowledge.answer_grounding import search_failure_reply
+
+                self.ready.emit(
+                    {
+                        "past": [],
+                        "wiki": "",
+                        "code": "",
+                        "web_error": True,
+                        "web": search_failure_reply(str(exc)[:200], self._query),
+                        "web_urls": [],
+                    }
+                )
+                return
+            if not found.ok:
+                self.ready.emit(
+                    {
+                        "past": [],
+                        "wiki": "",
+                        "code": "",
+                        "web_error": True,
+                        "web": found.reply,
+                        "web_urls": [],
+                    }
+                )
+                return
+            web = found.evidence
+            web_urls = list(found.urls)
         try:
             client = OllamaClient(self._base_url)
             hits = find_past_chats(
@@ -43,19 +84,52 @@ class PastChatsWorker(QThread):
                 client,
             )
             wiki_block = ""
+            code_block = ""
             wiki = getattr(self._service, "wiki", None)
-            if wiki is not None:
+            if wiki is not None and not self._search_today:
+                from iris.knowledge.code_note_prompt import code_prompt_for_query
                 from iris.knowledge.wiki_note_index import wiki_prompt_for_query
                 from iris.runtime.model_switch import resolve_embedder
 
                 embedder = resolve_embedder(self._service.history_settings, client)
                 wiki_block = wiki_prompt_for_query(
-                    self._service.db, wiki, self._query, embedder,
+                    self._service.db,
+                    wiki,
+                    self._query,
+                    embedder,
+                    on_empty=self._wiki_on_empty,
                 )
+                if self._code_on_empty:
+                    code_block = code_prompt_for_query(
+                        wiki._docs.root,
+                        self._query,
+                        on_empty=True,
+                    )
         except Exception as exc:  # noqa: BLE001
+            if web:
+                self.ready.emit(
+                    {
+                        "past": [],
+                        "wiki": "",
+                        "code": "",
+                        "web_error": False,
+                        "web": web,
+                        "web_urls": web_urls,
+                    }
+                )
+                return
             self.failed.emit(str(exc))
             return
-        self.ready.emit({"past": list(hits), "wiki": wiki_block})
+        self.ready.emit(
+            {
+                "past": list(hits),
+                "wiki": wiki_block,
+                "code": code_block,
+                "web_error": False,
+                "web": web,
+                "web_urls": web_urls,
+            }
+        )
 
 
 class EmbedWarmupWorker(QThread):

@@ -351,12 +351,72 @@ def _plain_to_chat_html(text: str) -> str:
                    for part in escaped.split("\n\n") if part.strip())
 
 
+_ALLOWED_CHAT_TAGS = frozenset(
+    {
+        "a", "b", "blockquote", "br", "code", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+        "hr", "i", "img", "li", "ol", "p", "pre", "span", "strong", "table", "tbody",
+        "td", "th", "thead", "tr", "ul",
+    }
+)
+_DROP_WITH_CONTENT = ("script", "style", "iframe", "object", "embed", "svg", "math", "form")
+_ON_ATTR = re.compile(
+    r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+    re.IGNORECASE,
+)
+_URL_ATTR = re.compile(
+    r"""(?P<name>href|src)\s*=\s*(?P<q>["'])(?P<val>.*?)(?P=q)""",
+    re.IGNORECASE | re.DOTALL,
+)
+_STYLE_JS = re.compile(
+    r"(?i)(?:url\s*\(\s*(['\"]?)\s*(?:javascript|vbscript|data|file):[^)]*\)|expression\s*\([^)]*\))"
+)
+_CHAT_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", re.DOTALL)
+_ALLOWED_URL_PREFIXES = (
+    "http://", "https://",
+    "iris-file://", "iris-wiki://", "iris-copy://", "iris-collapse://",
+    "iris-tts://", "iris-error://", "iris-update://", "iris-hermes-update://",
+    "iris-stt://", "iris-diagram://", "iris-ollama-login://",
+    "iris-image:",
+)
+
+
+def _chat_url_ok(value: str) -> bool:
+    raw = html.unescape((value or "").strip())
+    low = raw.lower()
+    if low.startswith(("javascript:", "vbscript:", "data:", "file:")):
+        return False
+    if low.startswith(_ALLOWED_URL_PREFIXES):
+        return True
+    if re.match(r"^[a-z]:[\\/]", low):
+        return True
+    head = low.split("/", 1)[0]
+    return ":" not in head
+
+
 def _sanitize_chat_html(html_body: str) -> str:
-    t = html_body
-    t = re.sub(r"(?is)<script[\s\S]*?</script>", "", t)
-    t = re.sub(r"(?is)<style[\s\S]*?</style>", "", t)
-    t = re.sub(r"(?is)<iframe[\s\S]*?</iframe>", "", t)
-    return t
+    t = html_body or ""
+    for name in _DROP_WITH_CONTENT:
+        t = re.sub(rf"(?is)<{name}\b[\s\S]*?</{name}>", "", t)
+        t = re.sub(rf"(?is)<{name}\b[^>]*?/?>", "", t)
+
+    def _tag(match: re.Match[str]) -> str:
+        closing, name, attrs = match.group(1), match.group(2).lower(), match.group(3) or ""
+        if name not in _ALLOWED_CHAT_TAGS:
+            return ""
+        if closing:
+            return f"</{name}>"
+        attrs = _ON_ATTR.sub("", attrs)
+        attrs = _STYLE_JS.sub("", attrs)
+
+        def _url(url_match: re.Match[str]) -> str:
+            if _chat_url_ok(url_match.group("val")):
+                return url_match.group(0)
+            return ""
+
+        attrs = _URL_ATTR.sub(_url, attrs)
+        return f"<{name}{attrs}>"
+
+    return _CHAT_TAG.sub(_tag, t)
 
 
 def _style_img_tag(attrs: str) -> str:
@@ -364,7 +424,7 @@ def _style_img_tag(attrs: str) -> str:
 
     sm = _IMG_SRC.search(attrs or "")
     src = (sm.group(2) if sm else "").strip()
-    if not src:
+    if not src or not _chat_url_ok(src):
         return ""
     am = _IMG_ALT.search(attrs or "")
     alt = html.escape((am.group(2) if am else "").strip(), quote=True)
@@ -476,6 +536,12 @@ def _style_chat_html(html_body: str) -> str:
 
 
 if __name__ == "__main__":
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])
     chip = render_file_chip("src/app/main.py")
     assert "src/app/main.py" in chip
     assert "iris-file://" in chip or "#475569" in chip
@@ -487,4 +553,12 @@ if __name__ == "__main__":
         "```diff\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n```"
     )
     assert "#34d399" in fenced and "#f87171" in fenced
+    dirty = render_iris_message(
+        '안녕 <script>alert(1)</script> [x](javascript:alert(1))\n\n'
+        '![a](javascript:alert(1))\n\n'
+        "See [Docs](https://example.com/a)"
+    )
+    lowered = dirty.lower()
+    assert "<script" not in lowered and "javascript:" not in lowered, dirty
+    assert "https://example.com/a" in dirty
     print("chat_renderer file/diff ok")
