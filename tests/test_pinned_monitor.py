@@ -162,3 +162,50 @@ class ServiceTests(TestCase):
         line = svc.status_lines()[0]
         self.assertIn("에러 발생", line)
         self.assertIn("화면: 터미널", line)
+
+
+class ChangeWatchTests(TestCase):
+    def _cap(self, value: int = 200, box: tuple[int, int, int, int] | None = None, fill: int = 0):
+        from iris.monitoring.screen_capture import CaptureResult
+
+        w, h = 800, 600
+        rows = [bytearray([value] * (w * 3)) for _ in range(h)]
+        if box:
+            x0, y0, x1, y1 = box
+            for y in range(y0, y1):
+                rows[y][x0 * 3 : x1 * 3] = bytes([fill] * ((x1 - x0) * 3))
+        return CaptureResult(w, h, bytes(b"".join(rows)))
+
+    def test_caret_blink_is_not_a_change_but_new_text_is(self) -> None:
+        sig = pinned_monitor.screen_signature
+        base = sig(self._cap())
+        self.assertFalse(pinned_monitor.screen_changed(base, sig(self._cap(box=(400, 300, 402, 316)))))
+        self.assertTrue(pinned_monitor.screen_changed(base, sig(self._cap(box=(100, 400, 500, 440)))))
+        self.assertTrue(pinned_monitor.screen_changed(None, base))
+
+    def test_only_changed_window_is_analyzed(self) -> None:
+        store = PinStore()
+        store.pin("빌드", 5)
+        store.pin("채팅", 6)
+        store.set_hwnd("빌드", 5, "빌드")
+        store.set_hwnd("채팅", 6, "채팅")
+        settings = SimpleNamespace(ollama_base_url="http://fake/v1")
+        svc = PinnedMonitorService(store, settings, lambda: "")  # type: ignore[arg-type]
+        same, before = self._cap(), self._cap()
+        svc._sigs = {"빌드": pinned_monitor.screen_signature(before), "채팅": pinned_monitor.screen_signature(before)}
+        caps = {5: same, 6: self._cap(box=(0, 0, 800, 100))}
+        emitted: list[list] = []
+        svc._changed.disconnect()
+        svc._changed.connect(emitted.append)
+        with mock.patch.object(pinned_monitor, "capture_window_by_hwnd", side_effect=lambda h, **_: caps[h]), \
+                mock.patch("ctypes.windll.user32.IsIconic", return_value=0):
+            svc._watch(store.list_pins())
+        self.assertEqual(emitted, [["채팅"]])
+
+        # 방금 분석한 창은 3초 안에 다시 부르지 않는다
+        svc._analyzed_at["채팅"] = pinned_monitor.time.monotonic()
+        emitted.clear()
+        with mock.patch.object(pinned_monitor, "capture_window_by_hwnd", side_effect=lambda h, **_: caps[h]), \
+                mock.patch("ctypes.windll.user32.IsIconic", return_value=0):
+            svc._watch(store.list_pins())
+        self.assertEqual(emitted, [])

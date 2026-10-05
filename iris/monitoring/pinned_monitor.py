@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -20,6 +21,7 @@ from iris.core.activity_sink import push_activity_line
 from iris.monitoring.models import StatusCategory
 from iris.monitoring.pin_store import PinnedTarget, PinStore
 from iris.monitoring.screen_capture import (
+    CaptureResult,
     capture_result_to_png_bytes,
     capture_window_by_hwnd,
 )
@@ -31,7 +33,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("iris.monitoring.pinned")
 
-_ANALYZE_INTERVAL_MS = 30_000  # 30초 — 모델 호출이라 썸네일 갱신(4초)보다 느리게
+# 1초마다 창을 캡처해(0.1초) 화면이 바뀌었을 때만 모델을 부른다 — 모델 한 번이 2~3초
+# (qwen2.5vl:3b, 6GB GPU 실측)라 매초 분석은 못 하고, 안 바뀐 화면을 다시 볼 필요도 없다
+_WATCH_INTERVAL_MS = 1_000
+_HEARTBEAT_MS = 60_000  # 바뀐 게 없어도 가끔은 다시 본다 (캡처가 실패해 변화를 놓쳤을 때)
+_MIN_ANALYZE_GAP_SEC = 3.0  # 계속 바뀌는 창(영상·스크롤)이 GPU 를 독차지하지 않게
+_SIG_WIDTH = 160  # 비교용 축소 폭
+_PIXEL_DELTA = 24  # 이만큼 밝기가 달라진 점을 '바뀐 점'으로
+_CHANGED_FRACTION = 0.004  # 바뀐 점이 이 비율을 넘으면 화면이 바뀐 것 (커서 깜빡임은 안 넘는다)
 _CAPTURE_TIMEOUT_SEC = 3.0
 _ANALYZE_TIMEOUT_SEC = 180.0  # 첫 호출은 모델을 GPU에 올리느라 80초 넘게 걸린다 (qwen2.5vl:3b 실측)
 _ANALYZE_MAX_WIDTH = 1024  # 비전 토큰·지연을 줄이려 축소해서 보낸다
@@ -57,6 +66,24 @@ _KOREAN_LABEL = {
     StatusCategory.USER_ACTION_REQUIRED: "조작 필요",
     StatusCategory.UNKNOWN: "판단 불가",
 }
+
+
+def screen_signature(cap: CaptureResult):
+    """화면 비교용 작은 흑백 그림."""
+    import numpy as np
+
+    img = np.frombuffer(cap.rgb_bytes, dtype=np.uint8).reshape(cap.height, cap.width, 3)
+    step = max(1, cap.width // _SIG_WIDTH)
+    return img[::step, ::step].mean(axis=2).astype(np.int16)
+
+
+def screen_changed(before, after) -> bool:
+    if before is None or after is None or before.shape != after.shape:
+        return True
+    import numpy as np
+
+    moved = np.count_nonzero(np.abs(after - before) > _PIXEL_DELTA)
+    return moved > _CHANGED_FRACTION * before.size
 
 
 def status_label(status: StatusCategory) -> str:
@@ -108,6 +135,8 @@ class PinnedMonitorService(QObject):
     vision_missing = pyqtSignal(str)
     # 분석이 끝났는데 고정할 때 들어온 요청이 남아 있음 — 메인 스레드에서 다시 돈다
     _rerun_requested = pyqtSignal()
+    # 1초 감시에서 화면이 바뀐 창 (고정 제목 목록) — 메인 스레드에서 분석을 띄운다
+    _changed = pyqtSignal(list)
 
     def __init__(
         self,
@@ -124,11 +153,19 @@ class PinnedMonitorService(QObject):
         self._shutdown = False
         self._rerun = False
         self._vision_prompted = False
+        self._watching = False
+        # 고정 제목 → 마지막으로 모델이 본 화면, 그때 시각
+        self._sigs: dict[str, object] = {}
+        self._analyzed_at: dict[str, float] = {}
 
         self._timer = QTimer(self)
-        self._timer.setInterval(_ANALYZE_INTERVAL_MS)
+        self._timer.setInterval(_HEARTBEAT_MS)
         self._timer.timeout.connect(self._tick)
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(_WATCH_INTERVAL_MS)
+        self._watch_timer.timeout.connect(self._watch_tick)
         self._rerun_requested.connect(self.analyze_soon)
+        self._changed.connect(self._on_changed)
 
     # ------------------------------------------------------------------
     # public
@@ -141,10 +178,13 @@ class PinnedMonitorService(QObject):
     def start(self) -> None:
         if not self._timer.isActive():
             self._timer.start()
+        if not self._watch_timer.isActive():
+            self._watch_timer.start()
 
     def stop(self) -> None:
         self._shutdown = True
         self._timer.stop()
+        self._watch_timer.stop()
 
     def analyze_soon(self) -> None:
         """고정 직후처럼 결과를 바로 보고 싶을 때 — 1초 뒤 1회.
@@ -184,7 +224,7 @@ class PinnedMonitorService(QObject):
     # loop
     # ------------------------------------------------------------------
 
-    def _tick(self) -> None:
+    def _tick(self, titles: Optional[list[str]] = None) -> None:
         if self._shutdown or self._busy:
             return
         if not self._store.list_pins():
@@ -194,12 +234,54 @@ class PinnedMonitorService(QObject):
         self._busy = True
         threading.Thread(
             target=self._analyze_all,
-            args=(chat_model,),
+            args=(chat_model, titles),
             daemon=True,
             name="iris-pinned-monitor",
         ).start()
 
-    def _analyze_all(self, chat_model: str) -> None:
+    def _watch_tick(self) -> None:
+        if self._shutdown or self._busy or self._watching:
+            return
+        pins = [p for p in self._store.list_pins() if p.hwnd and p.title in self._sigs]
+        if not pins:
+            return
+        self._watching = True
+        threading.Thread(
+            target=self._watch, args=(pins,), daemon=True, name="iris-pinned-watch"
+        ).start()
+
+    def _watch(self, pins: list[PinnedTarget]) -> None:
+        """모델이 마지막으로 본 화면과 지금 화면을 비교만 한다."""
+        import ctypes
+
+        changed: list[str] = []
+        try:
+            now = time.monotonic()
+            for pin in pins:
+                if now - self._analyzed_at.get(pin.title, 0.0) < _MIN_ANALYZE_GAP_SEC:
+                    continue
+                if ctypes.windll.user32.IsIconic(pin.hwnd):
+                    continue
+                cap = capture_window_by_hwnd(pin.hwnd, timeout_sec=_CAPTURE_TIMEOUT_SEC)
+                if cap is None:
+                    continue
+                if screen_changed(self._sigs.get(pin.title), screen_signature(cap)):
+                    changed.append(pin.title)
+        except Exception:
+            log.exception("고정 창 변화 감시 실패")
+        finally:
+            self._watching = False
+        if changed and not self._shutdown:
+            try:
+                self._changed.emit(changed)
+            except RuntimeError:
+                pass
+
+    def _on_changed(self, titles: list) -> None:
+        log.info("고정 창 화면 바뀜 → 분석: %s", ", ".join(t[:30] for t in titles))
+        self._tick(list(titles))
+
+    def _analyze_all(self, chat_model: str, titles: Optional[list[str]] = None) -> None:
         try:
             from iris.automation.window_controller import list_visible_windows
             from iris.infrastructure.local_vision import resolve_vision_model
@@ -220,6 +302,8 @@ class PinnedMonitorService(QObject):
             for pin in self._store.list_pins():
                 if self._shutdown:
                     return
+                if titles is not None and pin.title not in titles:
+                    continue
                 try:
                     self._analyze_one(client, model, pin, windows)
                 except Exception as e:  # 한 창의 실패가 나머지를 막지 않게
@@ -299,6 +383,12 @@ class PinnedMonitorService(QObject):
             )
             self._emit_updated()
             return
+        # 이 화면을 기준으로 1초 감시가 '바뀌었나'를 본다
+        try:
+            self._sigs[title] = screen_signature(cap)
+        except Exception:
+            self._sigs.pop(title, None)
+        self._analyzed_at[title] = time.monotonic()
 
         result = detect_window_state(
             client, model, win.title or title, png, timeout_sec=_ANALYZE_TIMEOUT_SEC

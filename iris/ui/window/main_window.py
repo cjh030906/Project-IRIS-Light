@@ -232,7 +232,7 @@ def _pinned_status_block(window: object) -> str:
     if not lines:
         return ""
     return (
-        "[고정 창 감시 현황] 사용자가 📌로 고정한 창을 IRIS가 30초마다 화면으로 "
+        "[고정 창 감시 현황] 사용자가 📌로 고정한 창을 IRIS가 화면이 바뀔 때마다 화면으로 "
         "분석한 최신 결과다. 고정한 창·감시 중인 창·모니터링에 대해 물으면 이걸로 답하고, "
         "여기 없는 내용을 화면에서 본 것처럼 지어내지 마라.\n" + "\n".join(lines)
     )
@@ -694,7 +694,7 @@ class MainWindow(QMainWindow):
         self._monitor.set_database(self._db)
         self._monitor.setMinimumHeight(160)
 
-        # 고정(📌) 창 AI 감시 — 최대 3개, 30초 주기로 화면을 분석해 상태 변화를 알림
+        # 고정(📌) 창 AI 감시 — 최대 3개, 1초마다 화면 변화를 보고 바뀌면 바로 분석해 상태 변화를 알림
         self._pin_store = PinStore(self._db)
         self._pinned_monitor = PinnedMonitorService(
             self._pin_store,
@@ -3738,7 +3738,7 @@ class MainWindow(QMainWindow):
             return False
         lines = monitor.status_lines()
         if lines:
-            msg = "고정한 창 상태예요 (30초마다 화면을 보고 갱신해요).\n" + "\n".join(lines)
+            msg = "고정한 창 상태예요 (화면이 바뀌면 몇 초 안에 다시 봐요).\n" + "\n".join(lines)
             monitor.analyze_soon()
         else:
             msg = "고정한 창이 없어요. 모니터 패널에서 창 카드의 📌를 누르면 그 창을 지켜볼게요."
