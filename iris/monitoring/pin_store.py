@@ -37,6 +37,40 @@ class PinnedTarget:
     summary: str = ""
 
 
+def _app_suffix(title: str) -> str:
+    """'문서 - Google Chrome' → 'google chrome'. 구분자가 없으면 빈 문자열."""
+    for sep in (" - ", " — ", " – "):
+        if sep in title:
+            return title.rsplit(sep, 1)[1].strip().lower()
+    return ""
+
+
+def _saved_hwnd_still_valid(hwnd: int, title: str) -> bool:
+    """지난 세션에 저장한 hwnd 가 아직 그 창인지.
+
+    창을 닫거나 재부팅하면 Windows 가 같은 번호를 엉뚱한 창에 다시 준다 — 그대로 믿으면
+    다른 앱 화면을 분석해 알린다. 제목이 같거나 같은 앱(제목 끝)일 때만 믿는다."""
+    import sys
+
+    if not hwnd or sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            return False
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        now = buf.value.strip()
+    except Exception:
+        return False
+    if now.lower() == title.strip().lower():
+        return True
+    suffix = _app_suffix(title)
+    return bool(suffix) and _app_suffix(now) == suffix
+
+
 class PinStore:
     """고정 목록 + 최신 분석 결과. 스레드 안전.
 
@@ -206,6 +240,8 @@ class PinStore:
                     try:
                         hwnd = int(hwnd)
                     except (TypeError, ValueError):
+                        hwnd = 0
+                    if not _saved_hwnd_still_valid(hwnd, name):
                         hwnd = 0
                     self._pins[key] = PinnedTarget(title=name, hwnd=hwnd)
                     restored.append(name)

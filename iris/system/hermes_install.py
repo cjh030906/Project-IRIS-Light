@@ -137,14 +137,18 @@ def hermes_python_range(repo: Path) -> PyRange:
         if m:
             if (g := re.search(r">=\s*(\d+\.\d+)", m.group(1))):
                 lo = _ver(g.group(1))
-            if (g := re.search(r"<\s*(\d+\.\d+)", m.group(1))):
-                hi = _ver(g.group(1))
+            if (g := re.search(r"<\s*(\d+)(?:\.(\d+))?", m.group(1))):
+                hi = (int(g.group(1)), int(g.group(2) or 0))  # '<4' 처럼 주 버전만 쓰기도 한다
     m = re.search(r"(?ms)^supported-markers\s*=\s*\[(.*?)\]", lock)
     if m:
         markers = re.findall(r'"([^"]+)"', m.group(1))
         floors = [re.search(r"python_full_version\s*>=\s*'(\d+\.\d+)", x) for x in markers]
         if markers and all(floors):  # 모든 marker 에 하한이 있을 때만 좁힌다
             lo = max(lo, min(_ver(f.group(1)) for f in floors))
+    if hi <= lo:
+        # 상한이 없거나('>=3.11') 기본 상한보다 하한이 올라간 경우 — 빈 범위면 어떤 Python 도
+        # 통과 못 해 설치가 늘 'Python 없음'으로 끝난다. 하한 버전 하나는 받게 둔다
+        hi = (lo[0], lo[1] + 1)
     return lo, hi
 
 

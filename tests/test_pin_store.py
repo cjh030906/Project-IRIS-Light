@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from iris.monitoring.models import StatusCategory
+from iris.monitoring import pin_store
 from iris.monitoring.pin_store import MAX_PINS, PinStore
 
 
@@ -103,12 +104,29 @@ class PinStoreTests(TestCase):
             saved, [{"title": "Chrome", "hwnd": 10}, {"title": "빌드", "hwnd": 11}]
         )
 
-        restored = PinStore(db)  # type: ignore[arg-type]
+        # IRIS 만 다시 켰을 때 대상 창은 살아 있으므로 hwnd 도 되살린다
+        alive = {10: "Chrome"}
+        with mock.patch.object(
+            pin_store, "_saved_hwnd_still_valid", side_effect=lambda h, t: alive.get(h) == t
+        ):
+            restored = PinStore(db)  # type: ignore[arg-type]
         self.assertTrue(restored.is_pinned("Chrome"))
         self.assertTrue(restored.is_pinned("빌드"))
         self.assertEqual(restored.count(), 2)
-        # IRIS 만 다시 켰을 때 대상 창은 살아 있으므로 hwnd 도 되살린다
         self.assertEqual(restored.get("Chrome").hwnd, 10)
+        # 그 번호가 다른 창에 다시 쓰였으면 버리고 제목으로 찾는다
+        self.assertEqual(restored.get("빌드").hwnd, 0)
+
+    def test_saved_hwnd_checked_against_title(self) -> None:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetDesktopWindow()
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        self.assertTrue(pin_store._saved_hwnd_still_valid(hwnd, buf.value or ""))
+        self.assertFalse(pin_store._saved_hwnd_still_valid(hwnd, "보고서 - Excel"))
+        self.assertFalse(pin_store._saved_hwnd_still_valid(0, "보고서 - Excel"))
 
     def test_restores_old_title_only_format(self) -> None:
         db = _FakeDb({"monitor.pinned_titles": json.dumps(["Chrome", "빌드"])})

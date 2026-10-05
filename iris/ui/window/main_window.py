@@ -220,6 +220,21 @@ _ASSISTANT_RIGHT_MIN = 220
 _ASSISTANT_CENTER_MIN = 340
 
 
+def is_pinned_status_question(text: str) -> bool:
+    """'고정한 창 어때?'처럼 감시 결과를 묻는 말인지.
+
+    다른 경로보다 먼저 가로채므로 좁게 잡는다 — '고정한 창 해제해줘', '모니터링 화면 열어줘',
+    '핀터레스트 화면 열어줘' 같은 요청을 상태 보고로 삼키면 안 된다."""
+    import re
+
+    t = text.strip()
+    if not re.search(r"(고정|📌|감시|모니터링)", t):
+        return False
+    if re.search(r"(해제|풀어|풀기|빼줘|빼 줘|열어|닫아|켜줘|켜 줘|꺼줘|꺼 줘|추가|삭제|고정해|감시해)", t):
+        return False
+    return bool(re.search(r"(어때|어떻|상태|괜찮|문제|에러|별일|뭐\s*(하|해|떠|보))", t))
+
+
 def _pinned_status_block(window: object) -> str:
     """고정(📌)해서 감시 중인 창의 최신 분석 — "고정한 창 지금 어때?"에 답하려고."""
     monitor = getattr(window, "_pinned_monitor", None)
@@ -3728,10 +3743,7 @@ class MainWindow(QMainWindow):
 
     def _try_local_pinned_status(self, turn: UserTurn) -> bool:
         """'고정한 창 지금 어때?' — 감시 결과를 모델 없이 그대로 답한다 (지어낼 일이 없게)."""
-        import re
-
-        text = (turn.text or "").strip()
-        if not re.search(r"(고정|핀|📌|감시|모니터링).{0,12}(창|화면|어때|상태|어떻|뭐)", text):
+        if not is_pinned_status_question(turn.text or ""):
             return False
         monitor = getattr(self, "_pinned_monitor", None)
         if monitor is None:

@@ -160,6 +160,9 @@ class DemonstrationRecorder:
         self._mods: set[int] = set()
         self._ralt_solo = False
         self._typing = TypingBuffer()
+        # 이번 입력 묶음 중 비밀번호 칸에서 친 글자가 있었나 — 정리 시점(창 전환 뒤)의
+        # 포커스로 판단하면 Alt+Tab 하는 순간 비밀번호가 평문으로 남는다
+        self._typing_sensitive = False
         # 클릭 순간 화면 — 영상 스레드가 계속 갈아 끼우는 최신 프레임
         self._latest_frame = None
         self._shot_seq = 0
@@ -439,6 +442,8 @@ class DemonstrationRecorder:
         key = redact_key_if_needed(
             key, window_title=title, process_name=proc, is_password_control=pwd
         )
+        # 글자를 가렸으면 가상 키 코드도 남기지 않는다 (0x41~0x5A 가 곧 글자)
+        masked = key != name
         self._append(
             LearningEvent(
                 timestamp=self._rel_ts(),
@@ -446,7 +451,7 @@ class DemonstrationRecorder:
                 key=key,
                 window_title=title,
                 process_name=proc,
-                metadata={"password": pwd, "vk": vk},
+                metadata={"password": pwd, "vk": 0 if masked else vk},
             )
         )
         if vk:
@@ -486,6 +491,8 @@ class DemonstrationRecorder:
                 self._typing.started = True
                 self._typing.hangul = ime_hangul_mode(fg)
                 self._typing.focus_hwnd = focused_control(fg)
+            if pwd or looks_like_credential_window(title, proc):
+                self._typing_sensitive = True
             self._typing.add(ch)
             return
         if vk == VK_BACK and self._typing.started:
@@ -493,7 +500,8 @@ class DemonstrationRecorder:
             return
         # 글자가 아닌 키(Enter·Tab·Ctrl+F 등) — 지금까지 친 글자를 먼저 정리하고 키를 남긴다
         self._flush_typing("key")
-        if shift and combo:
+        if shift:
+            # Shift+Enter(카톡 줄바꿈)·Shift+Tab 도 Shift 를 빼면 다른 동작이 된다
             combo.insert(1 if "ctrl" in combo else 0, "shift")
         name = "+".join([*combo, vk_key_name(vk)])
         self._append(
@@ -513,8 +521,15 @@ class DemonstrationRecorder:
             return
         proc, title, fg = self._last_fg
         focus = buf.focus_hwnd or focused_control(fg)
-        sensitive = _is_password_control() or looks_like_credential_window(title, proc)
-        control_text = None if sensitive else read_control_text(focus)
+        sensitive = (
+            self._typing_sensitive
+            or _is_password_control()
+            or looks_like_credential_window(title, proc)
+        )
+        self._typing_sensitive = False
+        # 글자 저장을 끈 정책이면 화면 글자·키 기록도 남기지 않는다
+        keep = not sensitive and self._store_key_chars
+        control_text = read_control_text(focus) if keep else None
         raw_keys, hangul_mode = buf.raw(), buf.hangul
         typed = buf.resolve(control_text, control_class(focus))
         buf.reset()
@@ -531,11 +546,11 @@ class DemonstrationRecorder:
                 metadata={
                     "source": typed.source,
                     "focus_class": typed.focus_class,
-                    "field_text": "" if sensitive else typed.field_text,
+                    "field_text": typed.field_text if keep else "",
                     "ended_by": reason,
                     "sensitive": sensitive,
                     # 글자 복원이 틀렸을 때 원인을 보려고 — 비밀번호 창이면 남기지 않는다
-                    "raw_keys": "" if sensitive else raw_keys,
+                    "raw_keys": raw_keys if keep else "",
                     "ime_hangul": hangul_mode,
                 },
             )

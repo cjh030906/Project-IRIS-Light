@@ -94,13 +94,19 @@ class SkillReviewDialog(QDialog):
         for s in self._skill.steps:
             if s.kind != "type" or not s.text.strip():
                 continue
-            m = re.fullmatch(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", s.text.strip())
-            param = by_name.get(m.group(1)) if m else None
-            example = param.example if param else s.text
-            if example in seen:
-                continue
-            seen.add(example)
-            out.append((example, param))
+            # 글자 일부만 칸인 경우('안녕 {when} 봐')도 있다 — 칸마다 한 줄씩.
+            # 빠뜨리면 등록할 때 그 칸이 사라진다
+            found = [
+                by_name[n]
+                for n in re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", s.text)
+                if n in by_name
+            ]
+            rows = [(p.example, p) for p in found] if found else [(s.text, None)]
+            for example, param in rows:
+                if example in seen:
+                    continue
+                seen.add(example)
+                out.append((example, param))
         return out
 
     def result_name(self) -> str:

@@ -216,6 +216,10 @@ def _pynput_key(name: str):
         return getattr(Key, n)
     if len(n) == 1:
         return KeyCode.from_char(n)
+    # 녹화기가 이름을 모르는 키(CapsLock·Insert·한자 등)는 'vk14' 처럼 남긴다
+    m = re.fullmatch(r"vk([0-9a-f]{1,2})", n)
+    if m:
+        return KeyCode.from_vk(int(m.group(1), 16))
     raise ValueError(f"모르는 키: {name}")
 
 
@@ -408,8 +412,9 @@ class _Watchdog:
     def start(self) -> None:
         from pynput import keyboard
 
-        def on_press(key):
-            if key == keyboard.Key.esc:
+        def on_press(key, injected=False):
+            # injected = 우리가 SendInput 으로 누른 키 — 녹화된 Esc 를 재생할 때 멈추면 안 된다
+            if key == keyboard.Key.esc and not injected:
                 self.aborted = "Esc 를 눌러 멈췄어요"
 
         self._kb = keyboard.Listener(on_press=on_press)
@@ -477,6 +482,12 @@ class LocalSkillExecutor:
             status="running",
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
+        if not skill_path:
+            # 예전 클라우드 방식(ShowUI-Aloha)으로 배운 업무 — 스킬 파일이 없어 이 실행기로는 못 돈다
+            run.status = "failed"
+            run.message = "예전 방식으로 배운 업무라 실행할 수 없어요. 한 번 더 보여 주시면 다시 배울게요."
+            run.finished_at = run.started_at
+            return run
         with self._lock:
             if self._active is not None:
                 run.status = "failed"

@@ -19,7 +19,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from iris.core.activity_sink import push_activity_line
 from iris.monitoring.models import StatusCategory
-from iris.monitoring.pin_store import PinnedTarget, PinStore
+from iris.monitoring.pin_store import PinnedTarget, PinStore, _app_suffix
 from iris.monitoring.screen_capture import (
     CaptureResult,
     capture_result_to_png_bytes,
@@ -92,14 +92,6 @@ def screen_changed(before, after) -> bool:
 
 def status_label(status: StatusCategory) -> str:
     return _KOREAN_LABEL.get(status, status.value)
-
-
-def _app_suffix(title: str) -> str:
-    """'문서 - Google Chrome' → 'google chrome'. 구분자가 없으면 빈 문자열."""
-    for sep in (" - ", " — ", " – "):
-        if sep in title:
-            return title.rsplit(sep, 1)[1].strip().lower()
-    return ""
 
 
 def locate_window(
