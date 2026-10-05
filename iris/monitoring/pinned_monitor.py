@@ -42,6 +42,10 @@ _SIG_WIDTH = 160  # 비교용 축소 폭
 _PIXEL_DELTA = 24  # 이만큼 밝기가 달라진 점을 '바뀐 점'으로
 _CHANGED_FRACTION = 0.004  # 바뀐 점이 이 비율을 넘으면 화면이 바뀐 것 (커서 깜빡임은 안 넘는다)
 _CAPTURE_TIMEOUT_SEC = 3.0
+# 앱을 켠 직후엔 IRIS 가 Ollama 를 띄우는 중이라 첫 분석이 연결 실패로 끝난다 —
+# 그동안은 heartbeat(60초) 대신 짧게 다시 시도한다
+_STARTUP_RETRY_MS = 10_000
+_STARTUP_WINDOW_SEC = 120.0
 _ANALYZE_TIMEOUT_SEC = 180.0  # 첫 호출은 모델을 GPU에 올리느라 80초 넘게 걸린다 (qwen2.5vl:3b 실측)
 _ANALYZE_MAX_WIDTH = 1024  # 비전 토큰·지연을 줄이려 축소해서 보낸다
 
@@ -135,6 +139,8 @@ class PinnedMonitorService(QObject):
     vision_missing = pyqtSignal(str)
     # 분석이 끝났는데 고정할 때 들어온 요청이 남아 있음 — 메인 스레드에서 다시 돈다
     _rerun_requested = pyqtSignal()
+    # Ollama 가 아직 안 떠서 실패 — 메인 스레드에서 잠시 뒤 다시 돈다
+    _retry_requested = pyqtSignal()
     # 1초 감시에서 화면이 바뀐 창 (고정 제목 목록) — 메인 스레드에서 분석을 띄운다
     _changed = pyqtSignal(list)
 
@@ -165,6 +171,10 @@ class PinnedMonitorService(QObject):
         self._watch_timer.setInterval(_WATCH_INTERVAL_MS)
         self._watch_timer.timeout.connect(self._watch_tick)
         self._rerun_requested.connect(self.analyze_soon)
+        self._retry_requested.connect(
+            lambda: QTimer.singleShot(_STARTUP_RETRY_MS, self._tick)
+        )
+        self._started_at = 0.0
         self._changed.connect(self._on_changed)
 
     # ------------------------------------------------------------------
@@ -176,10 +186,15 @@ class PinnedMonitorService(QObject):
         return self._store
 
     def start(self) -> None:
+        self._started_at = time.monotonic()
         if not self._timer.isActive():
             self._timer.start()
         if not self._watch_timer.isActive():
             self._watch_timer.start()
+        # 지난번에 고정해 둔 창 — heartbeat(60초)까지 기다리지 않고 바로 본다.
+        # 1초 감시도 첫 분석이 남긴 화면이 있어야 돌기 시작한다.
+        if self._store.list_pins():
+            self.analyze_soon()
 
     def stop(self) -> None:
         self._shutdown = True
@@ -291,6 +306,11 @@ class PinnedMonitorService(QObject):
             model, why = resolve_vision_model(client, chat_model)
             if not model:
                 self._mark_all_unavailable(why)
+                if "연결" in why and time.monotonic() - self._started_at < _STARTUP_WINDOW_SEC:
+                    try:
+                        self._retry_requested.emit()
+                    except RuntimeError:
+                        pass
                 return
 
             try:

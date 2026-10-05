@@ -209,3 +209,77 @@ class ChangeWatchTests(TestCase):
                 mock.patch("ctypes.windll.user32.IsIconic", return_value=0):
             svc._watch(store.list_pins())
         self.assertEqual(emitted, [])
+
+
+class StartupAndClosedPinTests(TestCase):
+    def test_start_analyzes_saved_pins_right_away(self) -> None:
+        store = PinStore()
+        store.pin("빌드", 5)
+        settings = SimpleNamespace(ollama_base_url="http://fake/v1")
+        svc = PinnedMonitorService(store, settings, lambda: "")  # type: ignore[arg-type]
+        with mock.patch.object(svc, "analyze_soon") as soon:
+            svc.start()
+        svc.stop()
+        soon.assert_called_once()
+
+    def test_start_without_pins_does_nothing(self) -> None:
+        settings = SimpleNamespace(ollama_base_url="http://fake/v1")
+        svc = PinnedMonitorService(PinStore(), settings, lambda: "")  # type: ignore[arg-type]
+        with mock.patch.object(svc, "analyze_soon") as soon:
+            svc.start()
+        svc.stop()
+        soon.assert_not_called()
+
+    def test_closed_pinned_window_gets_a_card_that_can_unpin(self) -> None:
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+
+        from iris.monitoring.screen_capture import CaptureResult
+        from iris.ui.monitor.unified_monitor_panel import UnifiedMonitorPanel, _WindowSnap
+
+        app = QApplication.instance() or QApplication([])
+        panel = UnifiedMonitorPanel()
+        panel._timer.stop()
+        store = PinStore()
+        store.pin("실시간 자막", 99)
+        store.pin("빌드", 5)
+        panel.set_pin_store(store)
+
+        open_snap = _WindowSnap(_win("빌드", 5), CaptureResult(2, 2, bytes(12)))
+        panel._render([open_snap], {})
+        self.assertEqual(len(panel._thumbs), 2)
+
+        closed = WindowInfo("실시간 자막", 0, 0, 0, 0, hwnd=0)
+        with mock.patch(
+            "iris.ui.monitor.unified_monitor_panel.focus_and_place"
+        ) as place, mock.patch(
+            "iris.ui.monitor.unified_monitor_panel.focus_window_by_hwnd"
+        ) as focus:
+            panel._focus_window(closed)
+        place.assert_not_called()
+        focus.assert_not_called()
+
+        panel._toggle_pin(closed)
+        self.assertEqual([p.title for p in store.list_pins()], ["빌드"])
+        self.assertEqual(len(panel._thumbs), 1)
+        del app
+
+    def test_retries_soon_while_ollama_is_starting(self) -> None:
+        store = PinStore()
+        store.pin("빌드", 5)
+        settings = SimpleNamespace(ollama_base_url="http://fake/v1")
+        svc = PinnedMonitorService(store, settings, lambda: "")  # type: ignore[arg-type]
+        retries: list[int] = []
+        svc._retry_requested.disconnect()
+        svc._retry_requested.connect(lambda: retries.append(1))
+        down = (None, "Ollama에 연결하지 못했어요 (refused)")
+        svc._started_at = pinned_monitor.time.monotonic()
+        with mock.patch("iris.infrastructure.local_vision.resolve_vision_model", return_value=down):
+            svc._analyze_all("")
+            self.assertEqual(retries, [1])
+            # 켠 지 오래됐으면 heartbeat 에 맡긴다 (Ollama 가 정말 꺼진 경우 10초마다 두드리지 않게)
+            svc._started_at -= 600
+            svc._analyze_all("")
+        self.assertEqual(retries, [1])

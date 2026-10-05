@@ -328,6 +328,15 @@ class UnifiedMonitorPanel(QWidget):
                 # 분석 결과가 없을 때만 쓴다.
                 meta = None
             rows.append((snap, meta, pin, _card_key(snap, pin, meta)))
+        # 고정했는데 지금 없는 창(닫힘·재부팅) — 카드가 없으면 고정을 풀 길이 없어
+        # 최대 3칸 중 한 칸을 계속 차지한다. 캡처 없는 카드로 보여 준다.
+        if self._pins is not None:
+            shown = {row[2].title.lower() for row in rows if row[2] is not None}
+            for pin in self._pins.list_pins():
+                if pin.title.lower() in shown:
+                    continue
+                snap = _WindowSnap(WindowInfo(pin.title, 0, 0, 0, 0, hwnd=0), None)
+                rows.append((snap, None, pin, _card_key(snap, pin, None)))
         keys = tuple(row[3] for row in rows)
         if keys == self._card_keys and len(self._thumbs) == len(rows):
             self._thumb_update_count += 1
@@ -414,6 +423,8 @@ class UnifiedMonitorPanel(QWidget):
         QTimer.singleShot(4_000, self._update_pin_hint)
 
     def _focus_window(self, info: WindowInfo) -> None:
+        if not info.hwnd and info.width <= 0:
+            return  # 닫힌 고정 창 카드 — 제목만 비슷한 다른 창을 0×0 으로 옮기지 않게
         ok = False
         if info.hwnd:
             ok = focus_window_by_hwnd(info.hwnd)
